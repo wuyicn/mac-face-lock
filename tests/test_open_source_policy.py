@@ -802,6 +802,22 @@ scripts/bootstrap.sh
             with self.subTest(job="macos", pattern=pattern):
                 assert_command("macos", macos_commands, pattern)
 
+    def test_ci_uses_node24_action_majors(self):
+        workflow = load_ci_workflow()
+        expected = {
+            "actions/checkout": "actions/checkout@v6",
+            "actions/setup-python": "actions/setup-python@v6",
+        }
+        for job_name, job in workflow["jobs"].items():
+            uses = {
+                step["uses"].split("@", 1)[0]: step["uses"]
+                for step in job["steps"]
+                if "uses" in step
+            }
+            for action, version in expected.items():
+                with self.subTest(job=job_name, action=action):
+                    self.assertEqual(uses.get(action), version)
+
     def test_ci_run_commands_exclude_dangerous_runtime_and_release_actions(self):
         workflow = load_ci_workflow()
         run_commands = [
