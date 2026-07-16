@@ -6,6 +6,16 @@ Mac Face Lock 是一套默认在本机处理、运行时默认离线的 macOS �
 
 > 安全提醒：当前人脸比对没有活体检测，照片、视频或其他重放方式可能绕过识别。Mac Face Lock 不能替代 macOS 登录密码、Touch ID、FileVault、系统锁屏策略、MDM 或物理访问控制，不应用于高安全场景。
 
+## 桌面端界面预览
+
+### 保护概览
+
+![Mac Face Lock 桌面端保护概览](docs/design-references/mac-face-lock-overview-liquid-glass.png)
+
+### 外观设置
+
+![Mac Face Lock 桌面端外观设置](docs/design-references/mac-face-lock-appearance-settings.png)
+
 ## 系统要求
 
 - Apple Silicon Mac
