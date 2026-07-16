@@ -1,0 +1,97 @@
+name: Source beta CI
+
+'on':
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-linux:
+    name: Python and policy (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - name: Install evdev build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential linux-libc-dev libgl1 libglib2.0-0
+      - name: Install locked Python dependencies
+        run: python -m pip install -r requirements-lock.txt
+      - name: Run full Python suite
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Compile Python sources
+        run: python -m compileall -q -x '/\.git/|/\.venv/|/dist/' .
+      - name: Parse all shell entry points
+        run: bash -n scripts/*.sh scripts/*.command
+
+  macos-release-gates:
+    name: Swift and bundle release gates (macOS)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - name: Install locked Python dependencies
+        run: python -m pip install -r requirements-lock.txt
+      - name: Run full Python suite
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Run Swift local-store smoke test
+        run: |
+          xcrun swiftc -parse-as-library \
+            src/app/Models.swift src/app/LocalJSONStore.swift \
+            tests/swift/LocalStoreSmokeTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-store-tests"
+          "$RUNNER_TEMP/mac-face-lock-store-tests"
+      - name: Run Swift project-locator tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ProjectLocator.swift tests/swift/ProjectLocatorTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-project-locator-tests"
+          "$RUNNER_TEMP/mac-face-lock-project-locator-tests"
+      - name: Run Swift agent-launcher tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/agent-launcher/main.swift tests/swift/AgentLauncherPathTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-agent-launcher-tests"
+          "$RUNNER_TEMP/mac-face-lock-agent-launcher-tests"
+      - name: Typecheck the unified Swift application
+        run: |
+          xcrun swiftc -parse-as-library -typecheck \
+            src/app/*.swift -framework AppKit -framework SwiftUI
+      - name: Build both ad-hoc signed applications
+        run: |
+          scripts/build-app.sh
+          scripts/build-status-app.sh
+      - name: Lint source, LaunchAgent, and bundle plists
+        run: |
+          plutil -lint src/app/Info.plist \
+            launchd/com.wuyi.mac-face-lock-agent.plist \
+            launchd/com.wuyi.mac-face-lock-status.plist \
+            "dist/Mac Face Lock Agent.app/Contents/Info.plist" \
+            "dist/Mac Face Lock.app/Contents/Info.plist"
+      - name: Verify ad-hoc signatures
+        run: |
+          codesign --verify --deep --strict "dist/Mac Face Lock Agent.app"
+          codesign --verify --deep --strict "dist/Mac Face Lock.app"
+      - name: Verify Mach-O minos 12.0
+        run: |
+          for executable in \
+            "dist/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent" \
+            "dist/Mac Face Lock.app/Contents/MacOS/MacFaceLock"
+          do
+            build_info="$(xcrun vtool -show-build "$executable")"
+            printf '%s\n' "$build_info"
+            minos="$(awk '$1 == "minos" { print $2; exit }' <<<"$build_info")"
+            [[ -n "$minos" ]]
+            [[ "$minos" == "12.0" ]]
+          done

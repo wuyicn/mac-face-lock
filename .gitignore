@@ -1,0 +1,12 @@
+data/
+logs/
+__pycache__/
+*.pyc
+.venv/
+dist/
+.worktrees/
+.superpowers/
+.DS_Store
+app-session-*.js
+initial-route-atom-*.js
+main-*.js

@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Camera capture and local owner face verification.
+
+This MVP intentionally uses OpenCV only. It stores a local face template made
+from normalized face crops so the project can run before a heavier embedding
+model is introduced.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+OWNER_FACE_PATH = PROJECT_DIR / "data" / "owner_face.npy"
+FACE_SIZE = (96, 96)
+
+
+@dataclass
+class VerifyResult:
+    decision: str
+    owner_hits: int
+    stranger_hits: int
+    no_face_hits: int
+    frames_checked: int
+    reason: str
+
+
+def _load_runtime_modules() -> Any:
+    try:
+        import cv2  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Missing OpenCV dependency. Run scripts/bootstrap.sh first."
+        ) from exc
+    return cv2
+
+
+def load_owner_encoding(path: Path = OWNER_FACE_PATH) -> np.ndarray:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Owner profile not found: {path}. Run python3 enroll_owner.py first."
+        )
+    encoding = np.load(path)
+    vector_size = FACE_SIZE[0] * FACE_SIZE[1]
+    if encoding.shape == (vector_size,):
+        return _normalize_templates(encoding.reshape(1, -1))
+    if encoding.ndim == 2 and encoding.shape[1] == vector_size:
+        return _normalize_templates(encoding)
+    if encoding.shape == FACE_SIZE:
+        return _normalize_templates(encoding.reshape(1, -1))
+    if encoding.ndim == 3 and encoding.shape[1:] == FACE_SIZE:
+        return _normalize_templates(encoding.reshape(encoding.shape[0], -1))
+    raise ValueError(f"Invalid owner profile shape: {encoding.shape}")
+
+
+def _normalize_templates(templates: np.ndarray) -> np.ndarray:
+    matrix = templates.astype("float32")
+    if matrix.ndim == 1:
+        matrix = matrix.reshape(1, -1)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    if np.any(norms == 0):
+        raise ValueError("Owner profile contains an empty face template")
+    return matrix / norms
+
+
+def _face_cascades(cv2: Any, config: dict[str, Any] | None = None) -> list[tuple[str, Any, bool]]:
+    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+    cascade = cv2.CascadeClassifier(str(cascade_path))
+    if cascade.empty():
+        raise RuntimeError(f"Could not load face cascade: {cascade_path}")
+    cascades: list[tuple[str, Any, bool]] = [("frontal", cascade, False)]
+
+    use_profile = True
+    if config is not None:
+        use_profile = bool(config.get("use_profile_face_detector", True))
+    if use_profile:
+        profile_path = Path(cv2.data.haarcascades) / "haarcascade_profileface.xml"
+        profile = cv2.CascadeClassifier(str(profile_path))
+        if not profile.empty():
+            cascades.append(("profile", profile, False))
+            cascades.append(("profile_mirror", profile, True))
+    return cascades
+
+
+def _box_area(box: tuple[int, int, int, int]) -> int:
+    return int(box[2] * box[3])
+
+
+def _box_iou(left: tuple[int, int, int, int], right: tuple[int, int, int, int]) -> float:
+    lx, ly, lw, lh = left
+    rx, ry, rw, rh = right
+    x1 = max(lx, rx)
+    y1 = max(ly, ry)
+    x2 = min(lx + lw, rx + rw)
+    y2 = min(ly + lh, ry + rh)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    intersection = (x2 - x1) * (y2 - y1)
+    union = _box_area(left) + _box_area(right) - intersection
+    if union <= 0:
+        return 0.0
+    return float(intersection / union)
+
+
+def _merge_face_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    merged: list[tuple[int, int, int, int]] = []
+    for box in sorted(boxes, key=_box_area, reverse=True):
+        if any(_box_iou(box, existing) >= 0.35 for existing in merged):
+            continue
+        merged.append(box)
+    return merged
+
+
+def _detect_face_boxes(cv2: Any, cascades: list[tuple[str, Any, bool]], gray: np.ndarray) -> list[tuple[int, int, int, int]]:
+    width = gray.shape[1]
+    boxes: list[tuple[int, int, int, int]] = []
+    for _, cascade, use_mirror in cascades:
+        source = cv2.flip(gray, 1) if use_mirror else gray
+        detected = cascade.detectMultiScale(
+            source,
+            scaleFactor=1.08,
+            minNeighbors=4,
+            minSize=(70, 70),
+        )
+        for x, y, w, h in detected:
+            if use_mirror:
+                x = width - x - w
+            boxes.append((int(x), int(y), int(w), int(h)))
+    return _merge_face_boxes(boxes)
+
+
+def _extract_face_template(cv2: Any, cascades: list[tuple[str, Any, bool]], frame: np.ndarray) -> np.ndarray | None:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = _detect_face_boxes(cv2, cascades, gray)
+    if not faces:
+        return None
+    faces = sorted(faces, key=_box_area, reverse=True)
+    if len(faces) > 1 and _box_area(faces[1]) >= _box_area(faces[0]) * 0.65:
+        return None
+    x, y, w, h = faces[0]
+    face = gray[y : y + h, x : x + w]
+    face = cv2.resize(face, FACE_SIZE)
+    face = cv2.equalizeHist(face)
+    vector = face.astype("float32").reshape(-1)
+    norm = np.linalg.norm(vector)
+    if norm == 0:
+        return None
+    return vector / norm
+
+
+def _best_similarity(owner_templates: np.ndarray, template: np.ndarray) -> float:
+    templates = _normalize_templates(owner_templates)
+    normalized_template = template / np.linalg.norm(template)
+    scores = templates @ normalized_template
+    return float(np.max(scores))
+
+
+def evidence_matches_owner(
+    config: dict[str, Any],
+    owner_encoding: np.ndarray,
+    evidence_path: Path,
+) -> tuple[bool, float | None]:
+    cv2 = _load_runtime_modules()
+    frame = cv2.imread(str(evidence_path))
+    if frame is None:
+        return False, None
+    template = _extract_face_template(cv2, _face_cascades(cv2, config), frame)
+    if template is None:
+        return False, None
+    score = _best_similarity(owner_encoding, template)
+    threshold = max(
+        float(config.get("face_match_threshold", 0.72)),
+        float(config.get("final_evidence_owner_threshold", 0.82)),
+    )
+    return score >= threshold, score
+
+
+def capture_owner_profile(config: dict[str, Any], output_path: Path = OWNER_FACE_PATH) -> Path:
+    cv2 = _load_runtime_modules()
+    camera_index = int(config.get("camera_index", 0))
+    cascades = _face_cascades(cv2, config)
+    samples_needed = int(config.get("enroll_samples", 8))
+    timeout_seconds = float(config.get("enroll_timeout_seconds", 20))
+
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {camera_index}")
+
+    encodings: list[np.ndarray] = []
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while time.monotonic() < deadline and len(encodings) < samples_needed:
+            ok, frame = cap.read()
+            if not ok:
+                time.sleep(0.2)
+                continue
+            template = _extract_face_template(cv2, cascades, frame)
+            if template is None:
+                time.sleep(0.2)
+                continue
+            encodings.append(template)
+            time.sleep(0.25)
+    finally:
+        cap.release()
+
+    if len(encodings) < max(2, min(samples_needed, 3)):
+        raise RuntimeError(
+            f"Not enough clean owner samples. Captured {len(encodings)}/{samples_needed}."
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    owner_templates = _normalize_templates(np.stack(encodings))
+    np.save(output_path, owner_templates)
+    return output_path
+
+
+def verify_current_user(config: dict[str, Any], owner_encoding: np.ndarray) -> VerifyResult:
+    cv2 = _load_runtime_modules()
+    camera_index = int(config.get("camera_index", 0))
+    cascades = _face_cascades(cv2, config)
+    threshold = float(config.get("face_match_threshold", 0.72))
+    verify_window = float(config.get("verify_window_seconds", 3.0))
+    frame_interval = float(config.get("frame_interval_seconds", 0.4))
+    owner_threshold = int(config.get("owner_pass_threshold", 2))
+    stranger_threshold = int(config.get("stranger_lock_threshold", 3))
+    no_face_threshold = int(config.get("no_face_lock_threshold", 5))
+
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {camera_index}")
+
+    owner_hits = 0
+    stranger_hits = 0
+    no_face_hits = 0
+    frames_checked = 0
+    deadline = time.monotonic() + verify_window
+
+    try:
+        while time.monotonic() < deadline:
+            ok, frame = cap.read()
+            if not ok:
+                no_face_hits += 1
+                time.sleep(frame_interval)
+                continue
+
+            frames_checked += 1
+            template = _extract_face_template(cv2, cascades, frame)
+            if template is None:
+                no_face_hits += 1
+            else:
+                score = _best_similarity(owner_encoding, template)
+                if score >= threshold:
+                    owner_hits += 1
+                else:
+                    stranger_hits += 1
+
+            if owner_hits >= owner_threshold:
+                return VerifyResult(
+                    decision="owner",
+                    owner_hits=owner_hits,
+                    stranger_hits=stranger_hits,
+                    no_face_hits=no_face_hits,
+                    frames_checked=frames_checked,
+                    reason="owner threshold reached",
+                )
+            if stranger_hits >= stranger_threshold:
+                return VerifyResult(
+                    decision="stranger",
+                    owner_hits=owner_hits,
+                    stranger_hits=stranger_hits,
+                    no_face_hits=no_face_hits,
+                    frames_checked=frames_checked,
+                    reason="stranger threshold reached",
+                )
+            if no_face_hits >= no_face_threshold:
+                return VerifyResult(
+                    decision="no_face",
+                    owner_hits=owner_hits,
+                    stranger_hits=stranger_hits,
+                    no_face_hits=no_face_hits,
+                    frames_checked=frames_checked,
+                    reason="no-face threshold reached",
+                )
+
+            time.sleep(frame_interval)
+    finally:
+        cap.release()
+
+    return VerifyResult(
+        decision="unknown",
+        owner_hits=owner_hits,
+        stranger_hits=stranger_hits,
+        no_face_hits=no_face_hits,
+        frames_checked=frames_checked,
+        reason="verification window expired",
+    )
