@@ -82,12 +82,16 @@ struct OnboardingView: View {
             updatePermissionPolling(for: newStep)
         }
         .task(id: setupCoordinator.currentStep) {
-            guard setupCoordinator.currentStep == .permissions else {
-                return
-            }
-            while !Task.isCancelled {
-                await setupCoordinator.refreshPermissions()
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            if setupCoordinator.currentStep == .permissions {
+                while !Task.isCancelled {
+                    await setupCoordinator.refreshPermissions()
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                }
+            } else if setupCoordinator.currentStep == .completion {
+                while !Task.isCancelled {
+                    await setupCoordinator.refreshCurrentAuthorizationStatus()
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                }
             }
         }
     }
@@ -202,13 +206,13 @@ struct OnboardingView: View {
     private var permissionsStep: some View {
         OnboardingCard(
             title: "权限中心",
-            subtitle: "系统授权必须由你本人完成；状态会在返回应用后自动刷新。",
+            subtitle: "这里先检查 Mac Face Lock 控制中心；后台 Agent 的独立权限会在安全测试中确认。",
             symbol: "hand.raised"
         ) {
+            Text("Mac Face Lock 控制中心权限")
+                .font(.headline)
             VStack(spacing: 12) {
                 permissionRow(.camera, title: "摄像头", required: true)
-                permissionRow(.inputMonitoring, title: "输入监控", required: true)
-                permissionRow(.accessibility, title: "辅助功能", required: true)
                 permissionRow(.screenRecording, title: "屏幕录制", required: false)
             }
 
@@ -228,10 +232,10 @@ struct OnboardingView: View {
                 .disabled(isWorking)
 
                 Button("继续录入本人") {
-                    actionState = .working("正在确认必需权限…")
+                    actionState = .working("正在确认控制中心摄像头权限…")
                     Task {
                         if await setupCoordinator.continueFromPermissions() {
-                            actionState = .success("必需权限已就绪")
+                            actionState = .success("控制中心摄像头权限已就绪")
                         } else {
                             actionState = .failure(
                                 setupCoordinator.currentError ?? "必需权限尚未就绪"
@@ -272,7 +276,7 @@ struct OnboardingView: View {
             HStack {
                 backButton
                 Spacer()
-                if isEnrollmentWorking {
+                if setupCoordinator.enrollmentLifecycle == .running {
                     Button("取消录入") {
                         setupCoordinator.cancelEnrollment()
                         actionState = .idle
@@ -311,6 +315,14 @@ struct OnboardingView: View {
                 readinessRow(.serviceHealth, title: "后台服务与实际权限")
             }
 
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Mac Face Lock Agent 权限")
+                    .font(.headline)
+                agentPermissionRow(.camera, title: "Agent 摄像头")
+                agentPermissionRow(.inputMonitoring, title: "Agent 输入监控")
+                agentPermissionRow(.accessibility, title: "Agent 辅助功能")
+            }
+
             CustomerActionStatusView(state: actionState)
 
             HStack {
@@ -341,12 +353,20 @@ struct OnboardingView: View {
             symbol: "checkmark.shield"
         ) {
             VStack(alignment: .leading, spacing: 12) {
-                readinessRow(.cameraPermission, title: "摄像头权限")
-                readinessRow(.inputMonitoringPermission, title: "输入监控权限")
-                readinessRow(.accessibilityPermission, title: "辅助功能权限")
+                readinessRow(.cameraPermission, title: "控制中心摄像头权限")
+                readinessRow(.inputMonitoringPermission, title: "Agent 输入监控权限")
+                readinessRow(.accessibilityPermission, title: "Agent 辅助功能权限")
                 readinessRow(.ownerProfile, title: "本人资料")
                 readinessRow(.ownerTest, title: "本人安全测试")
                 readinessRow(.serviceHealth, title: "后台服务")
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Mac Face Lock Agent 当前权限")
+                    .font(.headline)
+                agentPermissionRow(.camera, title: "Agent 摄像头")
+                agentPermissionRow(.inputMonitoring, title: "Agent 输入监控")
+                agentPermissionRow(.accessibility, title: "Agent 辅助功能")
             }
 
             CustomerActionStatusView(state: actionState)
@@ -399,9 +419,19 @@ struct OnboardingView: View {
             Button(state == .denied ? "打开系统设置" : "请求授权") {
                 if state == .denied {
                     setupCoordinator.openPermissionSettings(permission)
+                    actionState = .success("已打开 \(title) 系统设置，返回后会自动刷新")
                 } else {
+                    actionState = .working("正在请求 \(title) 权限…")
                     Task {
                         await setupCoordinator.requestPermission(permission)
+                        let refreshed = setupCoordinator.permissionStates[permission]
+                        if refreshed == .granted || refreshed == .restartRequired {
+                            actionState = .success("\(title) 权限状态已更新")
+                        } else {
+                            actionState = .failure(
+                                "\(title) 仍未开启，请在系统设置中确认。"
+                            )
+                        }
                     }
                 }
             }
@@ -421,6 +451,51 @@ struct OnboardingView: View {
         .foregroundStyle(passed ? Color(nsColor: .systemGreen) : .secondary)
     }
 
+    private func agentPermissionRow(
+        _ permission: SetupPermission,
+        title: String
+    ) -> some View {
+        let state = agentPermissionState(permission)
+        return HStack {
+            Image(systemName: state.granted ? "checkmark.circle.fill" : "questionmark.circle")
+                .foregroundStyle(
+                    state.granted ? Color(nsColor: .systemGreen) : .secondary
+                )
+            Text(title)
+            Spacer()
+            Text(state.label)
+                .foregroundStyle(.secondary)
+            if !state.granted {
+                Button("打开系统设置") {
+                    setupCoordinator.openPermissionSettings(permission)
+                    actionState = .success("已打开 \(title) 系统设置，返回后请重新检查")
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    private func agentPermissionState(
+        _ permission: SetupPermission
+    ) -> (granted: Bool, label: String) {
+        guard let status = setupCoordinator.serviceStatus,
+              status.state != .notInstalled else {
+            return (false, "未确认")
+        }
+        let granted: Bool
+        switch permission {
+        case .camera:
+            granted = status.cameraReady
+        case .inputMonitoring:
+            granted = status.inputMonitoringReady
+        case .accessibility:
+            granted = status.accessibilityReady
+        case .screenRecording:
+            return (false, "不由 Agent 使用")
+        }
+        return (granted, granted ? "已开启" : "未开启")
+    }
+
     private var backButton: some View {
         Button("返回上一步") {
             setupCoordinator.goBack()
@@ -437,13 +512,13 @@ struct OnboardingView: View {
     }
 
     private var isEnrollmentWorking: Bool {
-        guard let progress = setupCoordinator.progress else {
-            return false
-        }
-        return progress < 1
+        setupCoordinator.enrollmentLifecycle != .idle
     }
 
     private var enrollmentActionState: CustomerActionState {
+        if setupCoordinator.enrollmentLifecycle == .cancelling {
+            return .working("正在安全结束录入，请稍候…")
+        }
         if let error = setupCoordinator.currentError {
             return .failure(error)
         }

@@ -16,6 +16,19 @@ struct SettingsView: View {
                 Text("设置")
                     .font(.system(size: 30, weight: .bold))
 
+                if !setupCoordinator.isLiveReady {
+                    Label(
+                        "首次设置已完成，但当前安全状态尚未全部确认。修复入口保持可用，恢复保护前会重新验证全部门槛。",
+                        systemImage: "exclamationmark.shield.fill"
+                    )
+                    .foregroundStyle(Color(nsColor: .systemOrange))
+                    .padding(16)
+                    .background(
+                        Color(nsColor: .systemOrange).opacity(0.10),
+                        in: RoundedRectangle(cornerRadius: 14)
+                    )
+                }
+
                 permissionsSection
                 ownerSection
                 protectionSection
@@ -35,6 +48,8 @@ struct SettingsView: View {
 
     private var permissionsSection: some View {
         SettingsSection(title: "权限与运行状态", symbol: "hand.raised.fill") {
+            Text("Mac Face Lock 控制中心权限")
+                .font(.headline)
             VStack(spacing: 11) {
                 settingsPermissionRow(.camera, title: "摄像头")
                 settingsPermissionRow(.inputMonitoring, title: "输入监控")
@@ -53,6 +68,19 @@ struct SettingsView: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(isWorking(permissionAction))
+
+            Divider()
+
+            Text("Mac Face Lock Agent 权限")
+                .font(.headline)
+            VStack(spacing: 11) {
+                agentPermissionRow(.camera, title: "Agent 摄像头")
+                agentPermissionRow(.inputMonitoring, title: "Agent 输入监控")
+                agentPermissionRow(.accessibility, title: "Agent 辅助功能")
+            }
+            Text("Agent 权限由后台应用独立持有；控制中心显示已开启，不代表 Agent 已获得同一权限。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -93,7 +121,7 @@ struct SettingsView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(isEnrollmentWorking)
 
-                if isEnrollmentWorking {
+                if setupCoordinator.enrollmentLifecycle == .running {
                     Button("取消录入") {
                         setupCoordinator.cancelEnrollment()
                         enrollmentAction = .idle
@@ -155,6 +183,12 @@ struct SettingsView: View {
                 healthy: setupCoordinator.checks[.serviceHealth] == true
             )
 
+            VStack(spacing: 9) {
+                agentPermissionRow(.camera, title: "Agent 摄像头")
+                agentPermissionRow(.inputMonitoring, title: "Agent 输入监控")
+                agentPermissionRow(.accessibility, title: "Agent 辅助功能")
+            }
+
             CustomerActionStatusView(state: serviceStatus)
 
             HStack {
@@ -179,7 +213,13 @@ struct SettingsView: View {
                 .disabled(isWorking(serviceAction))
 
                 Button("查看日志") {
-                    setupCoordinator.openLogs()
+                    if setupCoordinator.openLogs() {
+                        serviceAction = .success("已打开本地日志文件夹")
+                    } else {
+                        serviceAction = .failure(
+                            setupCoordinator.currentError ?? "无法打开日志文件夹"
+                        )
+                    }
                 }
                 .buttonStyle(.bordered)
             }
@@ -245,9 +285,21 @@ struct SettingsView: View {
             Button(state == .denied ? "打开系统设置" : "请求授权") {
                 if state == .denied {
                     setupCoordinator.openPermissionSettings(permission)
+                    permissionAction = .success(
+                        "已打开 \(title) 系统设置，返回后会自动刷新"
+                    )
                 } else {
+                    permissionAction = .working("正在请求 \(title) 权限…")
                     Task {
                         await setupCoordinator.requestPermission(permission)
+                        let refreshed = setupCoordinator.permissionStates[permission]
+                        if refreshed == .granted || refreshed == .restartRequired {
+                            permissionAction = .success("\(title) 权限状态已更新")
+                        } else {
+                            permissionAction = .failure(
+                                "\(title) 仍未开启，请在系统设置中确认。"
+                            )
+                        }
                     }
                 }
             }
@@ -292,10 +344,58 @@ struct SettingsView: View {
     }
 
     private var isEnrollmentWorking: Bool {
-        guard let progress = setupCoordinator.progress else {
-            return false
+        setupCoordinator.enrollmentLifecycle != .idle
+    }
+
+    private func agentPermissionRow(
+        _ permission: SetupPermission,
+        title: String
+    ) -> some View {
+        let state = agentPermissionState(permission)
+        return HStack {
+            Image(systemName: state.granted ? "checkmark.circle.fill" : "questionmark.circle")
+                .foregroundStyle(
+                    state.granted ? Color(nsColor: .systemGreen) : .secondary
+                )
+                .frame(width: 22)
+            Text(title)
+            Spacer()
+            Text(state.label)
+                .foregroundStyle(.secondary)
+            if !state.granted {
+                Button("打开系统设置") {
+                    setupCoordinator.openPermissionSettings(permission)
+                    let message = CustomerActionState.success(
+                        "已打开 Agent 的 \(title) 设置页，返回后请刷新状态"
+                    )
+                    permissionAction = message
+                    serviceAction = message
+                }
+                .buttonStyle(.bordered)
+            }
         }
-        return progress < 1
+        .padding(.vertical, 3)
+    }
+
+    private func agentPermissionState(
+        _ permission: SetupPermission
+    ) -> (granted: Bool, label: String) {
+        guard let status = setupCoordinator.serviceStatus,
+              status.state != .notInstalled else {
+            return (false, "未确认")
+        }
+        let granted: Bool
+        switch permission {
+        case .camera:
+            granted = status.cameraReady
+        case .inputMonitoring:
+            granted = status.inputMonitoringReady
+        case .accessibility:
+            granted = status.accessibilityReady
+        case .screenRecording:
+            return (false, "不由 Agent 使用")
+        }
+        return (granted, granted ? "已开启" : "未开启")
     }
 
     private func updateServiceAction(successMessage: String) {

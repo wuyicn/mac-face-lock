@@ -95,6 +95,8 @@ private final class FakeServiceHealthProvider: SetupServiceHealthProviding {
 
 private final class FakeServiceManager: ServiceManaging {
     var currentStatus: ServiceStatus
+    var installError: Error?
+    var restartError: Error?
     private(set) var installs: [(appURL: URL, supportURL: URL)] = []
     private(set) var restartCount = 0
     private(set) var uninstallCount = 0
@@ -112,6 +114,9 @@ private final class FakeServiceManager: ServiceManaging {
     }
 
     func install(appURL: URL, supportURL: URL) async throws {
+        if let installError {
+            throw installError
+        }
         installs.append((appURL, supportURL))
     }
 
@@ -120,6 +125,9 @@ private final class FakeServiceManager: ServiceManaging {
     }
 
     func restart() async throws {
+        if let restartError {
+            throw restartError
+        }
         restartCount += 1
     }
 
@@ -295,11 +303,28 @@ private final class EnrollmentVerificationSerializationRunner: RuntimeCommandRun
 private final class CancellationEOFWindowRunner: RuntimeCommandRunning {
     private var eofContinuation: CheckedContinuation<Void, Never>?
     private(set) var started = false
+    private(set) var runCount = 0
 
     func run(
         command: RuntimeCommand,
         onEvent: @escaping (RuntimeEvent) -> Void
     ) async throws -> RuntimeResult {
+        runCount += 1
+        if runCount > 1 {
+            return RuntimeResult(
+                exitCode: 10,
+                events: [
+                    RuntimeEvent(
+                        schemaVersion: 1,
+                        event: "camera_unavailable",
+                        status: "error",
+                        message: "camera"
+                    ),
+                ],
+                stderr: "",
+                stderrTruncated: false
+            )
+        }
         started = true
         return try await withTaskCancellationHandler(
             operation: {
@@ -386,6 +411,13 @@ struct SetupCoordinatorTests {
         try await testRestoresSafeStepAndForwardsPermissionActions()
         try testUnsafePersistedStepFallsBackToLastSatisfiedGate()
         try await testOperationalServiceRepairActionsUseServiceManager()
+        try await testCompletedRecordDoesNotFabricateLiveRuntimeGates()
+        try await testEnableProtectionReprobesRevokedPermissionAndFallsBack()
+        try await testCompletedAuthorizationRefreshFallsBackAfterRevocation()
+        try await testCompletedInstallKeepsRecoverySurfaceWhenServiceIsUnhealthy()
+        try await testCancelImmediateRetryWaitsForRuntimeCleanup()
+        try await testServiceErrorsAreSanitizedBeforePublishing()
+        try testOpenLogsReportsCustomerSafeFailure()
         print("Setup coordinator tests passed")
     }
 
@@ -720,6 +752,292 @@ struct SetupCoordinatorTests {
         )
     }
 
+    private static func testCompletedRecordDoesNotFabricateLiveRuntimeGates() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try Data("corrupted-template".utf8).write(
+            to: fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        )
+        try fixture.setupStore.save(
+            OnboardingRecord(
+                currentStep: .completion,
+                completedSteps: SetupStep.allCases,
+                completedAt: "2026-07-17T12:00:00Z",
+                appVersion: "test"
+            )
+        )
+        let runner = FakeRuntimeRunner()
+        runner.results[.diagnose] = RuntimeResult(
+            exitCode: 11,
+            events: [
+                event("diagnosis_check", status: "error", check: "template"),
+                RuntimeEvent(
+                    schemaVersion: 1,
+                    event: "diagnosis_complete",
+                    status: "error",
+                    message: "failed",
+                    failedChecks: ["template"]
+                ),
+            ],
+            stderr: "",
+            stderrTruncated: false
+        )
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: FakeServiceManager(state: .healthy)
+        )
+
+        try require(
+            coordinator.checks[.diagnosis] == false
+                && coordinator.checks[.ownerTest] == false,
+            "completed record fabricated current diagnosis or owner-test success"
+        )
+
+        await coordinator.refreshLiveReadiness()
+
+        try require(
+            coordinator.checks[.ownerProfile] == false,
+            "current diagnosis did not reject the corrupted owner profile"
+        )
+        try require(
+            !coordinator.isLiveReady,
+            "corrupted completed install was reported live ready"
+        )
+    }
+
+    private static func testEnableProtectionReprobesRevokedPermissionAndFallsBack() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try Data("owner".utf8).write(
+            to: fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        )
+        try fixture.setupStore.save(
+            OnboardingRecord(
+                currentStep: .completion,
+                completedSteps: SetupStep.allCases,
+                completedAt: "2026-07-17T12:00:00Z",
+                appVersion: "test"
+            )
+        )
+        _ = try fixture.localStore.writeControl(enabled: false)
+        let provider = CoordinatorPermissionProvider()
+        let runner = FakeRuntimeRunner()
+        runner.events[.diagnose] = [
+            event("diagnosis_check", check: "template"),
+            event("diagnosis_complete"),
+        ]
+        runner.events[.verifyOwner] = [
+            event("owner_verification_complete", decision: "owner"),
+        ]
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: provider),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: FakeServiceManager(state: .healthy)
+        )
+        await coordinator.refreshPermissions()
+        provider.cameraStatus = .denied
+
+        do {
+            try await coordinator.enableProtection()
+            throw TestFailure.assertion("protection enabled after accessibility was revoked")
+        } catch is SetupCoordinatorError {
+            // Expected.
+        }
+
+        try require(
+            coordinator.permissionStates[.camera] == .denied,
+            "final enable did not re-probe the revoked permission"
+        )
+        try require(
+            coordinator.currentStep == .permissions
+                && !coordinator.hasCompletedOnboarding,
+            "permission revocation did not fall back to the permission step"
+        )
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "permission revocation did not keep protection disabled"
+        )
+    }
+
+    private static func testCompletedInstallKeepsRecoverySurfaceWhenServiceIsUnhealthy()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try Data("owner".utf8).write(
+            to: fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        )
+        try fixture.setupStore.save(
+            OnboardingRecord(
+                currentStep: .completion,
+                completedSteps: SetupStep.allCases,
+                completedAt: "2026-07-17T12:00:00Z",
+                appVersion: "test"
+            )
+        )
+        let runner = FakeRuntimeRunner()
+        runner.events[.diagnose] = [
+            event("diagnosis_check", check: "template"),
+            event("diagnosis_complete"),
+        ]
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: FakeServiceManager(state: .unhealthy)
+        )
+
+        await coordinator.refreshLiveReadiness()
+
+        try require(
+            coordinator.hasCompletedOnboarding,
+            "transient service failure erased completed onboarding"
+        )
+        try require(
+            coordinator.currentStep == .completion,
+            "transient service failure moved the user out of completed recovery"
+        )
+        try require(
+            !coordinator.isLiveReady,
+            "unhealthy service was reported live ready"
+        )
+    }
+
+    private static func testCompletedAuthorizationRefreshFallsBackAfterRevocation()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try fixture.setupStore.save(
+            OnboardingRecord(
+                currentStep: .completion,
+                completedSteps: SetupStep.allCases,
+                completedAt: "2026-07-17T12:00:00Z",
+                appVersion: "test"
+            )
+        )
+        let provider = CoordinatorPermissionProvider()
+        provider.cameraStatus = .denied
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: provider),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: FakeServiceManager(state: .healthy)
+        )
+
+        await coordinator.refreshCurrentAuthorizationStatus()
+
+        try require(
+            coordinator.currentStep == .permissions
+                && !coordinator.hasCompletedOnboarding,
+            "completion polling did not fall back after a required permission was revoked"
+        )
+    }
+
+    private static func testCancelImmediateRetryWaitsForRuntimeCleanup() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let runner = CancellationEOFWindowRunner()
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+        )
+        let firstEnrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        for _ in 0..<40 where !runner.started {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        coordinator.cancelEnrollment()
+        try require(
+            coordinator.enrollmentLifecycle == .cancelling,
+            "cancel did not publish the cancelling lifecycle"
+        )
+        await coordinator.startEnrollment()
+        try require(
+            runner.runCount == 1,
+            "immediate retry launched before cancelled runtime reached EOF"
+        )
+
+        runner.deliverEOF()
+        await firstEnrollment.value
+        try require(
+            coordinator.enrollmentLifecycle == .idle,
+            "runtime cleanup did not return enrollment to idle"
+        )
+
+        await coordinator.startEnrollment()
+        try require(
+            runner.runCount == 2,
+            "retry stayed blocked after cancelled runtime cleanup completed"
+        )
+    }
+
+    private static func testServiceErrorsAreSanitizedBeforePublishing() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let serviceManager = FakeServiceManager(state: .unhealthy)
+        let privatePath = "/Users/private-customer/Library/LaunchAgents/secret-token"
+        serviceManager.restartError = ServiceManagerError.commandFailed(
+            command: "launchctl kickstart \(privatePath)",
+            exitCode: 77,
+            stderr: "API_SECRET=do-not-display"
+        )
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: serviceManager
+        )
+
+        await coordinator.restartService()
+
+        let customerError = coordinator.currentError ?? ""
+        try require(!customerError.isEmpty, "service failure did not publish a repair message")
+        for secret in ["launchctl", privatePath, "API_SECRET", "do-not-display", "77"] {
+            try require(
+                !customerError.contains(secret),
+                "customer error leaked dynamic service detail: \(secret)"
+            )
+        }
+    }
+
+    private static func testOpenLogsReportsCustomerSafeFailure() throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            logOpener: { _ in false }
+        )
+
+        try require(!coordinator.openLogs(), "failed workspace open was reported as success")
+        try require(
+            coordinator.currentError == "无法打开日志文件夹，请稍后重试。",
+            "log open failure did not publish a concise customer repair"
+        )
+    }
+
     private static func testUnsafePersistedStepFallsBackToLastSatisfiedGate() throws {
         let fixture = try CoordinatorFixture(mode: .source)
         defer { fixture.remove() }
@@ -752,7 +1070,7 @@ struct SetupCoordinatorTests {
     }
 
     private static func testFailedReenrollmentPreservesExistingOwnerProfile() async throws {
-        let fixture = try CoordinatorFixture()
+        let fixture = try CoordinatorFixture(mode: .source)
         defer { fixture.remove() }
         try Data([0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59]).write(
             to: fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
@@ -766,6 +1084,7 @@ struct SetupCoordinatorTests {
             stderr: "",
             stderrTruncated: false
         )
+        runner.events[.diagnose] = [event("diagnosis_complete")]
         let coordinator = SetupCoordinator(
             environment: fixture.environment,
             permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
@@ -775,6 +1094,7 @@ struct SetupCoordinatorTests {
             serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
         )
 
+        await coordinator.runDiagnosis()
         await coordinator.startEnrollment()
 
         try require(
@@ -884,8 +1204,8 @@ struct SetupCoordinatorTests {
             "owner test passed while enrollment was active"
         )
         try require(
-            coordinator.checks[.ownerProfile] == true,
-            "verification refusal erased the still-valid owner profile"
+            coordinator.checks[.ownerProfile] == false,
+            "mere file existence fabricated a validated owner profile"
         )
         try require(
             coordinator.currentError?.contains("录入") == true
@@ -994,6 +1314,11 @@ struct SetupCoordinatorTests {
         try require(
             coordinator.checks[.serviceHealth] == false,
             "visible-app grants overrode unhealthy Agent permission state"
+        )
+        try require(
+            coordinator.checks[.inputMonitoringPermission] == false
+                && coordinator.checks[.accessibilityPermission] == false,
+            "visible-app grants were mislabeled as Agent input/accessibility grants"
         )
         try require(
             !coordinator.readiness.canEnableProtection,

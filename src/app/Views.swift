@@ -35,8 +35,10 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            if setupCoordinator.hasCompletedOnboarding
-                && setupCoordinator.isLiveReady {
+            if RootDestination.resolve(
+                hasCompletedOnboarding: setupCoordinator.hasCompletedOnboarding,
+                isLiveReady: setupCoordinator.isLiveReady
+            ) == .main {
                 mainInterface
             } else {
                 OnboardingView(
@@ -52,24 +54,53 @@ struct RootView: View {
             ZStack {
                 windowBackdrop
 
-                HStack(spacing: 0) {
-                    SidebarView(
-                        selection: $selection,
-                        accentColor: themeStore.accentColor
-                    )
-                    .frame(width: 210)
+                VStack(spacing: 0) {
+                    if !setupCoordinator.isLiveReady {
+                        HStack(spacing: 12) {
+                            Image(systemName: "exclamationmark.shield.fill")
+                                .foregroundStyle(Color(nsColor: .systemOrange))
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("首次设置已完成，当前安全状态尚未全部确认")
+                                    .font(.system(size: 14, weight: .semibold))
+                                Text("保护恢复前会重新检查当前权限、本人资料和 Agent 状态。")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("前往设置") {
+                                selection = .settings
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        .padding(.horizontal, 18)
+                        .frame(minHeight: 58)
+                        .background(.regularMaterial)
+                        .overlay(alignment: .bottom) {
+                            Rectangle()
+                                .fill(Color(nsColor: .systemOrange).opacity(0.45))
+                                .frame(height: 1)
+                        }
+                    }
 
-                    sectionContent
-                        .frame(minWidth: 520, maxWidth: .infinity, maxHeight: .infinity)
+                    HStack(spacing: 0) {
+                        SidebarView(
+                            selection: $selection,
+                            accentColor: themeStore.accentColor
+                        )
+                        .frame(width: 210)
 
-                    if selection == .overview, geometry.size.width >= 1050 {
-                        Rectangle()
-                            .fill(Color.primary.opacity(0.10))
-                            .frame(width: 1)
-                            .overlay(Color.white.opacity(0.06))
+                        sectionContent
+                            .frame(minWidth: 520, maxWidth: .infinity, maxHeight: .infinity)
 
-                        PolicyInspector()
-                            .frame(width: 300)
+                        if selection == .overview, geometry.size.width >= 1050 {
+                            Rectangle()
+                                .fill(Color.primary.opacity(0.10))
+                                .frame(width: 1)
+                                .overlay(Color.white.opacity(0.06))
+
+                            PolicyInspector()
+                                .frame(width: 300)
+                        }
                     }
                 }
             }

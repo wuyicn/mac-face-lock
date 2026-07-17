@@ -36,6 +36,7 @@ final class SetupCoordinator: ObservableObject {
     @Published private(set) var currentStep: SetupStep
     @Published private(set) var hasCompletedOnboarding: Bool
     @Published private(set) var serviceStatus: ServiceStatus?
+    @Published private(set) var enrollmentLifecycle: EnrollmentLifecycle
 
     private let environment: AppEnvironment
     private let permissionCenter: PermissionCenter
@@ -46,6 +47,7 @@ final class SetupCoordinator: ObservableObject {
     private let serviceHealthProvider: SetupServiceHealthProviding
     private let applicationURL: URL
     private let fileManager: FileManager
+    private let logOpener: (URL) -> Bool
 
     private var ownerProfileValid: Bool
     private var diagnosisPassed: Bool
@@ -64,7 +66,8 @@ final class SetupCoordinator: ObservableObject {
         serviceManager: ServiceManaging? = nil,
         serviceHealthProvider: SetupServiceHealthProviding? = nil,
         applicationURL: URL? = nil,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        logOpener: ((URL) -> Bool)? = nil
     ) {
         let storedRecord = setupStore.record
         let initialOwnerProfileValid = fileManager.fileExists(
@@ -94,15 +97,17 @@ final class SetupCoordinator: ObservableObject {
         self.serviceHealthProvider =
             serviceHealthProvider ?? UnavailableSetupServiceHealthProvider()
         self.fileManager = fileManager
+        self.logOpener = logOpener ?? { NSWorkspace.shared.open($0) }
         self.progress = nil
         self.currentError = nil
         self.permissionStates = [:]
         self.currentStep = restoredStep
         self.hasCompletedOnboarding = storedRecord.isComplete
         self.serviceStatus = nil
-        self.ownerProfileValid = initialOwnerProfileValid
-        self.diagnosisPassed = storedRecord.isComplete
-        self.ownerTestPassed = storedRecord.isComplete
+        self.enrollmentLifecycle = .idle
+        self.ownerProfileValid = false
+        self.diagnosisPassed = false
+        self.ownerTestPassed = false
         let initialReadiness = SetupReadiness.evaluate(
             permissions: [:],
             ownerProfileValid: self.ownerProfileValid,
@@ -130,8 +135,17 @@ final class SetupCoordinator: ObservableObject {
 
     func refreshLiveReadiness() async {
         await refreshPermissions()
+        await probeRuntimeDiagnosis()
         await refreshServiceHealthForEnable()
         updateReadiness()
+        fallBackIfRequiredPermissionWasRevoked()
+    }
+
+    func refreshCurrentAuthorizationStatus() async {
+        await refreshPermissions()
+        await refreshServiceHealthForEnable()
+        updateReadiness()
+        fallBackIfRequiredPermissionWasRevoked()
     }
 
     func refreshPermissions() async {
@@ -183,15 +197,11 @@ final class SetupCoordinator: ObservableObject {
     @discardableResult
     func continueFromPermissions() async -> Bool {
         await refreshPermissions()
-        let requiredPermissions: [SetupPermission] = [
-            .camera,
-            .inputMonitoring,
-            .accessibility,
-        ]
+        let requiredPermissions: [SetupPermission] = [.camera]
         guard requiredPermissions.allSatisfy({
             permissionStates[$0] == .granted
         }) else {
-            currentError = "请先完成摄像头、输入监控和辅助功能授权。"
+            currentError = "请先完成控制中心的摄像头授权。"
             return false
         }
         do {
@@ -230,9 +240,10 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func startEnrollment() async {
-        guard enrollmentTask == nil else {
+        guard enrollmentLifecycle == .idle, enrollmentTask == nil else {
             return
         }
+        enrollmentLifecycle = .running
         profileRevision &+= 1
         currentError = nil
         progress = 0
@@ -254,15 +265,13 @@ final class SetupCoordinator: ObservableObject {
             if enrollmentGeneration == generation {
                 enrollmentGeneration = nil
             }
+            enrollmentLifecycle = .idle
         }
 
         do {
             let result = try await task.value
             applyEnrollment(result.events, generation: generation)
             guard handleExitCode(result.exitCode) else {
-                ownerProfileValid = fileManager.fileExists(
-                    atPath: environment.dataURL.appendingPathComponent("owner_face.npy").path
-                )
                 updateReadiness()
                 return
             }
@@ -294,6 +303,10 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func cancelEnrollment() {
+        guard enrollmentLifecycle == .running else {
+            return
+        }
+        enrollmentLifecycle = .cancelling
         enrollmentGeneration = nil
         progress = nil
         let task = enrollmentTask
@@ -301,25 +314,35 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func runDiagnosis() async {
+        await probeRuntimeDiagnosis()
+        if environment.mode == .release {
+            await installAndRefreshReleaseService()
+        } else {
+            serviceHealthy = await serviceHealthProvider.isServiceHealthy()
+        }
+        updateReadiness()
+    }
+
+    private func probeRuntimeDiagnosis() async {
         currentError = nil
         diagnosisPassed = false
+        ownerTestPassed = false
+        ownerProfileValid = false
         do {
             let result = try await runtimeRunner.run(command: .diagnose) { _ in }
             diagnosisPassed = result.exitCode == 0
                 && result.events.contains {
                     $0.event == "diagnosis_complete" && $0.status == "success"
                 }
+            ownerProfileValid = diagnosisPassed
             if !handleExitCode(result.exitCode) {
                 diagnosisPassed = false
+                ownerProfileValid = false
             }
         } catch {
             currentError = localizedRuntimeError(error)
             diagnosisPassed = false
-        }
-        if environment.mode == .release {
-            await installAndRefreshReleaseService()
-        } else {
-            serviceHealthy = await serviceHealthProvider.isServiceHealthy()
+            ownerProfileValid = false
         }
         updateReadiness()
     }
@@ -385,7 +408,19 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func enableProtection() async throws {
+        guard enrollmentLifecycle == .idle else {
+            let error = SetupCoordinatorError.notReady([.ownerProfile])
+            currentError = "本人录入仍在结束处理中，请稍后再试。"
+            throw error
+        }
+        currentError = nil
+        await refreshPermissions()
+        await probeRuntimeDiagnosis()
+        if diagnosisPassed {
+            await verifyOwnerWithoutLocking()
+        }
         await refreshServiceHealthForEnable()
+        await refreshPermissions()
         updateReadiness()
         let missingChecks = readiness.requiredChecks
             .filter { readiness.checks[$0] != true }
@@ -399,7 +434,10 @@ final class SetupCoordinator: ObservableObject {
                 throw coordinatorError
             }
             let error = SetupCoordinatorError.notReady(missingChecks)
-            currentError = error.localizedDescription
+            fallBackForFailedEnable(missingChecks)
+            if currentError?.contains("无法保存安全恢复步骤") != true {
+                currentError = error.localizedDescription
+            }
             throw error
         }
 
@@ -434,6 +472,7 @@ final class SetupCoordinator: ObservableObject {
             try await serviceManager.restart()
             await refreshServiceHealthForEnable()
         } catch {
+            recordDiagnosticError(error, operation: "restart_service")
             currentError = localizedRuntimeError(error)
             serviceHealthy = false
         }
@@ -454,19 +493,31 @@ final class SetupCoordinator: ObservableObject {
             )
             await refreshServiceHealthForEnable()
         } catch {
+            recordDiagnosticError(error, operation: "reinstall_service")
             currentError = localizedRuntimeError(error)
             serviceHealthy = false
         }
         updateReadiness()
     }
 
-    func openLogs() {
+    @discardableResult
+    func openLogs() -> Bool {
         let logsURL = environment.logsURL
-        try? fileManager.createDirectory(
-            at: logsURL,
-            withIntermediateDirectories: true
-        )
-        NSWorkspace.shared.open(logsURL)
+        do {
+            try fileManager.createDirectory(
+                at: logsURL,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            currentError = "无法访问日志文件夹，请检查本地文件权限后重试。"
+            return false
+        }
+        guard logOpener(logsURL) else {
+            currentError = "无法打开日志文件夹，请稍后重试。"
+            return false
+        }
+        currentError = nil
+        return true
     }
 
     private var appVersion: String {
@@ -622,6 +673,18 @@ final class SetupCoordinator: ObservableObject {
     }
 
     private func localizedRuntimeError(_ error: Error) -> String {
+        if let serviceError = error as? ServiceManagerError {
+            switch serviceError {
+            case .invalidTemplate:
+                return "后台服务配置无效，请重新安装应用。"
+            case .commandFailed, .commandTimedOut:
+                return "后台服务操作未完成，请稍后重试；若仍失败，请重新安装服务。"
+            case .unstableService:
+                return "后台服务尚未稳定，请确认 Agent 权限后重试。"
+            case .rollbackFailed:
+                return "后台服务更新未完成，旧设置恢复也遇到问题；保护保持关闭。"
+            }
+        }
         if let error = error as? LocalizedError,
            let description = error.errorDescription {
             return description
@@ -629,9 +692,68 @@ final class SetupCoordinator: ObservableObject {
         return "运行组件未能完成，请重新运行诊断。"
     }
 
+    private func fallBackForFailedEnable(_ missingChecks: [SetupCheck]) {
+        let missing = Set(missingChecks)
+        do {
+            if missing.contains(.cameraPermission)
+                || missing.contains(.screenRecordingPermission) {
+                try persistStep(.permissions)
+            } else if missing.contains(.ownerProfile) {
+                try persistStep(.enrollment)
+            } else if missing.contains(.diagnosis) || missing.contains(.ownerTest) {
+                try persistStep(.safetyTest)
+            }
+        } catch {
+            currentError = "无法保存安全恢复步骤，请稍后重试。"
+        }
+    }
+
+    private func fallBackIfRequiredPermissionWasRevoked() {
+        guard currentStep == .completion else {
+            return
+        }
+        let requiredPermissionChecks: [SetupCheck] = [
+            .cameraPermission,
+        ]
+        let missing = requiredPermissionChecks.filter {
+            readiness.checks[$0] != true
+        }
+        guard !missing.isEmpty else {
+            return
+        }
+        fallBackForFailedEnable(missing)
+    }
+
+    private func recordDiagnosticError(_ error: Error, operation: String) {
+        do {
+            try fileManager.createDirectory(
+                at: environment.logsURL,
+                withIntermediateDirectories: true
+            )
+            let url = environment.logsURL.appendingPathComponent("ui-diagnostics.log")
+            let line = [
+                ISO8601DateFormatter().string(from: Date()),
+                operation,
+                String(describing: error),
+            ].joined(separator: " | ") + "\n"
+            let data = Data(line.utf8)
+            if fileManager.fileExists(atPath: url.path) {
+                let handle = try FileHandle(forWritingTo: url)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+            } else {
+                try data.write(to: url, options: .atomic)
+            }
+        } catch {
+            // Diagnostics are best-effort; customer-facing errors stay sanitized.
+        }
+    }
+
     private func updateReadiness() {
         let evaluated = SetupReadiness.evaluate(
             permissions: permissionStates,
+            agentPermissions: agentPermissionStates,
             ownerProfileValid: ownerProfileValid,
             diagnosisPassed: diagnosisPassed,
             ownerTestPassed: ownerTestPassed,
@@ -639,6 +761,26 @@ final class SetupCoordinator: ObservableObject {
         )
         readiness = evaluated
         checks = evaluated.checks
+    }
+
+    private var agentPermissionStates: [SetupPermission: PermissionState] {
+        if environment.mode == .source {
+            return permissionStates
+        }
+        guard let serviceStatus else {
+            return [
+                .camera: .notDetermined,
+                .inputMonitoring: .notDetermined,
+                .accessibility: .notDetermined,
+            ]
+        }
+        return [
+            .camera: serviceStatus.cameraReady ? .granted : .denied,
+            .inputMonitoring:
+                serviceStatus.inputMonitoringReady ? .granted : .denied,
+            .accessibility:
+                serviceStatus.accessibilityReady ? .granted : .denied,
+        ]
     }
 
     private func refreshServiceHealthForEnable() async {
@@ -694,6 +836,7 @@ final class SetupCoordinator: ObservableObject {
             serviceHealthy = false
             serviceStatus = nil
             _ = try? localStore.writeControl(enabled: false)
+            recordDiagnosticError(error, operation: "install_service")
             currentError = localizedRuntimeError(error)
         }
     }

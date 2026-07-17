@@ -8,6 +8,25 @@ enum SetupStep: String, Codable, CaseIterable, Hashable {
     case completion
 }
 
+enum EnrollmentLifecycle: Equatable {
+    case idle
+    case running
+    case cancelling
+}
+
+enum RootDestination: Equatable {
+    case onboarding
+    case main
+
+    static func resolve(
+        hasCompletedOnboarding: Bool,
+        isLiveReady: Bool
+    ) -> RootDestination {
+        _ = isLiveReady
+        return hasCompletedOnboarding ? .main : .onboarding
+    }
+}
+
 enum SetupPermission: String, Codable, CaseIterable, Hashable {
     case camera
     case inputMonitoring = "input_monitoring"
@@ -87,16 +106,20 @@ struct SetupReadiness: Equatable {
 
     static func evaluate(
         permissions: [SetupPermission: PermissionState],
+        agentPermissions: [SetupPermission: PermissionState]? = nil,
         ownerProfileValid: Bool,
         diagnosisPassed: Bool,
         ownerTestPassed: Bool,
         serviceHealthy: Bool,
         screenshotEvidenceEnabled: Bool = false
     ) -> SetupReadiness {
+        let effectiveAgentPermissions = agentPermissions ?? permissions
         let checks: [SetupCheck: Bool] = [
             .cameraPermission: permissions[.camera] == .granted,
-            .inputMonitoringPermission: permissions[.inputMonitoring] == .granted,
-            .accessibilityPermission: permissions[.accessibility] == .granted,
+            .inputMonitoringPermission:
+                effectiveAgentPermissions[.inputMonitoring] == .granted,
+            .accessibilityPermission:
+                effectiveAgentPermissions[.accessibility] == .granted,
             .screenRecordingPermission: permissions[.screenRecording] == .granted,
             .ownerProfile: ownerProfileValid,
             .diagnosis: diagnosisPassed,

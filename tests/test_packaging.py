@@ -286,7 +286,13 @@ class UnifiedPackagingTests(unittest.TestCase):
 
         self.assertIn("setupCoordinator.hasCompletedOnboarding", views)
         self.assertIn("setupCoordinator.isLiveReady", views)
+        self.assertIn("RootDestination.resolve", views)
         self.assertIn("OnboardingView(", views)
+        self.assertIn("Mac Face Lock 控制中心权限", onboarding)
+        self.assertIn("Mac Face Lock Agent 权限", onboarding)
+        self.assertIn("Mac Face Lock 控制中心权限", settings)
+        self.assertIn("Mac Face Lock Agent 权限", settings)
+        self.assertIn("enrollmentLifecycle", onboarding)
 
         user_facing_sources = onboarding + settings
         for shell_copy in (

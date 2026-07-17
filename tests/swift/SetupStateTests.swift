@@ -38,6 +38,7 @@ struct SetupStateTests {
         try testReleaseMissingOnboardingPersistsDisabledControl()
         try testSourceMissingOnboardingPreservesEnabledFallback()
         try testCompletedReleaseOnboardingPreservesControl()
+        try testCompletedRoutingKeepsRecoveryAvailableWhenLiveHealthIsLost()
         print("Setup state tests passed")
     }
 
@@ -245,6 +246,24 @@ struct SetupStateTests {
         try require(
             json?["permissions"] == nil && !persistedText.contains("granted"),
             "onboarding persistence stored a synthetic permission grant"
+        )
+    }
+
+    private static func testCompletedRoutingKeepsRecoveryAvailableWhenLiveHealthIsLost()
+        throws {
+        try require(
+            RootDestination.resolve(
+                hasCompletedOnboarding: true,
+                isLiveReady: false
+            ) == .main,
+            "completed install lost the settings recovery surface when health was false"
+        )
+        try require(
+            RootDestination.resolve(
+                hasCompletedOnboarding: false,
+                isLiveReady: true
+            ) == .onboarding,
+            "incomplete install bypassed onboarding because health happened to be true"
         )
     }
 
