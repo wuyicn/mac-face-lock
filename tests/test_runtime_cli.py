@@ -12,7 +12,7 @@ from unittest.mock import patch
 import numpy as np
 
 import runtime_cli
-from face_verifier import VerifyResult
+from face_verifier import RuntimeDependencyError, VerifyResult
 
 
 class PassingProbe:
@@ -40,6 +40,16 @@ class FailingCameraProbe(PassingProbe):
     def check_camera(self, config):
         self.calls.append("camera")
         raise RuntimeError("camera denied")
+
+
+class MissingRuntimeProbe(PassingProbe):
+    def check_runtime_imports(self):
+        self.calls.append("runtime_imports")
+        raise RuntimeDependencyError("OpenCV import failed")
+
+    def check_camera(self, config):
+        self.calls.append("camera")
+        raise RuntimeDependencyError("OpenCV import failed")
 
 
 class RuntimeCLITests(unittest.TestCase):
@@ -131,6 +141,24 @@ class RuntimeCLITests(unittest.TestCase):
         events = self.events(result)
         self.assertEqual(events[-1]["event"], "diagnosis_complete")
         self.assertIn("camera", events[-1]["failed_checks"])
+
+    def test_diagnose_classifies_runtime_import_failures_before_camera_failures(self):
+        probe = MissingRuntimeProbe()
+
+        result = self.run_cli("diagnose", probe=probe)
+
+        self.assertEqual(result.returncode, runtime_cli.EXIT_RUNTIME_FAILURE)
+        self.assertEqual(
+            probe.calls,
+            ["runtime_imports", "support_directory", "camera", "template"],
+        )
+        checks = {
+            event["check"]: event
+            for event in self.events(result)
+            if event["event"] == "diagnosis_check"
+        }
+        self.assertEqual(checks["runtime_imports"]["failure_kind"], "runtime")
+        self.assertEqual(checks["camera"]["failure_kind"], "runtime")
 
     def test_enroll_emits_started_progress_and_complete_events(self):
         output_path = self.support_dir / "data" / "owner_face.npy"
@@ -231,6 +259,24 @@ class RuntimeCLITests(unittest.TestCase):
         self.assertEqual(result.returncode, runtime_cli.EXIT_OWNER_PROFILE_INVALID)
         self.assertEqual(self.events(result)[-1]["event"], "owner_profile_invalid")
 
+    def test_corrupted_owner_profile_load_errors_use_dedicated_exit_code(self):
+        for load_error in (
+            OSError("owner profile read failed"),
+            EOFError("owner profile is truncated"),
+        ):
+            with self.subTest(error_type=type(load_error).__name__):
+                with patch("face_verifier.np.load", side_effect=load_error):
+                    result = self.run_cli("verify-owner")
+
+                self.assertEqual(
+                    result.returncode,
+                    runtime_cli.EXIT_OWNER_PROFILE_INVALID,
+                )
+                self.assertEqual(
+                    self.events(result)[-1]["event"],
+                    "owner_profile_invalid",
+                )
+
     def test_invalid_config_is_a_runtime_failure_not_an_owner_profile_failure(self):
         (self.support_dir / "config" / "config.json").write_text(
             "{not-json",
@@ -254,6 +300,75 @@ class RuntimeCLITests(unittest.TestCase):
 
         self.assertEqual(result.returncode, runtime_cli.EXIT_PERMISSION_OR_CAMERA)
         self.assertEqual(self.events(result)[-1]["event"], "camera_unavailable")
+
+    def test_open_camera_with_no_readable_frames_uses_camera_exit_code(self):
+        capture = SimpleNamespace(
+            isOpened=lambda: True,
+            read=lambda: (False, None),
+            release=lambda: None,
+        )
+        fake_cv2 = SimpleNamespace(VideoCapture=lambda _index: capture)
+        config_path = self.support_dir / "config" / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "camera_index": 0,
+                    "verify_window_seconds": 1,
+                    "frame_interval_seconds": 0,
+                    "no_face_lock_threshold": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with (
+            patch("runtime_cli.load_owner_encoding", return_value=object()),
+            patch("face_verifier._load_runtime_modules", return_value=fake_cv2),
+            patch("face_verifier._face_cascades", return_value=[]),
+            patch("face_verifier.time.monotonic", side_effect=(0, 0, 2)),
+        ):
+            result = self.run_cli("verify-owner")
+
+        self.assertEqual(result.returncode, runtime_cli.EXIT_PERMISSION_OR_CAMERA)
+        self.assertEqual(self.events(result)[-1]["event"], "camera_unavailable")
+
+    def test_readable_frames_without_faces_remain_verification_failure(self):
+        capture = SimpleNamespace(
+            isOpened=lambda: True,
+            read=lambda: (True, np.zeros((8, 8, 3), dtype="uint8")),
+            release=lambda: None,
+        )
+        fake_cv2 = SimpleNamespace(VideoCapture=lambda _index: capture)
+        config_path = self.support_dir / "config" / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "camera_index": 0,
+                    "verify_window_seconds": 1,
+                    "frame_interval_seconds": 0,
+                    "no_face_lock_threshold": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with (
+            patch("runtime_cli.load_owner_encoding", return_value=object()),
+            patch("face_verifier._load_runtime_modules", return_value=fake_cv2),
+            patch("face_verifier._face_cascades", return_value=[]),
+            patch("face_verifier._extract_face_template", return_value=None),
+            patch("face_verifier.time.monotonic", return_value=0),
+        ):
+            result = self.run_cli("verify-owner")
+
+        events = self.events(result)
+        self.assertEqual(
+            result.returncode,
+            runtime_cli.EXIT_OWNER_VERIFICATION_FAILED,
+        )
+        self.assertEqual(events[-1]["event"], "owner_verification_complete")
+        self.assertEqual(events[-1]["decision"], "no_face")
+        self.assertEqual(events[-1]["frames_checked"], 1)
 
 
 if __name__ == "__main__":

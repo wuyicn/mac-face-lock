@@ -43,6 +43,10 @@ class CameraUnavailableError(RuntimeError):
     pass
 
 
+class OwnerProfileInvalidError(ValueError):
+    pass
+
+
 def _load_runtime_modules() -> Any:
     try:
         import cv2  # type: ignore
@@ -54,21 +58,26 @@ def _load_runtime_modules() -> Any:
 
 
 def load_owner_encoding(path: Path = OWNER_FACE_PATH) -> np.ndarray:
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Owner profile not found: {path}. Run python3 enroll_owner.py first."
-        )
-    encoding = np.load(path)
-    vector_size = FACE_SIZE[0] * FACE_SIZE[1]
-    if encoding.shape == (vector_size,):
-        return _normalize_templates(encoding.reshape(1, -1))
-    if encoding.ndim == 2 and encoding.shape[1] == vector_size:
-        return _normalize_templates(encoding)
-    if encoding.shape == FACE_SIZE:
-        return _normalize_templates(encoding.reshape(1, -1))
-    if encoding.ndim == 3 and encoding.shape[1:] == FACE_SIZE:
-        return _normalize_templates(encoding.reshape(encoding.shape[0], -1))
-    raise ValueError(f"Invalid owner profile shape: {encoding.shape}")
+    try:
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Owner profile not found: {path}. Run python3 enroll_owner.py first."
+            )
+        encoding = np.load(path, allow_pickle=False)
+        vector_size = FACE_SIZE[0] * FACE_SIZE[1]
+        if encoding.shape == (vector_size,):
+            return _normalize_templates(encoding.reshape(1, -1))
+        if encoding.ndim == 2 and encoding.shape[1] == vector_size:
+            return _normalize_templates(encoding)
+        if encoding.shape == FACE_SIZE:
+            return _normalize_templates(encoding.reshape(1, -1))
+        if encoding.ndim == 3 and encoding.shape[1:] == FACE_SIZE:
+            return _normalize_templates(encoding.reshape(encoding.shape[0], -1))
+        raise ValueError(f"Invalid owner profile shape: {encoding.shape}")
+    except (OSError, EOFError, ValueError) as exc:
+        raise OwnerProfileInvalidError(
+            f"Invalid owner profile at {path}: {exc}"
+        ) from exc
 
 
 def _normalize_templates(templates: np.ndarray) -> np.ndarray:
@@ -263,8 +272,7 @@ def verify_current_user(config: dict[str, Any], owner_encoding: np.ndarray) -> V
     try:
         while time.monotonic() < deadline:
             ok, frame = cap.read()
-            if not ok:
-                no_face_hits += 1
+            if not ok or frame is None:
                 time.sleep(frame_interval)
                 continue
 
@@ -310,6 +318,11 @@ def verify_current_user(config: dict[str, Any], owner_encoding: np.ndarray) -> V
             time.sleep(frame_interval)
     finally:
         cap.release()
+
+    if frames_checked == 0:
+        raise CameraUnavailableError(
+            f"Could not read camera index {camera_index}"
+        )
 
     return VerifyResult(
         decision="unknown",

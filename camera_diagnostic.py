@@ -15,6 +15,7 @@ import numpy as np
 
 from face_verifier import (
     CameraUnavailableError,
+    RuntimeDependencyError,
     _detect_face_boxes,
     _face_cascades,
     _load_runtime_modules,
@@ -131,7 +132,9 @@ def run_diagnostics(
             error_fields: dict[str, object] = {
                 "error_type": type(exc).__name__,
             }
-            if check == "camera" and config_error is not None:
+            if isinstance(exc, (RuntimeDependencyError, ImportError)) or (
+                check == "camera" and config_error is not None
+            ):
                 error_fields["failure_kind"] = "runtime"
             results.append(
                 DiagnosticResult(
