@@ -12,6 +12,7 @@ enum AppEnvironmentError: Error, Equatable, LocalizedError {
     case defaultConfigurationUnavailable(String)
     case supportDirectoryUnavailable(String)
     case configurationDirectoryUnavailable(String)
+    case configurationFileUnavailable(String)
     case dataDirectoryUnavailable(String)
     case logsDirectoryUnavailable(String)
     case configurationCopyFailed(String)
@@ -30,6 +31,8 @@ enum AppEnvironmentError: Error, Equatable, LocalizedError {
             return "应用支持目录不可用：\(path)"
         case .configurationDirectoryUnavailable(let path):
             return "配置目录不可用：\(path)"
+        case .configurationFileUnavailable(let path):
+            return "配置文件不可用：\(path)"
         case .dataDirectoryUnavailable(let path):
             return "数据目录不可用：\(path)"
         case .logsDirectoryUnavailable(let path):
@@ -108,11 +111,15 @@ struct AppEnvironment {
         applicationSupportURL: URL,
         fileManager: FileManager
     ) throws -> AppEnvironment {
-        let resourcesURL = bundleURL
+        let resolvedBundleURL = bundleURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let resourcesURL = resolvedBundleURL
             .appendingPathComponent("Contents/Resources", isDirectory: true)
             .resolvingSymlinksInPath()
             .standardizedFileURL
-        guard isDirectory(resourcesURL, fileManager: fileManager) else {
+        guard isDirectory(resourcesURL, fileManager: fileManager),
+              isStrictDescendant(resourcesURL, of: resolvedBundleURL) else {
             throw AppEnvironmentError.resourcesDirectoryUnavailable(resourcesURL.path)
         }
 
@@ -171,14 +178,26 @@ struct AppEnvironment {
             error: AppEnvironmentError.logsDirectoryUnavailable,
             fileManager: fileManager
         )
-        let configURL = configDirectoryURL.appendingPathComponent("config.json")
+        let unresolvedConfigURL = configDirectoryURL.appendingPathComponent("config.json")
+        let configURL: URL
 
-        if !fileManager.fileExists(atPath: configURL.path) {
-            do {
-                try fileManager.copyItem(at: defaultConfigURL, to: configURL)
-            } catch {
-                throw AppEnvironmentError.configurationCopyFailed(configURL.path)
+        if fileManager.fileExists(atPath: unresolvedConfigURL.path) {
+            configURL = unresolvedConfigURL
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+            guard isRegularFile(configURL, fileManager: fileManager),
+                  isStrictDescendant(configURL, of: supportURL) else {
+                throw AppEnvironmentError.configurationFileUnavailable(
+                    unresolvedConfigURL.path
+                )
             }
+        } else {
+            do {
+                try fileManager.copyItem(at: defaultConfigURL, to: unresolvedConfigURL)
+            } catch {
+                throw AppEnvironmentError.configurationCopyFailed(unresolvedConfigURL.path)
+            }
+            configURL = unresolvedConfigURL
         }
 
         return AppEnvironment(
@@ -231,6 +250,14 @@ struct AppEnvironment {
         var isDirectory: ObjCBool = false
         return fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory)
             && !isDirectory.boolValue
+    }
+
+    private static func isRegularFile(_ url: URL, fileManager: FileManager) -> Bool {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+              let type = attributes[.type] as? FileAttributeType else {
+            return false
+        }
+        return type == .typeRegular
     }
 
     private static func isStrictDescendant(_ candidate: URL, of root: URL) -> Bool {

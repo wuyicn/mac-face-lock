@@ -65,6 +65,9 @@ struct AppEnvironmentTests {
         try testExplicitSourceRootPreservesRepositoryLayout()
         try testLegacySourceRootPreservesRepositoryLayout()
         try testReleaseCopiesDefaultConfigurationOnlyWhenMissing()
+        try testReleaseRejectsResourcesSymlinkOutsideBundle()
+        try testReleaseRejectsExistingConfigurationDirectory()
+        try testReleaseRejectsConfigurationSymlinkOutsideSupport()
         try testReleaseRejectsSupportSymlinkOutsideApplicationSupport()
         print("App environment tests passed")
     }
@@ -216,6 +219,123 @@ struct AppEnvironmentTests {
         try require(
             preservedConfiguration == customerConfiguration,
             "release overwrote the existing customer configuration"
+        )
+    }
+
+    private static func testReleaseRejectsResourcesSymlinkOutsideBundle() throws {
+        let fixture = try makeReleaseFixture()
+        let fixtureRoot = fixture.bundle.deletingLastPathComponent()
+        let external = try makeTemporaryDirectory(named: "mac-face-lock-external-resources")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureRoot)
+            try? FileManager.default.removeItem(at: external)
+        }
+
+        let externalDefault = external.appendingPathComponent("defaults/config.json")
+        try FileManager.default.createDirectory(
+            at: externalDefault.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("{\"source\":\"external\"}".utf8).write(to: externalDefault)
+
+        let resourcesURL = fixture.bundle.appendingPathComponent(
+            "Contents/Resources",
+            isDirectory: true
+        )
+        try FileManager.default.removeItem(at: resourcesURL)
+        try FileManager.default.createSymbolicLink(
+            at: resourcesURL,
+            withDestinationURL: external
+        )
+
+        do {
+            _ = try AppEnvironment.resolve(
+                arguments: ["MacFaceLock"],
+                bundleURL: fixture.bundle,
+                applicationSupportURL: fixture.applicationSupport,
+                fileManager: .default
+            )
+            throw TestFailure.assertion("escaping Resources symlink was accepted")
+        } catch AppEnvironmentError.resourcesDirectoryUnavailable {
+            return
+        }
+    }
+
+    private static func testReleaseRejectsExistingConfigurationDirectory() throws {
+        let fixture = try makeReleaseFixture()
+        let fixtureRoot = fixture.bundle.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: fixtureRoot) }
+
+        let configurationURL = fixture.applicationSupport.appendingPathComponent(
+            "Mac Face Lock/config/config.json",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: configurationURL,
+            withIntermediateDirectories: true
+        )
+
+        do {
+            _ = try AppEnvironment.resolve(
+                arguments: ["MacFaceLock"],
+                bundleURL: fixture.bundle,
+                applicationSupportURL: fixture.applicationSupport,
+                fileManager: .default
+            )
+            throw TestFailure.assertion("existing configuration directory was accepted")
+        } catch let error as AppEnvironmentError {
+            try require(
+                error == .configurationFileUnavailable(configurationURL.path),
+                "configuration-directory collision returned the wrong error: \(error)"
+            )
+        }
+    }
+
+    private static func testReleaseRejectsConfigurationSymlinkOutsideSupport() throws {
+        let fixture = try makeReleaseFixture()
+        let fixtureRoot = fixture.bundle.deletingLastPathComponent()
+        let external = try makeTemporaryDirectory(named: "mac-face-lock-external-config")
+        defer {
+            try? FileManager.default.removeItem(at: fixtureRoot)
+            try? FileManager.default.removeItem(at: external)
+        }
+
+        let externalConfigurationURL = external.appendingPathComponent("config.json")
+        let externalConfiguration = Data("{\"source\":\"external-customer\"}".utf8)
+        try externalConfiguration.write(to: externalConfigurationURL)
+
+        let configurationURL = fixture.applicationSupport.appendingPathComponent(
+            "Mac Face Lock/config/config.json"
+        )
+        try FileManager.default.createDirectory(
+            at: configurationURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: configurationURL,
+            withDestinationURL: externalConfigurationURL
+        )
+
+        do {
+            _ = try AppEnvironment.resolve(
+                arguments: ["MacFaceLock"],
+                bundleURL: fixture.bundle,
+                applicationSupportURL: fixture.applicationSupport,
+                fileManager: .default
+            )
+            throw TestFailure.assertion("escaping configuration symlink was accepted")
+        } catch let error as AppEnvironmentError {
+            try require(
+                error == .configurationFileUnavailable(configurationURL.path),
+                "escaping configuration symlink returned the wrong error: \(error)"
+            )
+        }
+        let preservedExternalConfiguration = try Data(
+            contentsOf: externalConfigurationURL
+        )
+        try require(
+            preservedExternalConfiguration == externalConfiguration,
+            "release modified a configuration outside its support root"
         )
     }
 
