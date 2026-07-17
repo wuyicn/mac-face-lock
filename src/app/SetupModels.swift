@@ -73,6 +73,14 @@ struct SetupReadiness: Equatable {
     let checks: [SetupCheck: Bool]
     let requiredChecks: Set<SetupCheck>
 
+    private init(
+        checks: [SetupCheck: Bool],
+        requiredChecks: Set<SetupCheck>
+    ) {
+        self.checks = checks
+        self.requiredChecks = requiredChecks
+    }
+
     var canEnableProtection: Bool {
         requiredChecks.allSatisfy { checks[$0] == true }
     }
