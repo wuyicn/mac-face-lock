@@ -91,6 +91,11 @@ struct ControlFile: Codable, Equatable {
     var schemaVersion: Int = 1
     var protectionEnabled: Bool
     var updatedAt: String
+
+    static let enabledFallback = ControlFile(
+        protectionEnabled: true,
+        updatedAt: ""
+    )
 }
 
 enum AppearanceMode: String, Codable, CaseIterable {

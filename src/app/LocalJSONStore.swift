@@ -118,7 +118,7 @@ final class LocalJSONStore {
             ControlFile.self,
             from: dataURL.appendingPathComponent("control.json")
         ), control.schemaVersion == 1 else {
-            return ControlFile(protectionEnabled: true, updatedAt: "")
+            return .enabledFallback
         }
         return control
     }
@@ -147,6 +147,23 @@ final class LocalJSONStore {
             throw LocalJSONStoreError.unsupportedSchemaVersion
         }
         try write(preferences, to: dataURL.appendingPathComponent("ui-preferences.json"))
+    }
+
+    func readOnboarding() -> OnboardingRecord {
+        guard let record = readVersioned(
+            OnboardingRecord.self,
+            from: dataURL.appendingPathComponent("onboarding.json")
+        ), record.schemaVersion == 1 else {
+            return .incomplete
+        }
+        return record
+    }
+
+    func writeOnboarding(_ record: OnboardingRecord) throws {
+        guard record.schemaVersion == 1 else {
+            throw LocalJSONStoreError.unsupportedSchemaVersion
+        }
+        try write(record, to: dataURL.appendingPathComponent("onboarding.json"))
     }
 
     private func read<Value: Decodable>(_ type: Value.Type, from url: URL) -> Value? {

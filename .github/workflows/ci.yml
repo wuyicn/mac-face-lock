@@ -48,10 +48,20 @@ jobs:
       - name: Run Swift local-store smoke test
         run: |
           xcrun swiftc -parse-as-library \
-            src/app/Models.swift src/app/LocalJSONStore.swift \
+            src/app/Models.swift src/app/SetupModels.swift \
+            src/app/LocalJSONStore.swift \
             tests/swift/LocalStoreSmokeTests.swift \
             -o "$RUNNER_TEMP/mac-face-lock-store-tests"
           "$RUNNER_TEMP/mac-face-lock-store-tests"
+      - name: Run Swift setup-state tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ProjectLocator.swift src/app/AppEnvironment.swift \
+            src/app/Models.swift src/app/SetupModels.swift \
+            src/app/LocalJSONStore.swift src/app/SetupStore.swift \
+            tests/swift/SetupStateTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-setup-state-tests"
+          "$RUNNER_TEMP/mac-face-lock-setup-state-tests"
       - name: Run Swift project-locator tests
         run: |
           xcrun swiftc -parse-as-library -DTESTING \
