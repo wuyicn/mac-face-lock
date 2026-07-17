@@ -31,6 +31,61 @@ LOG_PATH = RUNTIME_PATHS.logs_dir / "agent.log"
 PID_PATH = RUNTIME_PATHS.logs_dir / "agent.pid"
 
 
+def probe_agent_permissions() -> dict[str, bool]:
+    """Read this Agent process's TCC readiness without opening the camera."""
+
+    camera_ready = False
+    input_monitoring_ready = False
+    accessibility_ready = False
+    try:
+        try:
+            import AVFoundation
+
+            camera_status = (
+                AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(
+                    AVFoundation.AVMediaTypeVideo
+                )
+            )
+            camera_ready = (
+                camera_status == AVFoundation.AVAuthorizationStatusAuthorized
+            )
+        except ImportError:
+            import objc
+            from Foundation import NSBundle
+
+            bundle = NSBundle.bundleWithPath_(
+                "/System/Library/Frameworks/AVFoundation.framework"
+            )
+            if bundle is None or not bundle.load():
+                raise RuntimeError("AVFoundation framework is unavailable")
+            capture_device = objc.lookUpClass("AVCaptureDevice")
+            camera_ready = (
+                int(capture_device.authorizationStatusForMediaType_("vide")) == 3
+            )
+    except Exception as exc:
+        logging.warning("camera permission readiness probe failed error=%s", exc)
+
+    try:
+        import Quartz
+
+        input_monitoring_ready = bool(Quartz.CGPreflightListenEventAccess())
+    except Exception as exc:
+        logging.warning("input monitoring readiness probe failed error=%s", exc)
+
+    try:
+        import ApplicationServices
+
+        accessibility_ready = bool(ApplicationServices.AXIsProcessTrusted())
+    except Exception as exc:
+        logging.warning("accessibility readiness probe failed error=%s", exc)
+
+    return {
+        "camera_ready": camera_ready,
+        "input_monitoring_ready": input_monitoring_ready,
+        "accessibility_ready": accessibility_ready,
+    }
+
+
 def normalize_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
     effective = dict(config)
     effective["lock_on_camera_error"] = False
@@ -840,6 +895,7 @@ class FaceLockAgent:
             "status": "running",
             "mode": self.mode,
             "armed": self.armed,
+            "agent_pid": __import__("os").getpid(),
             "started_at": now_iso(),
             "owner_profile": str(self.runtime_paths.owner_face_path),
             "lock_on_camera_error": self.config["lock_on_camera_error"],
@@ -849,6 +905,7 @@ class FaceLockAgent:
             "camera_error_cooldown_seconds": self.config[
                 "camera_error_cooldown_seconds"
             ],
+            **probe_agent_permissions(),
         }
         if not self.protection_enabled:
             initial_state.update(
@@ -858,9 +915,6 @@ class FaceLockAgent:
                     "heartbeat": "paused",
                 }
             )
-        self.persist_replacement_state(initial_state)
-        logging.info("mac-face-lock-agent started mode=%s", self.mode)
-
         self.mouse_listener = mouse.Listener(
             on_move=lambda *_: self.on_input("mouse_move"),
             on_click=lambda *_: self.on_input("mouse_click"),
@@ -871,6 +925,8 @@ class FaceLockAgent:
         )
         self.mouse_listener.start()
         self.keyboard_listener.start()
+        self.persist_replacement_state(initial_state)
+        logging.info("mac-face-lock-agent started mode=%s", self.mode)
 
         try:
             while not self.stop_event.wait(1):

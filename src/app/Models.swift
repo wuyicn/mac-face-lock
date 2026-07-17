@@ -16,6 +16,10 @@ struct FaceLockState: Codable, Equatable {
     var framesChecked: Int?
     var lockReason: String?
     var lockSucceeded: Bool?
+    var agentPid: Int32?
+    var cameraReady: Bool?
+    var inputMonitoringReady: Bool?
+    var accessibilityReady: Bool?
 
     init(
         status: String,
@@ -32,7 +36,11 @@ struct FaceLockState: Codable, Equatable {
         noFaceHits: Int? = nil,
         framesChecked: Int? = nil,
         lockReason: String? = nil,
-        lockSucceeded: Bool? = nil
+        lockSucceeded: Bool? = nil,
+        agentPid: Int32? = nil,
+        cameraReady: Bool? = nil,
+        inputMonitoringReady: Bool? = nil,
+        accessibilityReady: Bool? = nil
     ) {
         self.status = status
         self.mode = mode
@@ -49,6 +57,10 @@ struct FaceLockState: Codable, Equatable {
         self.framesChecked = framesChecked
         self.lockReason = lockReason
         self.lockSucceeded = lockSucceeded
+        self.agentPid = agentPid
+        self.cameraReady = cameraReady
+        self.inputMonitoringReady = inputMonitoringReady
+        self.accessibilityReady = accessibilityReady
     }
 
     static let missing = FaceLockState(status: "missing", armed: false)

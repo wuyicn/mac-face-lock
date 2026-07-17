@@ -80,6 +80,41 @@ private final class FakeServiceHealthProvider: SetupServiceHealthProviding {
     }
 }
 
+private final class FakeServiceManager: ServiceManaging {
+    var currentStatus: ServiceStatus
+    private(set) var installs: [(appURL: URL, supportURL: URL)] = []
+    private(set) var restartCount = 0
+    private(set) var uninstallCount = 0
+
+    init(state: ServiceState, pid: Int32? = 42) {
+        currentStatus = ServiceStatus(
+            state: state,
+            pid: pid,
+            cameraReady: state == .healthy,
+            inputMonitoringReady: state == .healthy,
+            accessibilityReady: state == .healthy,
+            installedProgram: nil,
+            expectedProgram: "/expected/MacFaceLockAgent"
+        )
+    }
+
+    func install(appURL: URL, supportURL: URL) async throws {
+        installs.append((appURL, supportURL))
+    }
+
+    func status() async -> ServiceStatus {
+        currentStatus
+    }
+
+    func restart() async throws {
+        restartCount += 1
+    }
+
+    func uninstallPreservingData() async throws {
+        uninstallCount += 1
+    }
+}
+
 private final class LateEventCancellationRunner: RuntimeCommandRunning {
     private(set) var started = false
 
@@ -293,15 +328,15 @@ private struct CoordinatorFixture {
     let setupStore: SetupStore
     let environment: AppEnvironment
 
-    init() throws {
+    init(mode: AppEnvironmentMode = .release) throws {
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("mac-face-lock-coordinator-\(UUID().uuidString)")
         let dataURL = root.appendingPathComponent("data", isDirectory: true)
         try FileManager.default.createDirectory(at: dataURL, withIntermediateDirectories: true)
         localStore = LocalJSONStore(resourcesURL: root, dataURL: dataURL)
-        setupStore = try SetupStore(localStore: localStore, mode: .release)
+        setupStore = try SetupStore(localStore: localStore, mode: mode)
         environment = AppEnvironment(
-            mode: .release,
+            mode: mode,
             resourcesURL: root,
             supportURL: root,
             configURL: root.appendingPathComponent("config/config.json"),
@@ -327,7 +362,11 @@ struct SetupCoordinatorTests {
         try await testCancellationIgnoresLateProgress()
         try await testCancellationInvalidatesCallbacksBeforeRuntimeEOF()
         try await testVerificationDoesNotLaunchDuringActiveEnrollment()
+        try await testSuccessfulEnrollmentClearsActiveEnrollmentRefusal()
         try await testVerificationCannotPassAfterEnrollmentReplacesProfile()
+        try await testReleaseDiagnosisInstallsAndUsesAgentOwnedServiceHealth()
+        try await testVisibleAppGrantsCannotOverrideUnhealthyAgentPermissions()
+        try await testSourceModePreservesExistingServiceHealthBoundary()
         try await testEnableProtectionRefusesWhenAnyGateIsFalse()
         print("Setup coordinator tests passed")
     }
@@ -621,6 +660,139 @@ struct SetupCoordinatorTests {
 
         runner.completeEnrollment()
         await enrollment.value
+    }
+
+    private static func testSuccessfulEnrollmentClearsActiveEnrollmentRefusal() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        let runner = EnrollmentVerificationSerializationRunner(replacementURL: ownerURL)
+        let permissionCenter = PermissionCenter(provider: CoordinatorPermissionProvider())
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: permissionCenter,
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+        )
+
+        let enrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        for _ in 0..<40 where !runner.enrollmentStarted {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        await coordinator.verifyOwnerWithoutLocking()
+        try require(
+            coordinator.currentError?.contains("录入正在进行") == true,
+            "active enrollment refusal was not published"
+        )
+
+        runner.completeEnrollment()
+        await enrollment.value
+
+        try require(
+            coordinator.currentError == nil,
+            "successful enrollment retained the transient active-enrollment refusal"
+        )
+    }
+
+    private static func testReleaseDiagnosisInstallsAndUsesAgentOwnedServiceHealth() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let runner = FakeRuntimeRunner()
+        runner.events[.diagnose] = [event("diagnosis_complete")]
+        let serviceManager = FakeServiceManager(state: .healthy)
+        let applicationURL = fixture.root.appendingPathComponent("Mac Face Lock.app")
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: serviceManager,
+            applicationURL: applicationURL
+        )
+
+        await coordinator.runDiagnosis()
+
+        try require(
+            serviceManager.installs.count == 1,
+            "release diagnosis did not install and verify the background service"
+        )
+        try require(
+            serviceManager.installs.first?.appURL == applicationURL
+                && serviceManager.installs.first?.supportURL == fixture.environment.supportURL,
+            "release service install received the wrong application or support path"
+        )
+        try require(
+            coordinator.checks[.serviceHealth] == true,
+            "healthy Agent-owned service state did not satisfy service readiness"
+        )
+    }
+
+    private static func testVisibleAppGrantsCannotOverrideUnhealthyAgentPermissions() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let runner = FakeRuntimeRunner()
+        runner.events[.diagnose] = [event("diagnosis_complete")]
+        let serviceManager = FakeServiceManager(state: .unhealthy)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: serviceManager
+        )
+
+        await coordinator.refreshPermissions()
+        await coordinator.runDiagnosis()
+
+        try require(
+            coordinator.permissionStates[.camera] == .granted
+                && coordinator.permissionStates[.inputMonitoring] == .granted
+                && coordinator.permissionStates[.accessibility] == .granted,
+            "fixture did not establish visible-app grants"
+        )
+        try require(
+            coordinator.checks[.serviceHealth] == false,
+            "visible-app grants overrode unhealthy Agent permission state"
+        )
+        try require(
+            !coordinator.readiness.canEnableProtection,
+            "protection became available while Agent permission health was false"
+        )
+    }
+
+    private static func testSourceModePreservesExistingServiceHealthBoundary() async throws {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let runner = FakeRuntimeRunner()
+        runner.events[.diagnose] = [event("diagnosis_complete")]
+        let serviceManager = FakeServiceManager(state: .healthy)
+        let provider = FakeServiceHealthProvider(healthy: true)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: serviceManager,
+            serviceHealthProvider: provider
+        )
+
+        await coordinator.runDiagnosis()
+
+        try require(
+            serviceManager.installs.isEmpty,
+            "source mode attempted to install the release LaunchAgent"
+        )
+        try require(
+            coordinator.checks[.serviceHealth] == true,
+            "source mode stopped honoring its existing health boundary"
+        )
     }
 
     private static func testCancellationIgnoresLateProgress() async throws {

@@ -1,3 +1,4 @@
+import os
 import tempfile
 import threading
 import time
@@ -6,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent import FaceLockAgent
+from agent import FaceLockAgent, probe_agent_permissions
 from control_store import read_control, write_control
 from face_verifier import VerifyResult
 from runtime_paths import RuntimePaths
@@ -62,6 +63,44 @@ class InlineActivityWriter:
 
 
 class AgentControlTests(unittest.TestCase):
+    def test_agent_permission_probe_checks_authorization_without_opening_camera(
+        self,
+    ) -> None:
+        capture_device = types.SimpleNamespace(
+            authorizationStatusForMediaType_=lambda _media_type: 3
+        )
+        av_foundation = types.ModuleType("AVFoundation")
+        av_foundation.AVMediaTypeVideo = "video"
+        av_foundation.AVAuthorizationStatusAuthorized = 3
+        av_foundation.AVCaptureDevice = capture_device
+        quartz = types.ModuleType("Quartz")
+        quartz.CGPreflightListenEventAccess = lambda: False
+        application_services = types.ModuleType("ApplicationServices")
+        application_services.AXIsProcessTrusted = lambda: True
+
+        real_import = __import__
+
+        def import_probe(name, *args, **kwargs):
+            if name == "AVFoundation":
+                return av_foundation
+            if name == "Quartz":
+                return quartz
+            if name == "ApplicationServices":
+                return application_services
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_probe):
+            readiness = probe_agent_permissions()
+
+        self.assertEqual(
+            readiness,
+            {
+                "camera_ready": True,
+                "input_monitoring_ready": False,
+                "accessibility_ready": True,
+            },
+        )
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         directory = Path(self.temporary_directory.name)
@@ -363,6 +402,14 @@ class AgentControlTests(unittest.TestCase):
 
         with (
             patch.dict("sys.modules", {"pynput": pynput}),
+            patch(
+                "agent.probe_agent_permissions",
+                return_value={
+                    "camera_ready": False,
+                    "input_monitoring_ready": False,
+                    "accessibility_ready": False,
+                },
+            ),
             patch("agent.replace_state") as replace_state,
         ):
             agent.run()
@@ -373,6 +420,72 @@ class AgentControlTests(unittest.TestCase):
         self.assertEqual(initial_state["action"], "allow_paused")
         self.assertEqual(initial_state["heartbeat"], "paused")
         self.append_activity.assert_not_called()
+
+    def test_run_publishes_agent_owned_permission_readiness_without_camera_capture(
+        self,
+    ) -> None:
+        write_control(False, self.control_path)
+        agent = self.make_agent()
+        agent.stop_event.set()
+        pynput = types.ModuleType("pynput")
+        pynput.keyboard = types.SimpleNamespace(Listener=FakeListener)
+        pynput.mouse = types.SimpleNamespace(Listener=FakeListener)
+        readiness = {
+            "camera_ready": True,
+            "input_monitoring_ready": False,
+            "accessibility_ready": True,
+        }
+
+        with (
+            patch.dict("sys.modules", {"pynput": pynput}),
+            patch("agent.probe_agent_permissions", return_value=readiness) as probe,
+            patch("agent.replace_state") as replace_state,
+            patch("agent.verify_current_user") as verify_current_user,
+        ):
+            agent.run()
+
+        probe.assert_called()
+        verify_current_user.assert_not_called()
+        initial_state = replace_state.call_args.args[0]
+        self.assertEqual(initial_state["agent_pid"], os.getpid())
+        self.assertIs(initial_state["camera_ready"], True)
+        self.assertIs(initial_state["input_monitoring_ready"], False)
+        self.assertIs(initial_state["accessibility_ready"], True)
+
+    def test_run_publishes_readiness_only_after_input_listeners_start(self) -> None:
+        write_control(False, self.control_path)
+        agent = self.make_agent()
+        agent.stop_event.set()
+        started = []
+
+        class OrderingListener(FakeListener):
+            def start(self) -> None:
+                started.append(self)
+
+        pynput = types.ModuleType("pynput")
+        pynput.keyboard = types.SimpleNamespace(Listener=OrderingListener)
+        pynput.mouse = types.SimpleNamespace(Listener=OrderingListener)
+
+        def publish_state(_state):
+            self.assertEqual(
+                len(started),
+                2,
+                "Agent readiness was published before both input listeners started",
+            )
+
+        with (
+            patch.dict("sys.modules", {"pynput": pynput}),
+            patch(
+                "agent.probe_agent_permissions",
+                return_value={
+                    "camera_ready": True,
+                    "input_monitoring_ready": True,
+                    "accessibility_ready": True,
+                },
+            ),
+            patch("agent.replace_state", side_effect=publish_state),
+        ):
+            agent.run()
 
     def test_entering_armed_state_emits_activity_event(self) -> None:
         agent = self.make_agent(idle_seconds_before_armed=60)
@@ -669,6 +782,14 @@ class AgentControlTests(unittest.TestCase):
         try:
             with (
                 patch.dict("sys.modules", {"pynput": pynput}),
+                patch(
+                    "agent.probe_agent_permissions",
+                    return_value={
+                        "camera_ready": False,
+                        "input_monitoring_ready": False,
+                        "accessibility_ready": False,
+                    },
+                ),
                 patch("agent.replace_state", side_effect=lambda *_: run_started.set()),
                 patch("agent.verify_current_user", side_effect=blocking_verify) as verify,
             ):
@@ -894,6 +1015,14 @@ class AgentControlTests(unittest.TestCase):
         pynput.mouse = types.SimpleNamespace(Listener=FakeListener)
         with (
             patch.dict("sys.modules", {"pynput": pynput}),
+            patch(
+                "agent.probe_agent_permissions",
+                return_value={
+                    "camera_ready": False,
+                    "input_monitoring_ready": False,
+                    "accessibility_ready": False,
+                },
+            ),
             patch("agent.replace_state") as replace_state,
         ):
             agent.run()

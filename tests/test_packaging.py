@@ -23,6 +23,40 @@ UI_BUILD_SCRIPT = PROJECT_DIR / "scripts" / "build-status-app.sh"
 
 
 class UnifiedPackagingTests(unittest.TestCase):
+    def test_release_launchagent_targets_only_embedded_agent_and_support_paths(
+        self,
+    ) -> None:
+        plist_path = (
+            PROJECT_DIR / "launchd" / "com.wuyi.mac-face-lock-release.plist"
+        )
+        with plist_path.open("rb") as handle:
+            launch = plistlib.load(handle)
+
+        self.assertEqual(launch["Label"], "com.wuyi.mac-face-lock-agent")
+        self.assertEqual(
+            launch["ProgramArguments"],
+            [
+                "__APP_URL__/Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent",
+                "--resources-dir",
+                "__APP_URL__/Contents/Resources",
+                "--support-dir",
+                "__SUPPORT_URL__",
+                "agent",
+            ],
+        )
+        rendered = plist_path.read_text(encoding="utf-8")
+        self.assertNotIn(".venv", rendered)
+        self.assertNotIn("__PROJECT_DIR__", rendered)
+
+    def test_unified_builder_embeds_agent_and_release_service_template(self) -> None:
+        script = UI_BUILD_SCRIPT.read_text()
+
+        self.assertIn(
+            'Contents/Library/LoginItems/Mac Face Lock Agent.app',
+            script,
+        )
+        self.assertIn("com.wuyi.mac-face-lock-release.plist", script)
+
     def test_bundle_metadata_names_the_unified_application(self) -> None:
         info_path = PROJECT_DIR / "src" / "app" / "Info.plist"
         with info_path.open("rb") as handle:

@@ -38,7 +38,9 @@ final class SetupCoordinator: ObservableObject {
     private let setupStore: SetupStore
     private let localStore: LocalJSONStore
     private let runtimeRunner: RuntimeCommandRunning
+    private let serviceManager: ServiceManaging?
     private let serviceHealthProvider: SetupServiceHealthProviding
+    private let applicationURL: URL
     private let fileManager: FileManager
 
     private var ownerProfileValid: Bool
@@ -55,7 +57,9 @@ final class SetupCoordinator: ObservableObject {
         setupStore: SetupStore,
         localStore: LocalJSONStore,
         runtimeRunner: RuntimeCommandRunning? = nil,
+        serviceManager: ServiceManaging? = nil,
         serviceHealthProvider: SetupServiceHealthProviding? = nil,
+        applicationURL: URL? = nil,
         fileManager: FileManager = .default
     ) {
         self.environment = environment
@@ -63,6 +67,18 @@ final class SetupCoordinator: ObservableObject {
         self.setupStore = setupStore
         self.localStore = localStore
         self.runtimeRunner = runtimeRunner ?? RuntimeCommandRunner(environment: environment)
+        let resolvedApplicationURL = (
+            applicationURL ?? Bundle.main.bundleURL
+        ).standardizedFileURL
+        self.applicationURL = resolvedApplicationURL
+        if environment.mode == .release {
+            self.serviceManager = serviceManager ?? ServiceManager(
+                appURL: resolvedApplicationURL,
+                supportURL: environment.supportURL
+            )
+        } else {
+            self.serviceManager = serviceManager
+        }
         self.serviceHealthProvider =
             serviceHealthProvider ?? UnavailableSetupServiceHealthProvider()
         self.fileManager = fileManager
@@ -141,6 +157,7 @@ final class SetupCoordinator: ObservableObject {
                 return
             }
             try markEnrollmentCompleted()
+            currentError = nil
             updateReadiness()
         } catch is CancellationError {
             enrollmentGeneration = nil
@@ -174,7 +191,11 @@ final class SetupCoordinator: ObservableObject {
             currentError = localizedRuntimeError(error)
             diagnosisPassed = false
         }
-        serviceHealthy = await serviceHealthProvider.isServiceHealthy()
+        if environment.mode == .release {
+            await installAndRefreshReleaseService()
+        } else {
+            serviceHealthy = await serviceHealthProvider.isServiceHealthy()
+        }
         updateReadiness()
     }
 
@@ -321,6 +342,36 @@ final class SetupCoordinator: ObservableObject {
         )
         readiness = evaluated
         checks = evaluated.checks
+    }
+
+    private func installAndRefreshReleaseService() async {
+        serviceHealthy = false
+        guard diagnosisPassed, let serviceManager else {
+            return
+        }
+        do {
+            _ = try localStore.writeControl(enabled: false)
+            try await serviceManager.install(
+                appURL: applicationURL,
+                supportURL: environment.supportURL
+            )
+            let serviceStatus = await serviceManager.status()
+            serviceHealthy = serviceStatus.isHealthy
+            switch serviceStatus.state {
+            case .healthy:
+                break
+            case .needsRepair:
+                currentError = "应用位置已变化，请重新安装后台服务后再开启保护。"
+            case .notInstalled:
+                currentError = "后台服务尚未安装，请重新运行诊断。"
+            case .unhealthy:
+                currentError = "后台 Agent 权限或运行状态未就绪，请完成授权并重新运行诊断。"
+            }
+        } catch {
+            serviceHealthy = false
+            _ = try? localStore.writeControl(enabled: false)
+            currentError = localizedRuntimeError(error)
+        }
     }
 
     private static func repairInstruction(for exitCode: Int32) -> String {

@@ -102,8 +102,14 @@ class BuildRecoveryTests(unittest.TestCase):
         self.root = Path(self.temporary_directory.name) / "project"
         (self.root / "scripts").mkdir(parents=True)
         (self.root / "src" / "app").mkdir(parents=True)
+        (self.root / "src" / "agent-launcher").mkdir(parents=True)
+        (self.root / "launchd").mkdir()
         (self.root / ".test-bin").mkdir()
         shutil.copy2(BUILD_SCRIPT, self.root / "scripts" / BUILD_SCRIPT.name)
+        shutil.copy2(
+            PROJECT_DIR / "scripts" / "build-app.sh",
+            self.root / "scripts" / "build-app.sh",
+        )
         shutil.copy2(SWAP_HELPER, self.root / "scripts" / SWAP_HELPER.name)
         shutil.copy2(
             PROJECT_DIR / "src" / "app" / "Info.plist",
@@ -111,6 +117,13 @@ class BuildRecoveryTests(unittest.TestCase):
         )
         (self.root / "src" / "app" / "main.swift").write_text(
             "@main enum App { static func main() {} }\n", encoding="utf-8"
+        )
+        (self.root / "src" / "agent-launcher" / "main.swift").write_text(
+            "@main enum Agent { static func main() {} }\n", encoding="utf-8"
+        )
+        shutil.copy2(
+            PROJECT_DIR / "launchd" / "com.wuyi.mac-face-lock-release.plist",
+            self.root / "launchd" / "com.wuyi.mac-face-lock-release.plist",
         )
         self._write_tool(
             "xcrun",
@@ -141,6 +154,17 @@ exit 2
 """,
         )
         self._write_tool("plutil", "#!/bin/bash\nexit 0\n")
+        agent_bundle = self.root / "dist" / "Mac Face Lock Agent.app"
+        agent_executable = (
+            agent_bundle / "Contents" / "MacOS" / "MacFaceLockAgent"
+        )
+        agent_executable.parent.mkdir(parents=True)
+        agent_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+        agent_executable.chmod(0o755)
+        (agent_bundle / "Contents" / "Info.plist").write_text(
+            "fixture", encoding="utf-8"
+        )
+        (agent_bundle / ".test-signed").touch()
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()

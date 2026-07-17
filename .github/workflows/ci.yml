@@ -79,6 +79,13 @@ jobs:
             tests/swift/RuntimeCommandRunnerTests.swift \
             -o "$RUNNER_TEMP/mac-face-lock-runtime-command-tests"
           "$RUNNER_TEMP/mac-face-lock-runtime-command-tests"
+      - name: Run Swift service-manager tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/Models.swift src/app/ServiceManager.swift \
+            tests/swift/ServiceManagerTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-service-manager-tests"
+          "$RUNNER_TEMP/mac-face-lock-service-manager-tests"
       - name: Run Swift setup-coordinator tests
         run: |
           xcrun swiftc -parse-as-library -DTESTING \
@@ -86,7 +93,7 @@ jobs:
             src/app/Models.swift src/app/SetupModels.swift \
             src/app/LocalJSONStore.swift src/app/SetupStore.swift \
             src/app/PermissionCenter.swift src/app/RuntimeCommandRunner.swift \
-            src/app/SetupCoordinator.swift \
+            src/app/ServiceManager.swift src/app/SetupCoordinator.swift \
             tests/swift/SetupCoordinatorTests.swift \
             -framework AppKit -framework AVFoundation \
             -framework ApplicationServices -framework CoreGraphics \
@@ -125,6 +132,7 @@ jobs:
         run: |
           plutil -lint src/app/Info.plist \
             launchd/com.wuyi.mac-face-lock-agent.plist \
+            launchd/com.wuyi.mac-face-lock-release.plist \
             launchd/com.wuyi.mac-face-lock-status.plist \
             "dist/Mac Face Lock Agent.app/Contents/Info.plist" \
             "dist/Mac Face Lock.app/Contents/Info.plist"
