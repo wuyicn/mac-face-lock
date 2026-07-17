@@ -13,18 +13,21 @@ protocol OwnerProfileInspecting: AnyObject {
 }
 
 final class NumpyOwnerProfileInspector: OwnerProfileInspecting {
-    private let maximumBytes = 64 * 1_024 * 1_024
-    private let expectedColumns = 96 * 96
+    private let maximumBytes = 67_108_864
+    private let expectedColumns = 9_216
 
     func inspect(_ url: URL) -> OwnerProfileInspection {
         guard let data = try? Data(
             contentsOf: url,
             options: [.mappedIfSafe]
-        ), data.count >= 16, data.count <= maximumBytes,
+        ), data.count >= 10, data.count <= maximumBytes,
               Array(data.prefix(6)) == [0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59] else {
             return OwnerProfileInspection(isValid: false, fingerprint: nil)
         }
         let major = data[6]
+        guard data[7] == 0 else {
+            return OwnerProfileInspection(isValid: false, fingerprint: nil)
+        }
         let headerStart: Int
         let headerLength: Int
         if major == 1, data.count >= 10 {
@@ -32,26 +35,32 @@ final class NumpyOwnerProfileInspector: OwnerProfileInspecting {
             headerLength = Int(data[8]) | (Int(data[9]) << 8)
         } else if (major == 2 || major == 3), data.count >= 12 {
             headerStart = 12
-            headerLength = Int(data[8])
-                | (Int(data[9]) << 8)
-                | (Int(data[10]) << 16)
-                | (Int(data[11]) << 24)
+            let rawHeaderLength = UInt32(data[8])
+                | (UInt32(data[9]) << 8)
+                | (UInt32(data[10]) << 16)
+                | (UInt32(data[11]) << 24)
+            guard let convertedHeaderLength = Int(exactly: rawHeaderLength) else {
+                return OwnerProfileInspection(isValid: false, fingerprint: nil)
+            }
+            headerLength = convertedHeaderLength
         } else {
             return OwnerProfileInspection(isValid: false, fingerprint: nil)
         }
-        let payloadStart = headerStart + headerLength
-        guard headerLength > 0, payloadStart <= data.count,
-              let header = String(
-                  data: data[headerStart..<payloadStart],
-                  encoding: .ascii
-              ),
-              header.contains("'fortran_order': False")
-                || header.contains("\"fortran_order\": False"),
-              header.contains("'<f4'")
-                || header.contains("\"<f4\"")
-                || header.contains("'=f4'")
-                || header.contains("\"=f4\""),
-              let shape = parseShape(header),
+        let payloadStartResult = headerStart.addingReportingOverflow(headerLength)
+        guard headerLength > 0, !payloadStartResult.overflow,
+              payloadStartResult.partialValue <= data.count else {
+            return OwnerProfileInspection(isValid: false, fingerprint: nil)
+        }
+        let payloadStart = payloadStartResult.partialValue
+        let headerBytes = Array(data[headerStart..<payloadStart])
+        guard var parser = NumpyHeaderParser(bytes: headerBytes),
+              let metadata = parser.parse(),
+              metadata.descr == "<f4",
+              metadata.fortranOrder == false else {
+            return OwnerProfileInspection(isValid: false, fingerprint: nil)
+        }
+        let shape = metadata.shape
+        guard
               shape.rows >= 2,
               shape.columns == expectedColumns else {
             return OwnerProfileInspection(isValid: false, fingerprint: nil)
@@ -61,41 +70,251 @@ final class NumpyOwnerProfileInspector: OwnerProfileInspecting {
             return OwnerProfileInspection(isValid: false, fingerprint: nil)
         }
         let payloadBytes = valueCount.partialValue.multipliedReportingOverflow(by: 4)
-        guard !payloadBytes.overflow,
-              payloadStart + payloadBytes.partialValue == data.count else {
+        guard !payloadBytes.overflow else {
             return OwnerProfileInspection(isValid: false, fingerprint: nil)
         }
-        var offset = payloadStart
-        while offset < data.count {
-            let bits = UInt32(data[offset])
-                | (UInt32(data[offset + 1]) << 8)
-                | (UInt32(data[offset + 2]) << 16)
-                | (UInt32(data[offset + 3]) << 24)
-            guard Float(bitPattern: bits).isFinite else {
+        let payloadEnd = payloadStart.addingReportingOverflow(
+            payloadBytes.partialValue
+        )
+        guard !payloadEnd.overflow, payloadEnd.partialValue == data.count else {
+            return OwnerProfileInspection(isValid: false, fingerprint: nil)
+        }
+        var bits: UInt32 = 0
+        var byteIndex = 0
+        for byte in data[payloadStart..<payloadEnd.partialValue] {
+            switch byteIndex {
+            case 0:
+                bits = UInt32(byte)
+                byteIndex = 1
+            case 1:
+                bits |= UInt32(byte) << 8
+                byteIndex = 2
+            case 2:
+                bits |= UInt32(byte) << 16
+                byteIndex = 3
+            case 3:
+                bits |= UInt32(byte) << 24
+                guard Float(bitPattern: bits).isFinite else {
+                    return OwnerProfileInspection(isValid: false, fingerprint: nil)
+                }
+                bits = 0
+                byteIndex = 0
+            default:
                 return OwnerProfileInspection(isValid: false, fingerprint: nil)
             }
-            offset += 4
+        }
+        guard byteIndex == 0 else {
+            return OwnerProfileInspection(isValid: false, fingerprint: nil)
         }
         let fingerprint = SHA256.hash(data: data)
             .map { String(format: "%02x", $0) }
             .joined()
         return OwnerProfileInspection(isValid: true, fingerprint: fingerprint)
     }
+}
 
-    private func parseShape(_ header: String) -> (rows: Int, columns: Int)? {
-        let pattern = #"'shape'\s*:\s*\(\s*([0-9]+)\s*,\s*([0-9]+)\s*,?\s*\)"#
-        guard let expression = try? NSRegularExpression(pattern: pattern),
-              let match = expression.firstMatch(
-                  in: header,
-                  range: NSRange(header.startIndex..., in: header)
-              ),
-              let rowsRange = Range(match.range(at: 1), in: header),
-              let columnsRange = Range(match.range(at: 2), in: header),
-              let rows = Int(header[rowsRange]),
-              let columns = Int(header[columnsRange]) else {
+private struct NumpyHeaderParser {
+    struct Metadata {
+        let descr: String
+        let fortranOrder: Bool
+        let shape: (rows: Int, columns: Int)
+    }
+
+    private let bytes: [UInt8]
+    private var index = 0
+
+    init?(bytes: [UInt8]) {
+        guard bytes.allSatisfy({ $0 < 0x80 }) else {
+            return nil
+        }
+        self.bytes = bytes
+    }
+
+    mutating func parse() -> Metadata? {
+        skipWhitespace()
+        guard consume(0x7B) else {
+            return nil
+        }
+        var descr: String?
+        var fortranOrder: Bool?
+        var shape: (rows: Int, columns: Int)?
+        var seenKeys = Set<String>()
+
+        while true {
+            skipWhitespace()
+            if consume(0x7D) {
+                break
+            }
+            guard let key = parseString(), seenKeys.insert(key).inserted else {
+                return nil
+            }
+            skipWhitespace()
+            guard consume(0x3A) else {
+                return nil
+            }
+            skipWhitespace()
+            switch key {
+            case "descr":
+                guard let value = parseString() else {
+                    return nil
+                }
+                descr = value
+            case "fortran_order":
+                guard let value = parseBoolean() else {
+                    return nil
+                }
+                fortranOrder = value
+            case "shape":
+                guard let value = parseShape() else {
+                    return nil
+                }
+                shape = value
+            default:
+                return nil
+            }
+            skipWhitespace()
+            if consume(0x2C) {
+                continue
+            }
+            guard consume(0x7D) else {
+                return nil
+            }
+            break
+        }
+        skipWhitespace()
+        guard index == bytes.count, seenKeys.count == 3,
+              let descr, let fortranOrder, let shape else {
+            return nil
+        }
+        return Metadata(
+            descr: descr,
+            fortranOrder: fortranOrder,
+            shape: shape
+        )
+    }
+
+    private mutating func parseString() -> String? {
+        guard index < bytes.count,
+              bytes[index] == 0x27 || bytes[index] == 0x22 else {
+            return nil
+        }
+        let quote = bytes[index]
+        guard advance() else {
+            return nil
+        }
+        let start = index
+        while index < bytes.count, bytes[index] != quote {
+            guard bytes[index] != 0x5C else {
+                return nil
+            }
+            guard advance() else {
+                return nil
+            }
+        }
+        guard index < bytes.count else {
+            return nil
+        }
+        let value = String(decoding: bytes[start..<index], as: UTF8.self)
+        guard advance() else {
+            return nil
+        }
+        return value
+    }
+
+    private mutating func parseBoolean() -> Bool? {
+        if consumeLiteral("False") {
+            return false
+        }
+        if consumeLiteral("True") {
+            return true
+        }
+        return nil
+    }
+
+    private mutating func parseShape() -> (rows: Int, columns: Int)? {
+        guard consume(0x28) else {
+            return nil
+        }
+        skipWhitespace()
+        guard let rows = parseUnsignedInteger() else {
+            return nil
+        }
+        skipWhitespace()
+        guard consume(0x2C) else {
+            return nil
+        }
+        skipWhitespace()
+        guard let columns = parseUnsignedInteger() else {
+            return nil
+        }
+        skipWhitespace()
+        _ = consume(0x2C)
+        skipWhitespace()
+        guard consume(0x29) else {
             return nil
         }
         return (rows, columns)
+    }
+
+    private mutating func parseUnsignedInteger() -> Int? {
+        let start = index
+        var value = 0
+        while index < bytes.count, bytes[index] >= 0x30, bytes[index] <= 0x39 {
+            let multiplied = value.multipliedReportingOverflow(by: 10)
+            guard !multiplied.overflow else {
+                return nil
+            }
+            let added = multiplied.partialValue.addingReportingOverflow(
+                Int(bytes[index] - 0x30)
+            )
+            guard !added.overflow else {
+                return nil
+            }
+            value = added.partialValue
+            guard advance() else {
+                return nil
+            }
+        }
+        return index > start ? value : nil
+    }
+
+    private mutating func consumeLiteral(_ literal: String) -> Bool {
+        let literalBytes = Array(literal.utf8)
+        let end = index.addingReportingOverflow(literalBytes.count)
+        guard !end.overflow, end.partialValue <= bytes.count,
+              Array(bytes[index..<end.partialValue]) == literalBytes else {
+            return false
+        }
+        index = end.partialValue
+        return true
+    }
+
+    private mutating func skipWhitespace() {
+        while index < bytes.count,
+              bytes[index] == 0x20
+                || bytes[index] == 0x09
+                || bytes[index] == 0x0A
+                || bytes[index] == 0x0D {
+            guard advance() else {
+                return
+            }
+        }
+    }
+
+    private mutating func consume(_ byte: UInt8) -> Bool {
+        guard index < bytes.count, bytes[index] == byte else {
+            return false
+        }
+        return advance()
+    }
+
+    private mutating func advance() -> Bool {
+        let next = index.addingReportingOverflow(1)
+        guard !next.overflow, next.partialValue <= bytes.count else {
+            return false
+        }
+        index = next.partialValue
+        return true
     }
 }
 
@@ -115,6 +334,11 @@ enum SetupCoordinatorError: Error, Equatable, LocalizedError {
 
 protocol SetupServiceHealthProviding: AnyObject {
     func isServiceHealthy() async -> Bool
+}
+
+private struct RuntimeReadinessWaiter {
+    let id: UUID
+    let continuation: CheckedContinuation<Bool, Never>
 }
 
 private final class UnavailableSetupServiceHealthProvider: SetupServiceHealthProviding {
@@ -154,11 +378,12 @@ final class SetupCoordinator: ObservableObject {
     private var serviceHealthy = false
     private var enrollmentTask: Task<RuntimeResult, Error>?
     private var enrollmentGeneration: UUID?
+    private var enrollmentPermitWaiterID: UUID?
     private var profileRevision: UInt64 = 0
     private var currentOwnerFingerprint: String?
     private var runtimeValidationRequired: Bool
     private var runtimeReadinessBusy = false
-    private var runtimeReadinessWaiters: [CheckedContinuation<Void, Never>] = []
+    private var runtimeReadinessWaiters: [RuntimeReadinessWaiter] = []
 
     init(
         environment: AppEnvironment,
@@ -362,8 +587,15 @@ final class SetupCoordinator: ObservableObject {
             return
         }
         enrollmentLifecycle = .running
-        await acquireRuntimeReadinessPermit()
-        guard enrollmentLifecycle == .running else {
+        let acquiredPermit = await acquireRuntimeReadinessPermit { [weak self] id in
+            self?.enrollmentPermitWaiterID = id
+        }
+        enrollmentPermitWaiterID = nil
+        guard acquiredPermit else {
+            enrollmentLifecycle = .idle
+            return
+        }
+        guard !Task.isCancelled, enrollmentLifecycle == .running else {
             releaseRuntimeReadinessPermit()
             enrollmentLifecycle = .idle
             return
@@ -376,6 +608,13 @@ final class SetupCoordinator: ObservableObject {
         let generation = UUID()
         enrollmentGeneration = generation
 
+        guard !Task.isCancelled, enrollmentLifecycle == .running else {
+            enrollmentGeneration = nil
+            progress = nil
+            releaseRuntimeReadinessPermit()
+            enrollmentLifecycle = .idle
+            return
+        }
         let task = Task { [runtimeRunner] in
             try await runtimeRunner.run(command: .enroll) { [weak self] event in
                 Task { @MainActor [weak self] in
@@ -432,13 +671,22 @@ final class SetupCoordinator: ObservableObject {
         enrollmentLifecycle = .cancelling
         enrollmentGeneration = nil
         progress = nil
+        if let waiterID = enrollmentPermitWaiterID {
+            enrollmentPermitWaiterID = nil
+            cancelRuntimeReadinessWaiter(id: waiterID)
+        }
         let task = enrollmentTask
         task?.cancel()
     }
 
     func runDiagnosis() async {
-        await acquireRuntimeReadinessPermit()
+        guard await acquireRuntimeReadinessPermit() else {
+            return
+        }
         defer { releaseRuntimeReadinessPermit() }
+        guard !Task.isCancelled else {
+            return
+        }
         await probeRuntimeDiagnosis()
         await refreshServiceAfterDiagnosis()
         updateReadiness()
@@ -484,8 +732,13 @@ final class SetupCoordinator: ObservableObject {
 
     @discardableResult
     func runSafetyTest() async -> Bool {
-        await acquireRuntimeReadinessPermit()
+        guard await acquireRuntimeReadinessPermit() else {
+            return false
+        }
         defer { releaseRuntimeReadinessPermit() }
+        guard !Task.isCancelled else {
+            return false
+        }
         await probeRuntimeDiagnosis()
         await refreshServiceAfterDiagnosis()
         guard diagnosisPassed else {
@@ -522,8 +775,13 @@ final class SetupCoordinator: ObservableObject {
             updateReadiness()
             return
         }
-        await acquireRuntimeReadinessPermit()
+        guard await acquireRuntimeReadinessPermit() else {
+            return
+        }
         defer { releaseRuntimeReadinessPermit() }
+        guard !Task.isCancelled else {
+            return
+        }
         await verifyOwnerWithoutLockingInsidePermit()
     }
 
@@ -572,8 +830,11 @@ final class SetupCoordinator: ObservableObject {
             currentError = "本人录入仍在结束处理中，请稍后再试。"
             throw error
         }
-        await acquireRuntimeReadinessPermit()
+        guard await acquireRuntimeReadinessPermit() else {
+            throw CancellationError()
+        }
         defer { releaseRuntimeReadinessPermit() }
+        try Task.checkCancellation()
         currentError = nil
         await refreshPermissions()
         await probeRuntimeDiagnosis()
@@ -1012,13 +1273,35 @@ final class SetupCoordinator: ObservableObject {
         }
     }
 
-    private func acquireRuntimeReadinessPermit() async {
+    private func acquireRuntimeReadinessPermit(
+        onQueued: ((UUID) -> Void)? = nil
+    ) async -> Bool {
+        guard !Task.isCancelled else {
+            return false
+        }
         if !runtimeReadinessBusy {
             runtimeReadinessBusy = true
-            return
+            return true
         }
-        await withCheckedContinuation { continuation in
-            runtimeReadinessWaiters.append(continuation)
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                runtimeReadinessWaiters.append(
+                    RuntimeReadinessWaiter(
+                        id: id,
+                        continuation: continuation
+                    )
+                )
+                onQueued?(id)
+            }
+        } onCancel: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.cancelRuntimeReadinessWaiter(id: id)
+            }
         }
     }
 
@@ -1027,7 +1310,17 @@ final class SetupCoordinator: ObservableObject {
             runtimeReadinessBusy = false
             return
         }
-        runtimeReadinessWaiters.removeFirst().resume()
+        runtimeReadinessWaiters.removeFirst().continuation.resume(returning: true)
+    }
+
+    private func cancelRuntimeReadinessWaiter(id: UUID) {
+        guard let index = runtimeReadinessWaiters.firstIndex(where: {
+            $0.id == id
+        }) else {
+            return
+        }
+        let waiter = runtimeReadinessWaiters.remove(at: index)
+        waiter.continuation.resume(returning: false)
     }
 
     private func updateReadiness() {

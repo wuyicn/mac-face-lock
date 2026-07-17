@@ -446,6 +446,72 @@ private final class SerializedDiagnosisRunner: RuntimeCommandRunning {
     }
 }
 
+private final class EnrollmentQueueCancellationRunner: RuntimeCommandRunning {
+    private var diagnosisContinuation: CheckedContinuation<Void, Never>?
+    private(set) var diagnosisStarted = false
+    private(set) var enrollmentCommands = 0
+
+    func run(
+        command: RuntimeCommand,
+        onEvent: @escaping (RuntimeEvent) -> Void
+    ) async throws -> RuntimeResult {
+        switch command {
+        case .diagnose:
+            diagnosisStarted = true
+            await withCheckedContinuation { continuation in
+                diagnosisContinuation = continuation
+            }
+            return RuntimeResult(
+                exitCode: 0,
+                events: [
+                    RuntimeEvent(
+                        schemaVersion: 1,
+                        event: "diagnosis_check",
+                        status: "success",
+                        message: "template",
+                        check: "template"
+                    ),
+                    RuntimeEvent(
+                        schemaVersion: 1,
+                        event: "diagnosis_complete",
+                        status: "success",
+                        message: "complete"
+                    ),
+                ],
+                stderr: "",
+                stderrTruncated: false
+            )
+        case .enroll:
+            enrollmentCommands += 1
+            let terminal = RuntimeEvent(
+                schemaVersion: 1,
+                event: "enrollment_complete",
+                status: "success",
+                message: "complete"
+            )
+            onEvent(terminal)
+            return RuntimeResult(
+                exitCode: 0,
+                events: [terminal],
+                stderr: "",
+                stderrTruncated: false
+            )
+        default:
+            return RuntimeResult(
+                exitCode: 20,
+                events: [],
+                stderr: "",
+                stderrTruncated: false
+            )
+        }
+    }
+
+    func completeDiagnosis() {
+        diagnosisContinuation?.resume()
+        diagnosisContinuation = nil
+    }
+}
+
 private struct CoordinatorFixture {
     let root: URL
     let localStore: LocalJSONStore
@@ -508,6 +574,8 @@ struct SetupCoordinatorTests {
         try await testFreshPreparationPassiveRefreshRunsNoRuntimeCommand()
         try await testRuntimeDiagnosticsAreSerialized()
         try testStrictStaticOwnerProfileInspection()
+        try testAdversarialOwnerProfilesAreRejectedWithoutCoordinatorCrash()
+        try await testQueuedEnrollmentCancellationNeverStartsRuntime()
         try await testCameraOnlyDiagnosisKeepsValidOwnerProfile()
         try await testCompletedCameraRevocationRecoveryPreservesHistoryAndSkipsEnrollment()
         print("Setup coordinator tests passed")
@@ -1278,6 +1346,113 @@ struct SetupCoordinatorTests {
         )
     }
 
+    private static func testAdversarialOwnerProfilesAreRejectedWithoutCoordinatorCrash()
+        throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        let validHeader =
+            "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 9216), }"
+        let hostileFiles = [
+            numpyContainer(
+                header: "{'descr': '<f4', 'fortran_order': False, "
+                    + "'shape': (9223372036854775807, 9216), }"
+            ),
+            numpyContainer(
+                header: "{'descr': '<f4', 'descr': '<f4', "
+                    + "'fortran_order': False, 'shape': (2, 9216), }",
+                payloadBytes: 2 * 9_216 * 4
+            ),
+            numpyContainer(
+                header: "{'descr': '|O', 'fortran_order': False, "
+                    + "'shape': (2, 9216), 'note': '<f4', }",
+                payloadBytes: 2 * 9_216 * 4
+            ),
+            numpyContainer(
+                header: "{'descr': [('face', '<f4')], 'fortran_order': False, "
+                    + "'shape': (2, 9216), }",
+                payloadBytes: 2 * 9_216 * 4
+            ),
+            numpyContainer(
+                header: "{'descr': '|O', 'fortran_order': False, "
+                    + "'shape': (2, 9216), }",
+                payloadBytes: 2 * 9_216 * 4
+            ),
+            numpyContainer(
+                header: "{'descr': ('<f4', (2,)), 'fortran_order': False, "
+                    + "'shape': (2, 9216), }",
+                payloadBytes: 2 * 9_216 * 4
+            ),
+            numpyContainer(
+                header: "{'descr': '>f4', 'fortran_order': False, "
+                    + "'shape': (2, 9216), }",
+                payloadBytes: 2 * 9_216 * 4
+            ),
+            numpyContainer(
+                header: "{'descr': '<f4', 'fortran_order': True, "
+                    + "'shape': (2, 9216), }",
+                payloadBytes: 2 * 9_216 * 4
+            ),
+            numpyContainer(
+                header: validHeader,
+                payloadBytes: 2 * 9_216 * 4 - 1
+            ),
+            numpyContainer(
+                header: validHeader,
+                payloadBytes: 0,
+                declaredHeaderLength: validHeader.utf8.count + 128
+            ),
+            numpyContainer(
+                header: "{'descr': '<f4', 'fortran_order': False, "
+                    + "'shape': (999999999, 9216), }"
+            ),
+            numpyV2Container(declaredHeaderLength: UInt32.max),
+        ]
+        let inspector = NumpyOwnerProfileInspector()
+
+        for (index, hostileFile) in hostileFiles.enumerated() {
+            try hostileFile.write(to: ownerURL)
+            try require(
+                !inspector.inspect(ownerURL).isValid,
+                "hostile NPY case \(index) was accepted"
+            )
+            _ = SetupCoordinator(
+                environment: fixture.environment,
+                permissionCenter: PermissionCenter(
+                    provider: CoordinatorPermissionProvider()
+                ),
+                setupStore: fixture.setupStore,
+                localStore: fixture.localStore,
+                runtimeRunner: FakeRuntimeRunner(),
+                serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+            )
+        }
+    }
+
+    private static func numpyContainer(
+        header: String,
+        payloadBytes: Int = 0,
+        declaredHeaderLength: Int? = nil
+    ) -> Data {
+        let headerBytes = Data(header.utf8)
+        let declared = UInt16(declaredHeaderLength ?? headerBytes.count)
+        var data = Data([0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59, 0x01, 0x00])
+        data.append(UInt8(declared & 0x00FF))
+        data.append(UInt8((declared >> 8) & 0x00FF))
+        data.append(headerBytes)
+        data.append(Data(repeating: 0, count: payloadBytes))
+        return data
+    }
+
+    private static func numpyV2Container(declaredHeaderLength: UInt32) -> Data {
+        var data = Data([0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59, 0x02, 0x00])
+        data.append(UInt8(declaredHeaderLength & 0x000000FF))
+        data.append(UInt8((declaredHeaderLength >> 8) & 0x000000FF))
+        data.append(UInt8((declaredHeaderLength >> 16) & 0x000000FF))
+        data.append(UInt8((declaredHeaderLength >> 24) & 0x000000FF))
+        return data
+    }
+
     private static func numpyOwnerProfileData(firstValueIsNaN: Bool = false) -> Data {
         var header = "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 9216), }"
         let padding = (16 - ((10 + header.utf8.count + 1) % 16)) % 16
@@ -1297,6 +1472,57 @@ struct SetupCoordinatorTests {
         }
         data.append(payload)
         return data
+    }
+
+    private static func testQueuedEnrollmentCancellationNeverStartsRuntime() async throws {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let runner = EnrollmentQueueCancellationRunner()
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+        let blocker = Task {
+            await coordinator.runDiagnosis()
+        }
+        for _ in 0..<40 where !runner.diagnosisStarted {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        try require(runner.diagnosisStarted, "diagnosis did not hold the runtime permit")
+
+        var cancelledEnrollmentFinished = false
+        let cancelledEnrollment = Task {
+            await coordinator.startEnrollment()
+            cancelledEnrollmentFinished = true
+        }
+        try await Task.sleep(nanoseconds: 30_000_000)
+        coordinator.cancelEnrollment()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        let finishedBeforePermitRelease = cancelledEnrollmentFinished
+
+        runner.completeDiagnosis()
+        await blocker.value
+        await cancelledEnrollment.value
+
+        try require(
+            finishedBeforePermitRelease,
+            "cancelled queued enrollment stayed suspended until permit release"
+        )
+        try require(
+            runner.enrollmentCommands == 0,
+            "cancelled queued enrollment started the camera runtime"
+        )
+
+        await coordinator.startEnrollment()
+        try require(
+            runner.enrollmentCommands == 1,
+            "permit queue leaked or normal enrollment could not retry after cancellation"
+        )
     }
 
     private static func testCameraOnlyDiagnosisKeepsValidOwnerProfile() async throws {
