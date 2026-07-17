@@ -179,6 +179,71 @@ private final class VerificationEnrollmentOverlapRunner: RuntimeCommandRunning {
     }
 }
 
+private final class EnrollmentVerificationSerializationRunner: RuntimeCommandRunning {
+    private let replacementURL: URL
+    private var enrollmentContinuation: CheckedContinuation<Void, Never>?
+    private(set) var enrollmentStarted = false
+    private(set) var commands: [RuntimeCommand] = []
+
+    init(replacementURL: URL) {
+        self.replacementURL = replacementURL
+    }
+
+    func run(
+        command: RuntimeCommand,
+        onEvent: @escaping (RuntimeEvent) -> Void
+    ) async throws -> RuntimeResult {
+        commands.append(command)
+        switch command {
+        case .enroll:
+            enrollmentStarted = true
+            await withCheckedContinuation { continuation in
+                enrollmentContinuation = continuation
+            }
+            try Data("replacement-template".utf8).write(to: replacementURL)
+            let terminal = RuntimeEvent(
+                schemaVersion: 1,
+                event: "enrollment_complete",
+                status: "success",
+                message: "complete"
+            )
+            onEvent(terminal)
+            return RuntimeResult(
+                exitCode: 0,
+                events: [terminal],
+                stderr: "",
+                stderrTruncated: false
+            )
+        case .verifyOwner:
+            let terminal = RuntimeEvent(
+                schemaVersion: 1,
+                event: "owner_verification_complete",
+                status: "success",
+                message: "owner",
+                decision: "owner"
+            )
+            return RuntimeResult(
+                exitCode: 0,
+                events: [terminal],
+                stderr: "",
+                stderrTruncated: false
+            )
+        default:
+            return RuntimeResult(
+                exitCode: 20,
+                events: [],
+                stderr: "",
+                stderrTruncated: false
+            )
+        }
+    }
+
+    func completeEnrollment() {
+        enrollmentContinuation?.resume()
+        enrollmentContinuation = nil
+    }
+}
+
 private final class CancellationEOFWindowRunner: RuntimeCommandRunning {
     private var eofContinuation: CheckedContinuation<Void, Never>?
     private(set) var started = false
@@ -261,6 +326,7 @@ struct SetupCoordinatorTests {
         try await testSuccessfulEnrollmentRequiresSuccessfulTerminalStatus()
         try await testCancellationIgnoresLateProgress()
         try await testCancellationInvalidatesCallbacksBeforeRuntimeEOF()
+        try await testVerificationDoesNotLaunchDuringActiveEnrollment()
         try await testVerificationCannotPassAfterEnrollmentReplacesProfile()
         try await testEnableProtectionRefusesWhenAnyGateIsFalse()
         print("Setup coordinator tests passed")
@@ -509,6 +575,52 @@ struct SetupCoordinatorTests {
             coordinator.checks[.ownerTest] == false,
             "verification for the replaced profile incorrectly passed owner readiness"
         )
+    }
+
+    private static func testVerificationDoesNotLaunchDuringActiveEnrollment() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let profileURL = fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        try Data("original-template".utf8).write(to: profileURL)
+        let runner = EnrollmentVerificationSerializationRunner(replacementURL: profileURL)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+        )
+        let enrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        for _ in 0..<40 where !runner.enrollmentStarted {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try require(runner.enrollmentStarted, "enrollment-first overlap did not start")
+
+        await coordinator.verifyOwnerWithoutLocking()
+
+        try require(
+            !runner.commands.contains(.verifyOwner),
+            "verify-owner runtime command launched while enrollment was active"
+        )
+        try require(
+            coordinator.checks[.ownerTest] == false,
+            "owner test passed while enrollment was active"
+        )
+        try require(
+            coordinator.checks[.ownerProfile] == true,
+            "verification refusal erased the still-valid owner profile"
+        )
+        try require(
+            coordinator.currentError?.contains("录入") == true
+                && (coordinator.currentError?.count ?? 0) < 50,
+            "active-enrollment refusal did not publish a concise repair message"
+        )
+
+        runner.completeEnrollment()
+        await enrollment.value
     }
 
     private static func testCancellationIgnoresLateProgress() async throws {

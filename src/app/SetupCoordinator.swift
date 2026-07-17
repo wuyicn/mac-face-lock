@@ -179,6 +179,12 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func verifyOwnerWithoutLocking() async {
+        guard enrollmentTask == nil else {
+            ownerTestPassed = false
+            currentError = "本人录入正在进行，请完成或取消录入后再测试。"
+            updateReadiness()
+            return
+        }
         currentError = nil
         ownerTestPassed = false
         let verificationRevision = profileRevision
