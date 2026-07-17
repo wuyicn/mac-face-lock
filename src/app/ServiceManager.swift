@@ -154,6 +154,11 @@ final class BoundedServiceCommandRunner: ServiceCommandRunning {
         arguments: [String],
         timeout: TimeInterval
     ) async throws -> ServiceCommandResult {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let totalTimeout = max(timeout, 0)
+        let deadline = startedAt + totalTimeout
+        let terminationGrace = min(0.25, totalTimeout)
+        let executionDeadline = deadline - terminationGrace
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -163,15 +168,31 @@ final class BoundedServiceCommandRunner: ServiceCommandRunning {
         process.standardError = stderrPipe
         try process.run()
 
-        let deadline = Date().addingTimeInterval(max(timeout, 0.1))
-        while process.isRunning, Date() < deadline {
-            try await Task.sleep(nanoseconds: 25_000_000)
+        while process.isRunning {
+            let remaining = executionDeadline - ProcessInfo.processInfo.systemUptime
+            if remaining <= 0 {
+                break
+            }
+            try await Task.sleep(
+                nanoseconds: min(
+                    25_000_000,
+                    UInt64(remaining * 1_000_000_000)
+                )
+            )
         }
         if process.isRunning {
             process.terminate()
-            let terminationDeadline = Date().addingTimeInterval(0.25)
-            while process.isRunning, Date() < terminationDeadline {
-                try await Task.sleep(nanoseconds: 10_000_000)
+            while process.isRunning {
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                if remaining <= 0 {
+                    break
+                }
+                try await Task.sleep(
+                    nanoseconds: min(
+                        10_000_000,
+                        UInt64(remaining * 1_000_000_000)
+                    )
+                )
             }
             if process.isRunning {
                 Darwin.kill(process.processIdentifier, SIGKILL)
@@ -202,9 +223,7 @@ final class ServiceManager: ServiceManaging {
     static let label = "com.wuyi.mac-face-lock-agent"
     static let productionHealthPollAttempts = 301
     static let productionHealthPollIntervalNanoseconds: UInt64 = 1_000_000_000
-    static let productionStableHealthWindowSeconds = TimeInterval(
-        productionHealthPollAttempts - 1
-    ) * TimeInterval(productionHealthPollIntervalNanoseconds) / 1_000_000_000
+    static let productionStableHealthWindowSeconds: TimeInterval = 300
 
     private let appURL: URL
     private let supportURL: URL
@@ -216,8 +235,11 @@ final class ServiceManager: ServiceManaging {
     private let commandTimeout: TimeInterval
     private let healthPollAttempts: Int
     private let healthPollIntervalNanoseconds: UInt64
+    private let stableHealthTimeout: TimeInterval
     private let heartbeatMaxAge: TimeInterval
     private let now: () -> Date
+    private let monotonicNow: () -> TimeInterval
+    private let sleep: (UInt64) async throws -> Void
     private let launchctlURL = URL(fileURLWithPath: "/bin/launchctl")
 
     init(
@@ -232,8 +254,16 @@ final class ServiceManager: ServiceManaging {
         healthPollAttempts: Int = ServiceManager.productionHealthPollAttempts,
         healthPollIntervalNanoseconds: UInt64 =
             ServiceManager.productionHealthPollIntervalNanoseconds,
+        stableHealthTimeout: TimeInterval =
+            ServiceManager.productionStableHealthWindowSeconds,
         heartbeatMaxAge: TimeInterval = 15,
-        now: @escaping () -> Date = Date.init
+        now: @escaping () -> Date = Date.init,
+        monotonicNow: @escaping () -> TimeInterval = {
+            ProcessInfo.processInfo.systemUptime
+        },
+        sleep: @escaping (UInt64) async throws -> Void = {
+            try await Task.sleep(nanoseconds: $0)
+        }
     ) {
         self.appURL = appURL.standardizedFileURL
         self.supportURL = supportURL.standardizedFileURL
@@ -254,8 +284,16 @@ final class ServiceManager: ServiceManaging {
         self.commandTimeout = commandTimeout
         self.healthPollAttempts = max(3, healthPollAttempts)
         self.healthPollIntervalNanoseconds = healthPollIntervalNanoseconds
+        self.stableHealthTimeout = stableHealthTimeout.isFinite
+            ? min(
+                max(0, stableHealthTimeout),
+                Self.productionStableHealthWindowSeconds
+            )
+            : Self.productionStableHealthWindowSeconds
         self.heartbeatMaxAge = max(0, heartbeatMaxAge)
         self.now = now
+        self.monotonicNow = monotonicNow
+        self.sleep = sleep
     }
 
     func install(appURL: URL, supportURL: URL) async throws {
@@ -313,6 +351,10 @@ final class ServiceManager: ServiceManaging {
     }
 
     func status() async -> ServiceStatus {
+        await status(commandTimeout: commandTimeout)
+    }
+
+    private func status(commandTimeout: TimeInterval) async -> ServiceStatus {
         let expectedProgram = agentProgramURL(appURL: appURL).path
         guard fileSystem.fileExists(at: plistURL) else {
             return ServiceStatus(
@@ -348,7 +390,10 @@ final class ServiceManager: ServiceManaging {
             )
         }
 
-        guard let result = try? await runLaunchctl(["print", serviceTarget]),
+        guard let result = try? await runLaunchctl(
+            ["print", serviceTarget],
+            timeout: commandTimeout
+        ),
               result.exitCode == 0,
               let pid = Self.parsePID(result.stdout),
               pid > 0 else {
@@ -492,11 +537,18 @@ final class ServiceManager: ServiceManaging {
     }
 
     private func requireStableHealth() async throws {
+        let deadline = monotonicNow() + stableHealthTimeout
         var stablePID: Int32?
         var stableHeartbeatSequence: UInt64?
         var consecutiveHealthyPolls = 0
         for attempt in 0..<healthPollAttempts {
-            let current = await status()
+            let remainingBeforeProbe = deadline - monotonicNow()
+            guard remainingBeforeProbe > 0 else {
+                break
+            }
+            let current = await status(
+                commandTimeout: min(commandTimeout, remainingBeforeProbe)
+            )
             if current.isHealthy,
                let pid = current.pid,
                pid > 0,
@@ -527,11 +579,22 @@ final class ServiceManager: ServiceManaging {
                 stableHeartbeatSequence = nil
                 consecutiveHealthyPolls = 0
             }
+            let remainingAfterProbe = deadline - monotonicNow()
+            guard remainingAfterProbe > 0 else {
+                break
+            }
             if attempt + 1 < healthPollAttempts,
                healthPollIntervalNanoseconds > 0 {
-                try await Task.sleep(
-                    nanoseconds: healthPollIntervalNanoseconds
+                let remainingNanoseconds = UInt64(
+                    remainingAfterProbe * 1_000_000_000
                 )
+                let sleepNanoseconds = min(
+                    healthPollIntervalNanoseconds,
+                    remainingNanoseconds
+                )
+                if sleepNanoseconds > 0 {
+                    try await sleep(sleepNanoseconds)
+                }
             }
         }
         throw ServiceManagerError.unstableService
@@ -592,11 +655,14 @@ final class ServiceManager: ServiceManaging {
         )
     }
 
-    private func runLaunchctl(_ arguments: [String]) async throws -> ServiceCommandResult {
+    private func runLaunchctl(
+        _ arguments: [String],
+        timeout: TimeInterval? = nil
+    ) async throws -> ServiceCommandResult {
         try await commandRunner.run(
             executableURL: launchctlURL,
             arguments: arguments,
-            timeout: commandTimeout
+            timeout: timeout ?? commandTimeout
         )
     }
 

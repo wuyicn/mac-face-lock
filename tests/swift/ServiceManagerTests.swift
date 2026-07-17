@@ -88,6 +88,7 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
     var bootoutExitCode: Int32 = 0
     var printError: Error?
     var unloadedPrintExitCode: Int32 = 113
+    var onLoadedPrint: ((TimeInterval) -> Void)?
 
     init(loaded: Bool = false, printPIDs: [Int32] = []) {
         self.loaded = loaded
@@ -112,6 +113,7 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
                     stderr: "print failed"
                 )
             }
+            onLoadedPrint?(timeout)
             let pid = printPIDs.isEmpty ? 0 : printPIDs.removeFirst()
             return ServiceCommandResult(
                 exitCode: 0,
@@ -136,6 +138,20 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
         default:
             return ServiceCommandResult(exitCode: 64, stdout: "", stderr: "unexpected")
         }
+    }
+}
+
+private final class ManualServiceClock {
+    private(set) var now: TimeInterval = 0
+    private(set) var sleeps: [UInt64] = []
+
+    func advance(by seconds: TimeInterval) {
+        now += seconds
+    }
+
+    func sleep(nanoseconds: UInt64) async throws {
+        sleeps.append(nanoseconds)
+        now += TimeInterval(nanoseconds) / 1_000_000_000
     }
 }
 
@@ -167,7 +183,15 @@ private struct ServiceFixture {
     }
 
     func manager(
-        pollAttempts: Int = 3
+        pollAttempts: Int = 3,
+        pollIntervalNanoseconds: UInt64 = 0,
+        stableHealthTimeout: TimeInterval = 300,
+        monotonicNow: @escaping () -> TimeInterval = {
+            ProcessInfo.processInfo.systemUptime
+        },
+        sleep: @escaping (UInt64) async throws -> Void = {
+            try await Task.sleep(nanoseconds: $0)
+        }
     ) -> ServiceManager {
         ServiceManager(
             appURL: appURL,
@@ -179,9 +203,12 @@ private struct ServiceFixture {
             userID: 501,
             commandTimeout: 2,
             healthPollAttempts: pollAttempts,
-            healthPollIntervalNanoseconds: 0,
+            healthPollIntervalNanoseconds: pollIntervalNanoseconds,
+            stableHealthTimeout: stableHealthTimeout,
             heartbeatMaxAge: 5,
-            now: { now }
+            now: { now },
+            monotonicNow: monotonicNow,
+            sleep: sleep
         )
     }
 
@@ -268,6 +295,7 @@ struct ServiceManagerTests {
         try await testStaleOrMissingHeartbeatCannotReportHealthy()
         try await testStableInstallRequiresAdvancingHeartbeat()
         try await testStableInstallWaitsThroughDuplicateHeartbeatPolls()
+        try await testSlowHealthProbeCannotExceedTotalDeadline()
         try await testPriorJobPrintTimeoutAbortsBeforeAnyMutation()
         try await testPriorJobUnexpectedPrintFailureAbortsBeforeAnyMutation()
         try await testMovedApplicationNeedsRepair()
@@ -521,6 +549,47 @@ struct ServiceManagerTests {
         try require(
             fixture.fileSystem.fileExists(at: fixture.plistURL),
             "stable install reset progress instead of waiting for heartbeat advancement"
+        )
+    }
+
+    private static func testSlowHealthProbeCannotExceedTotalDeadline() async throws {
+        let fixture = try ServiceFixture(printPIDs: [42])
+        let clock = ManualServiceClock()
+        try fixture.seedHealthyStateSequence(sequences: [1])
+        fixture.runner.onLoadedPrint = { timeout in
+            clock.advance(by: min(timeout, 1.25))
+        }
+
+        do {
+            try await fixture.manager(
+                pollAttempts: 10,
+                pollIntervalNanoseconds: 1_000_000_000,
+                stableHealthTimeout: 1.5,
+                monotonicNow: { clock.now },
+                sleep: clock.sleep
+            ).install(
+                appURL: fixture.appURL,
+                supportURL: fixture.supportURL
+            )
+            throw TestFailure.assertion("slow health probe unexpectedly stabilized")
+        } catch ServiceManagerError.unstableService {
+            // Expected.
+        }
+
+        let healthPrintCalls = fixture.runner.calls.filter {
+            $0.arguments.first == "print" && $0.timeout != 2
+        }
+        try require(
+            healthPrintCalls.map(\.timeout) == [1.5],
+            "health probe timeout was not clipped to the total remaining deadline"
+        )
+        try require(
+            clock.now == 1.5,
+            "slow health probe advanced beyond the total monotonic deadline"
+        )
+        try require(
+            clock.sleeps == [250_000_000],
+            "poll sleep was not clipped to the remaining total deadline"
         )
     }
 
