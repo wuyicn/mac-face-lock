@@ -243,8 +243,8 @@ struct SourceDataMigratorTests {
         let sourceBeforeRollback = try byteSnapshot(of: source)
         let failingMigrator = SourceDataMigrator(
             candidateRootURLs: [source],
-            afterCommit: { committedCount in
-                if committedCount == 2 {
+            faultInjector: { point in
+                if point == .afterJournalDirectoryFsync("committed", 1) {
                     throw TestFailure.injected
                 }
             }
@@ -271,6 +271,13 @@ struct SourceDataMigratorTests {
 
         try testActivityBudget(root: root)
         try testUntrustedSourceEntries(root: root)
+        try testOverlapIsRejectedBeforeAnyDestinationWrite(root: root)
+        try testCandidateIdentityAndHardLinksAreRejected(root: root)
+        try testCrashRecoveryAtEveryDurabilityBoundary(root: root)
+        try testDestinationParentReplacementCannotEscape(root: root)
+        try testCrossProcessImportLock(root: root)
+        try testReorderedNumpyHeaderUsesSharedValidator(root: root)
+        try testLaunchAgentProvenanceIsExactAndRevalidated(root: root)
 
         print("SourceDataMigratorTests passed")
     }
@@ -294,7 +301,14 @@ struct SourceDataMigratorTests {
         let migrator = SourceDataMigrator(candidateRootURLs: [source])
         let candidate = try requireCandidate(migrator)
         let destination = root.appendingPathComponent("large-activity-destination")
-        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+        try fileManager.createDirectory(
+            at: destination.appendingPathComponent("config"),
+            withIntermediateDirectories: true
+        )
+        try fileManager.createDirectory(
+            at: destination.appendingPathComponent("data"),
+            withIntermediateDirectories: true
+        )
         _ = try migrator.import(candidate: candidate, destination: destination)
         let imported = try Data(
             contentsOf: destination.appendingPathComponent("data/activity.jsonl")
@@ -348,4 +362,371 @@ struct SourceDataMigratorTests {
             )
         }
     }
+
+    private static func testOverlapIsRejectedBeforeAnyDestinationWrite(
+        root: URL
+    ) throws {
+        let fileManager = FileManager.default
+        let source = root.appendingPathComponent("overlap-source")
+        try createSource(at: source)
+        let migrator = SourceDataMigrator(candidateRootURLs: [source])
+        let candidate = try requireCandidate(migrator)
+        let sourceBefore = try byteSnapshot(of: source)
+        for destination in [
+            source,
+            source.appendingPathComponent("nested"),
+            source.deletingLastPathComponent(),
+        ] {
+            do {
+                _ = try migrator.import(candidate: candidate, destination: destination)
+                throw TestFailure.assertion("overlapping source/destination was accepted")
+            } catch let error as SourceDataMigrationError {
+                try require(error == .sourceDestinationOverlap, "wrong overlap error")
+            }
+            let sourceAfter = try byteSnapshot(of: source)
+            try require(
+                sourceAfter == sourceBefore,
+                "overlap rejection modified the source before returning"
+            )
+        }
+
+        let alias = root.appendingPathComponent("overlap-alias")
+        try fileManager.createSymbolicLink(at: alias, withDestinationURL: source)
+        do {
+            _ = try migrator.import(candidate: candidate, destination: alias)
+            throw TestFailure.assertion("canonical symlink overlap was accepted")
+        } catch let error as SourceDataMigrationError {
+            try require(error == .sourceDestinationOverlap, "wrong alias overlap error")
+        }
+    }
+
+    private static func testCandidateIdentityAndHardLinksAreRejected(
+        root: URL
+    ) throws {
+        let fileManager = FileManager.default
+        let source = root.appendingPathComponent("identity-source")
+        try createSource(at: source)
+        let migrator = SourceDataMigrator(candidateRootURLs: [source])
+        let candidate = try requireCandidate(migrator)
+        let moved = root.appendingPathComponent("identity-source-moved")
+        try fileManager.moveItem(at: source, to: moved)
+        try createSource(at: source)
+        let destination = root.appendingPathComponent("identity-destination")
+        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+        do {
+            _ = try migrator.import(candidate: candidate, destination: destination)
+            throw TestFailure.assertion("replaced candidate root identity was accepted")
+        } catch let error as SourceDataMigrationError {
+            try require(error == .sourceChanged("."), "wrong root identity error")
+        }
+
+        let hardlinkSource = root.appendingPathComponent("hardlink-source")
+        try createSource(at: hardlinkSource)
+        let outside = root.appendingPathComponent("hardlink-preferences")
+        try Data(
+            "{\"schema_version\":1,\"appearance\":\"dark\",\"accent\":\"amethyst\"}".utf8
+        ).write(to: outside)
+        let preferences = hardlinkSource.appendingPathComponent(
+            "data/ui-preferences.json"
+        )
+        try fileManager.removeItem(at: preferences)
+        try fileManager.linkItem(at: outside, to: preferences)
+        let hardlinkMigrator = SourceDataMigrator(candidateRootURLs: [hardlinkSource])
+        let hardlinkCandidate = try requireCandidate(hardlinkMigrator)
+        do {
+            _ = try hardlinkMigrator.import(
+                candidate: hardlinkCandidate,
+                destination: destination
+            )
+            throw TestFailure.assertion("hard-linked source input was accepted")
+        } catch let error as SourceDataMigrationError {
+            try require(
+                error == .unsafeSourceEntry("data/ui-preferences.json"),
+                "wrong hard-link rejection error"
+            )
+        }
+    }
+
+    private static func testCrashRecoveryAtEveryDurabilityBoundary(
+        root: URL
+    ) throws {
+        var points: [MigrationFaultPoint] = []
+        for index in 0..<4 {
+            points.append(.afterStageFileFsync(index))
+            points.append(.afterBackupFileFsync(index))
+        }
+        points.append(.afterPreparedDirectoryFsync)
+        let journalCheckpoints: [(String, Int)] =
+            [("initial", -1)]
+            + (0..<4).map { ("intent", $0) }
+            + (0..<4).map { ("committed", $0) }
+            + [("complete", -1)]
+        for (checkpoint, index) in journalCheckpoints {
+            points.append(.afterJournalFileFsync(checkpoint, index))
+            points.append(.afterJournalRename(checkpoint, index))
+            points.append(.afterJournalDirectoryFsync(checkpoint, index))
+        }
+        for index in 0..<4 {
+            points.append(.afterTargetRename(index))
+            points.append(.afterDestinationDirectoryFsync(index))
+        }
+        for (index, crashPoint) in points.enumerated() {
+            let source = root.appendingPathComponent("crash-source-\(index)")
+            let destination = root.appendingPathComponent("crash-destination-\(index)")
+            try createSource(at: source)
+            try FileManager.default.createDirectory(
+                at: destination.appendingPathComponent("config"),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.createDirectory(
+                at: destination.appendingPathComponent("data"),
+                withIntermediateDirectories: true
+            )
+            try Data("old-config".utf8).write(
+                to: destination.appendingPathComponent("config/config.json")
+            )
+            try Data("old-owner".utf8).write(
+                to: destination.appendingPathComponent("data/owner_face.npy")
+            )
+            try Data("old-preferences".utf8).write(
+                to: destination.appendingPathComponent("data/ui-preferences.json")
+            )
+            try Data("old-activity".utf8).write(
+                to: destination.appendingPathComponent("data/activity.jsonl")
+            )
+            let oldSnapshot = try byteSnapshot(of: destination)
+            let migrator = SourceDataMigrator(
+                candidateRootURLs: [source],
+                faultInjector: { point in
+                    if point == crashPoint {
+                        throw SimulatedMigrationCrash()
+                    }
+                }
+            )
+            let candidate = try requireCandidate(migrator)
+            do {
+                _ = try migrator.import(candidate: candidate, destination: destination)
+                throw TestFailure.assertion("fault point \(crashPoint) did not stop import")
+            } catch is SimulatedMigrationCrash {
+                // Simulates process termination: no in-process rollback.
+            }
+
+            let recovering = SourceDataMigrator(candidateRootURLs: [])
+            try recovering.recoverPendingImports(destination: destination)
+            let completionPoints: [MigrationFaultPoint] = [
+                .afterJournalFileFsync("complete", -1),
+                .afterJournalRename("complete", -1),
+                .afterJournalDirectoryFsync("complete", -1),
+            ]
+            if completionPoints.contains(crashPoint)
+                && crashPoint != .afterJournalFileFsync("complete", -1) {
+                let destinationConfig = try Data(
+                    contentsOf: destination.appendingPathComponent("config/config.json")
+                )
+                let sourceConfig = try Data(
+                    contentsOf: source.appendingPathComponent("config/config.json")
+                )
+                try require(
+                    destinationConfig == sourceConfig,
+                    "completed transaction did not recover to all-new"
+                )
+            } else {
+                let recovered = try byteSnapshot(of: destination)
+                    .filter { !$0.key.hasPrefix("backups") && $0.key != ".migration.lock" }
+                let expected = oldSnapshot
+                    .filter { !$0.key.hasPrefix("backups") && $0.key != ".migration.lock" }
+                try require(recovered == expected, "crash recovery did not restore all-old")
+            }
+            try recovering.recoverPendingImports(destination: destination)
+        }
+    }
+
+    private static func testDestinationParentReplacementCannotEscape(
+        root: URL
+    ) throws {
+        let fileManager = FileManager.default
+        let source = root.appendingPathComponent("parent-race-source")
+        let destination = root.appendingPathComponent("parent-race-destination")
+        let outside = root.appendingPathComponent("parent-race-outside")
+        try createSource(at: source)
+        try fileManager.createDirectory(
+            at: destination.appendingPathComponent("config"),
+            withIntermediateDirectories: true
+        )
+        try fileManager.createDirectory(
+            at: destination.appendingPathComponent("data"),
+            withIntermediateDirectories: true
+        )
+        try fileManager.createDirectory(at: outside, withIntermediateDirectories: true)
+        let outsideSentinel = outside.appendingPathComponent("config.json")
+        try Data("outside".utf8).write(to: outsideSentinel)
+        let migrator = SourceDataMigrator(
+            candidateRootURLs: [source],
+            faultInjector: { point in
+                guard point == .afterJournalDirectoryFsync("intent", 0) else {
+                    return
+                }
+                let config = destination.appendingPathComponent("config")
+                try fileManager.moveItem(
+                    at: config,
+                    to: destination.appendingPathComponent("config-replaced")
+                )
+                try fileManager.createSymbolicLink(at: config, withDestinationURL: outside)
+            }
+        )
+        do {
+            _ = try migrator.import(
+                candidate: try requireCandidate(migrator),
+                destination: destination
+            )
+            throw TestFailure.assertion("replaced destination parent was accepted")
+        } catch let error as SourceDataMigrationError {
+            try require(
+                error == .unsafeDestination("config"),
+                "wrong destination replacement error"
+            )
+        }
+        let outsideAfter = try Data(contentsOf: outsideSentinel)
+        try require(
+            outsideAfter == Data("outside".utf8),
+            "destination race escaped into an outside directory"
+        )
+    }
+
+    private static func testCrossProcessImportLock(root: URL) throws {
+        let source = root.appendingPathComponent("lock-source")
+        let destination = root.appendingPathComponent("lock-destination")
+        try createSource(at: source)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let lockURL = destination.appendingPathComponent(".migration.lock")
+        let fd = open(lockURL.path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o600)
+        try require(fd >= 0, "could not create test migration lock")
+        defer {
+            _ = flock(fd, LOCK_UN)
+            close(fd)
+        }
+        try require(flock(fd, LOCK_EX | LOCK_NB) == 0, "could not hold test lock")
+        let migrator = SourceDataMigrator(candidateRootURLs: [source])
+        do {
+            _ = try migrator.import(
+                candidate: try requireCandidate(migrator),
+                destination: destination
+            )
+            throw TestFailure.assertion("concurrent migration lock was ignored")
+        } catch let error as SourceDataMigrationError {
+            try require(error == .migrationInProgress, "wrong lock contention error")
+        }
+    }
+
+    private static func testReorderedNumpyHeaderUsesSharedValidator(
+        root: URL
+    ) throws {
+        let source = root.appendingPathComponent("reordered-npy-source")
+        try createSource(at: source)
+        let header = "{'shape': (2, 9216), 'fortran_order': False, 'descr': '<f4', }"
+        try numpyContainer(header: header, rows: 2).write(
+            to: source.appendingPathComponent("data/owner_face.npy")
+        )
+        let destination = root.appendingPathComponent("reordered-npy-destination")
+        try FileManager.default.createDirectory(
+            at: destination.appendingPathComponent("config"),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: destination.appendingPathComponent("data"),
+            withIntermediateDirectories: true
+        )
+        let migrator = SourceDataMigrator(candidateRootURLs: [source])
+        _ = try migrator.import(
+            candidate: try requireCandidate(migrator),
+            destination: destination
+        )
+    }
+
+    private static func testLaunchAgentProvenanceIsExactAndRevalidated(
+        root: URL
+    ) throws {
+        let fileManager = FileManager.default
+        let source = root.appendingPathComponent("provenance-source")
+        let launchAgents = root.appendingPathComponent("provenance-launchagents")
+        try createSource(at: source)
+        try fileManager.createDirectory(at: launchAgents, withIntermediateDirectories: true)
+        let plistURL = launchAgents.appendingPathComponent(
+            "com.wuyi.mac-face-lock-agent.plist"
+        )
+        func plist(arguments: [String], label: String) throws -> Data {
+            try PropertyListSerialization.data(
+                fromPropertyList: [
+                    "Label": label,
+                    "ProgramArguments": arguments,
+                    "WorkingDirectory": source.path,
+                ],
+                format: .xml,
+                options: 0
+            )
+        }
+        let executable = source.appendingPathComponent(
+            "dist/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent"
+        ).path
+        try plist(
+            arguments: [executable, source.path, root.path],
+            label: "com.wuyi.mac-face-lock-agent"
+        ).write(to: plistURL)
+        let migrator = SourceDataMigrator(
+            launchAgentDirectoryURL: launchAgents
+        )
+        try require(
+            migrator.discoverCandidates().isEmpty,
+            "arbitrary extra absolute LaunchAgent argument was trusted"
+        )
+
+        try plist(
+            arguments: [executable, source.path],
+            label: "com.wuyi.mac-face-lock-agent"
+        ).write(to: plistURL)
+        guard let candidate = migrator.discoverCandidates().first else {
+            throw TestFailure.assertion("exact known LaunchAgent schema was not discovered")
+        }
+        try plist(
+            arguments: [executable, source.path],
+            label: "changed-after-selection"
+        ).write(to: plistURL)
+        let destination = root.appendingPathComponent("provenance-destination")
+        try fileManager.createDirectory(
+            at: destination.appendingPathComponent("config"),
+            withIntermediateDirectories: true
+        )
+        try fileManager.createDirectory(
+            at: destination.appendingPathComponent("data"),
+            withIntermediateDirectories: true
+        )
+        do {
+            _ = try migrator.import(candidate: candidate, destination: destination)
+            throw TestFailure.assertion("changed LaunchAgent provenance was accepted")
+        } catch let error as SourceDataMigrationError {
+            try require(
+                error == .candidateProvenanceChanged,
+                "wrong changed-provenance error"
+            )
+        }
+    }
+
+    private static func numpyContainer(header rawHeader: String, rows: Int) -> Data {
+        var header = rawHeader
+        let padding = (64 - ((10 + header.utf8.count + 1) % 64)) % 64
+        header += String(repeating: " ", count: padding) + "\n"
+        var data = Data([0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59, 0x01, 0x00])
+        let length = UInt16(header.utf8.count)
+        data.append(UInt8(length & 0xff))
+        data.append(UInt8(length >> 8))
+        data.append(Data(header.utf8))
+        let one = Float(1).bitPattern.littleEndian
+        for _ in 0..<(rows * 9_216) {
+            var bits = one
+            withUnsafeBytes(of: &bits) { data.append(contentsOf: $0) }
+        }
+        return data
+    }
 }
+
+private struct SimulatedMigrationCrash: MigrationCrashFault {}

@@ -1,5 +1,6 @@
 import Darwin
 import CoreFoundation
+import CryptoKit
 import Foundation
 
 enum MigrationItem: String, CaseIterable, Codable, Hashable {
@@ -26,9 +27,25 @@ enum MigrationItem: String, CaseIterable, Codable, Hashable {
     }
 }
 
+struct MigrationFileIdentity: Codable, Equatable {
+    let device: UInt64
+    let inode: UInt64
+}
+
+struct LaunchAgentProvenance: Equatable {
+    let url: URL
+    let identity: MigrationFileIdentity
+    let size: Int64
+    let modifiedSeconds: Int64
+    let modifiedNanoseconds: Int64
+    let digest: [UInt8]
+}
+
 struct SourceInstallCandidate: Identifiable, Equatable {
     let rootURL: URL
     let availableItems: Set<MigrationItem>
+    let rootIdentity: MigrationFileIdentity
+    let launchAgentProvenance: LaunchAgentProvenance?
 
     var id: String {
         rootURL.standardizedFileURL.path
@@ -47,6 +64,7 @@ struct MigrationResult: Equatable {
 enum MigrationDecision: Equatable {
     case notRequired
     case pending
+    case recoveryFailed
     case imported(MigrationResult)
     case skipped
 }
@@ -61,6 +79,10 @@ enum SourceDataMigrationError: Error, Equatable, LocalizedError {
     case invalidPreferences
     case invalidActivityHistory
     case unsafeDestination(String)
+    case sourceDestinationOverlap
+    case migrationInProgress
+    case candidateProvenanceChanged
+    case recoveryFailed
     case commitFailed
     case rollbackFailed
 
@@ -84,6 +106,14 @@ enum SourceDataMigrationError: Error, Equatable, LocalizedError {
             return "旧版活动记录无效，未导入任何数据。"
         case .unsafeDestination(let path):
             return "新版本地数据目录不安全：\(path)"
+        case .sourceDestinationOverlap:
+            return "旧版目录与新数据目录重叠，已拒绝导入。"
+        case .migrationInProgress:
+            return "另一个导入或恢复操作正在进行，请稍后重试。"
+        case .candidateProvenanceChanged:
+            return "旧版安装来源在选择后发生变化，请重新检查。"
+        case .recoveryFailed:
+            return "上次导入尚未安全恢复，请重试恢复后再继续。"
         case .commitFailed:
             return "无法提交导入数据，原有数据已恢复。"
         case .rollbackFailed:
@@ -91,6 +121,20 @@ enum SourceDataMigrationError: Error, Equatable, LocalizedError {
         }
     }
 }
+
+enum MigrationFaultPoint: Equatable {
+    case afterStageFileFsync(Int)
+    case afterBackupFileFsync(Int)
+    case afterPreparedDirectoryFsync
+    case afterJournalFileFsync(String, Int)
+    case afterJournalRename(String, Int)
+    case afterJournalDirectoryFsync(String, Int)
+    case afterTargetRename(Int)
+    case afterDestinationDirectoryFsync(Int)
+
+}
+
+protocol MigrationCrashFault: Error {}
 
 final class SourceDataMigrator {
     private static let configurationByteLimit = 1 * 1_024 * 1_024
@@ -102,22 +146,31 @@ final class SourceDataMigrator {
 
     private let fileManager: FileManager
     private let candidateRootURLs: [URL]?
-    private let afterCommit: ((Int) throws -> Void)?
+    private let launchAgentDirectoryURL: URL?
+    private let faultInjector: ((MigrationFaultPoint) throws -> Void)?
 
     init(
         fileManager: FileManager = .default,
         candidateRootURLs: [URL]? = nil,
-        afterCommit: ((Int) throws -> Void)? = nil
+        launchAgentDirectoryURL: URL? = nil,
+        faultInjector: ((MigrationFaultPoint) throws -> Void)? = nil
     ) {
         self.fileManager = fileManager
         self.candidateRootURLs = candidateRootURLs
-        self.afterCommit = afterCommit
+        self.launchAgentDirectoryURL = launchAgentDirectoryURL
+        self.faultInjector = faultInjector
     }
 
     func discoverCandidates() -> [SourceInstallCandidate] {
-        let roots = candidateRootURLs ?? legacyCandidateRoots()
+        let descriptors: [(URL, LaunchAgentProvenance?)]
+        if let candidateRootURLs {
+            descriptors = candidateRootURLs.map { ($0, nil) }
+        } else {
+            descriptors = legacyCandidateDescriptors()
+        }
         var seen = Set<String>()
-        return roots.compactMap { root in
+        return descriptors.compactMap { descriptor -> SourceInstallCandidate? in
+            let (root, provenance) = descriptor
             let standardized = root.standardizedFileURL
             guard seen.insert(standardized.path).inserted,
                   let reader = try? SecureSourceReader(rootURL: standardized),
@@ -134,21 +187,40 @@ final class SourceDataMigrator {
             }
             return SourceInstallCandidate(
                 rootURL: standardized,
-                availableItems: items
+                availableItems: items,
+                rootIdentity: reader.rootIdentity,
+                launchAgentProvenance: provenance
             )
         }
         .sorted { $0.rootURL.path < $1.rootURL.path }
+    }
+
+    func recoverPendingImports(destination: URL) throws {
+        let session = try DestinationSession(
+            destination: destination,
+            removeLockWhenDone: true
+        )
+        try session.recoverPendingTransactions()
     }
 
     func `import`(
         candidate: SourceInstallCandidate,
         destination: URL
     ) throws -> MigrationResult {
+        try rejectOverlap(
+            source: candidate.rootURL,
+            sourceIdentity: candidate.rootIdentity,
+            destination: destination
+        )
+        try validateProvenance(candidate)
         let reader: SecureSourceReader
         do {
             reader = try SecureSourceReader(rootURL: candidate.rootURL)
         } catch {
             throw SourceDataMigrationError.unsafeSourceRoot
+        }
+        guard reader.rootIdentity == candidate.rootIdentity else {
+            throw SourceDataMigrationError.sourceChanged(".")
         }
         guard reader.isRegularFile("agent.py"),
               reader.isRegularFile(MigrationItem.configuration.sourcePath),
@@ -156,411 +228,186 @@ final class SourceDataMigrator {
             throw SourceDataMigrationError.unsafeSourceRoot
         }
 
-        let destinationRoot = try validatedDestinationRoot(destination)
+        let session = try DestinationSession(
+            destination: destination,
+            removeLockWhenDone: true
+        )
+        try session.recoverPendingTransactions()
+        let payloads = try validatedPayloads(
+            candidate: candidate,
+            reader: reader
+        )
         let transactionID = "import-\(UUID().uuidString.lowercased())"
-        let backupsRoot = destinationRoot.appendingPathComponent(
-            "backups",
-            isDirectory: true
-        )
-        let transactionRoot = backupsRoot.appendingPathComponent(
-            transactionID,
-            isDirectory: true
-        )
-        let stagingRoot = transactionRoot.appendingPathComponent(
-            "staging",
-            isDirectory: true
-        )
-        let rollbackRoot = transactionRoot.appendingPathComponent(
-            "rollback",
-            isDirectory: true
-        )
-        var createdDestinationDirectories: [URL] = []
-        var preserveTransactionForRecovery = false
-        let backupsExisted = fileManager.fileExists(atPath: backupsRoot.path)
-
         do {
-            try createSafeDirectory(
-                backupsRoot,
-                inside: destinationRoot,
-                created: &createdDestinationDirectories
+            let backupURL = try session.performImport(
+                transactionID: transactionID,
+                payloads: payloads,
+                inject: inject
             )
-            try fileManager.createDirectory(
-                at: stagingRoot,
-                withIntermediateDirectories: true
-            )
-            try fileManager.createDirectory(
-                at: rollbackRoot,
-                withIntermediateDirectories: true
-            )
-
-            let staged = try stageAndValidate(
-                candidate: candidate,
-                reader: reader,
-                stagingRoot: stagingRoot
-            )
-            let journal = try prepareJournal(
-                staged: staged,
-                destinationRoot: destinationRoot,
-                rollbackRoot: rollbackRoot,
-                createdDirectories: &createdDestinationDirectories
-            )
-            try writeJournal(
-                journal,
-                to: transactionRoot.appendingPathComponent("journal.json")
-            )
-
-            var committedCount = 0
-            do {
-                try commit(
-                    journal: journal,
-                    transactionRoot: transactionRoot,
-                    committedCount: &committedCount
-                )
-            } catch {
-                do {
-                    try rollback(
-                        journal: Array(journal.prefix(committedCount))
-                    )
-                } catch {
-                    preserveTransactionForRecovery = true
-                    throw SourceDataMigrationError.rollbackFailed
-                }
-                try? fileManager.removeItem(at: transactionRoot)
-                removeCreatedDirectoriesIfEmpty(
-                    createdDestinationDirectories,
-                    preserving: backupsExisted ? backupsRoot : nil
-                )
-                throw error
-            }
-
-            try? fileManager.removeItem(at: stagingRoot)
             return MigrationResult(
-                importedItems: Set(staged.map(\.item)),
-                backupURL: transactionRoot
+                importedItems: Set(payloads.map(\.item)),
+                backupURL: backupURL
             )
+        } catch let injected as InjectedMigrationFault {
+            throw injected.underlying
+        }
+    }
+
+    private func inject(_ point: MigrationFaultPoint) throws {
+        do {
+            try faultInjector?(point)
+        } catch let crash as MigrationCrashFault {
+            throw InjectedMigrationFault(underlying: crash)
         } catch {
-            if !preserveTransactionForRecovery,
-               fileManager.fileExists(atPath: transactionRoot.path) {
-                try? fileManager.removeItem(at: transactionRoot)
-            }
-            if !preserveTransactionForRecovery {
-                removeCreatedDirectoriesIfEmpty(
-                    createdDestinationDirectories,
-                    preserving: backupsExisted ? backupsRoot : nil
-                )
-            }
             throw error
         }
     }
 
-    private func stageAndValidate(
+    private func validatedPayloads(
         candidate: SourceInstallCandidate,
-        reader: SecureSourceReader,
-        stagingRoot: URL
-    ) throws -> [StagedMigrationFile] {
-        var staged: [StagedMigrationFile] = []
+        reader: SecureSourceReader
+    ) throws -> [MigrationPayload] {
+        var payloads: [MigrationPayload] = []
         for item in MigrationItem.allCases where candidate.availableItems.contains(item) {
             let data: Data
-            do {
-                switch item {
-                case .configuration:
-                    data = try reader.read(
-                        item.sourcePath,
-                        maximumBytes: Self.configurationByteLimit
-                    )
-                    guard Self.isValidConfiguration(data) else {
-                        throw SourceDataMigrationError.invalidConfiguration
-                    }
-                case .ownerTemplate:
-                    data = try reader.read(
-                        item.sourcePath,
-                        maximumBytes: Self.ownerTemplateByteLimit
-                    )
-                    guard Self.isValidOwnerTemplate(data) else {
-                        throw SourceDataMigrationError.invalidOwnerTemplate
-                    }
-                case .uiPreferences:
-                    data = try reader.read(
-                        item.sourcePath,
-                        maximumBytes: Self.preferencesByteLimit
-                    )
-                    guard Self.isValidPreferences(data) else {
-                        throw SourceDataMigrationError.invalidPreferences
-                    }
-                case .activityHistory:
-                    let tail = try reader.readTail(
-                        item.sourcePath,
-                        maximumBytes: Self.activityScanByteLimit
-                    )
-                    data = try Self.validatedActivityTail(
-                        tail.data,
-                        startsMidFile: tail.startsMidFile
-                    )
-                }
-            } catch let error as SourceDataMigrationError {
-                throw error
-            } catch {
-                throw SourceDataMigrationError.unsafeSourceEntry(item.sourcePath)
-            }
-
-            let stageURL = stagingRoot.appendingPathComponent(
-                item.destinationPath
-            )
-            try fileManager.createDirectory(
-                at: stageURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try data.write(to: stageURL, options: .atomic)
-            staged.append(
-                StagedMigrationFile(
-                    item: item,
-                    stageURL: stageURL,
-                    relativeDestinationPath: item.destinationPath
+            switch item {
+            case .configuration:
+                data = try reader.read(
+                    item.sourcePath,
+                    maximumBytes: Self.configurationByteLimit
                 )
-            )
+                guard Self.isValidConfiguration(data) else {
+                    throw SourceDataMigrationError.invalidConfiguration
+                }
+            case .ownerTemplate:
+                data = try reader.read(
+                    item.sourcePath,
+                    maximumBytes: Self.ownerTemplateByteLimit
+                )
+                guard NumpyOwnerProfileInspector().inspect(data).isValid else {
+                    throw SourceDataMigrationError.invalidOwnerTemplate
+                }
+            case .uiPreferences:
+                data = try reader.read(
+                    item.sourcePath,
+                    maximumBytes: Self.preferencesByteLimit
+                )
+                guard Self.isValidPreferences(data) else {
+                    throw SourceDataMigrationError.invalidPreferences
+                }
+            case .activityHistory:
+                let tail = try reader.readTail(
+                    item.sourcePath,
+                    maximumBytes: Self.activityScanByteLimit
+                )
+                data = try Self.validatedActivityTail(
+                    tail.data,
+                    startsMidFile: tail.startsMidFile
+                )
+            }
+            payloads.append(MigrationPayload(item: item, data: data))
         }
-        return staged
+        return payloads
     }
 
-    private func prepareJournal(
-        staged: [StagedMigrationFile],
-        destinationRoot: URL,
-        rollbackRoot: URL,
-        createdDirectories: inout [URL]
-    ) throws -> [MigrationJournalEntry] {
-        var entries: [MigrationJournalEntry] = []
-        for stagedFile in staged {
-            let target = destinationRoot.appendingPathComponent(
-                stagedFile.relativeDestinationPath
-            )
-            let parent = target.deletingLastPathComponent()
-            try createSafeDirectory(
-                parent,
-                inside: destinationRoot,
-                created: &createdDirectories
-            )
-            let existed = fileManager.fileExists(atPath: target.path)
-            var backupURL: URL?
-            if existed {
-                guard isRegularNonSymlink(target) else {
-                    throw SourceDataMigrationError.unsafeDestination(target.path)
-                }
-                let backup = rollbackRoot.appendingPathComponent(
-                    stagedFile.relativeDestinationPath
-                )
-                try fileManager.createDirectory(
-                    at: backup.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                try fileManager.copyItem(at: target, to: backup)
-                backupURL = backup
-            }
-            entries.append(
-                MigrationJournalEntry(
-                    item: stagedFile.item,
-                    stageURL: stagedFile.stageURL,
-                    targetURL: target,
-                    backupURL: backupURL,
-                    existed: existed
-                )
-            )
-        }
-        return entries
-    }
-
-    private func commit(
-        journal: [MigrationJournalEntry],
-        transactionRoot: URL,
-        committedCount: inout Int
+    private func rejectOverlap(
+        source: URL,
+        sourceIdentity: MigrationFileIdentity,
+        destination: URL
     ) throws {
-        for entry in journal {
-            guard isRegularNonSymlink(entry.stageURL),
-                  isSafeTarget(entry.targetURL) else {
-                throw SourceDataMigrationError.commitFailed
-            }
-            guard rename(entry.stageURL.path, entry.targetURL.path) == 0 else {
-                throw SourceDataMigrationError.commitFailed
-            }
-            committedCount += 1
-            try writeJournal(
-                journal,
-                committedCount: committedCount,
-                to: transactionRoot.appendingPathComponent("journal.json")
-            )
-            try afterCommit?(committedCount)
+        let sourceCanonical = source.resolvingSymlinksInPath().standardizedFileURL
+        let destinationCanonical = destination
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let sourceComponents = sourceCanonical.pathComponents
+        let destinationComponents = destinationCanonical.pathComponents
+        let sourcePrefixesDestination =
+            destinationComponents.count >= sourceComponents.count
+            && zip(sourceComponents, destinationComponents).allSatisfy(==)
+        let destinationPrefixesSource =
+            sourceComponents.count >= destinationComponents.count
+            && zip(destinationComponents, sourceComponents).allSatisfy(==)
+        var destinationInfo = stat()
+        let sameIdentity = lstat(destinationCanonical.path, &destinationInfo) == 0
+            && sourceIdentity == MigrationFileIdentity(destinationInfo)
+        guard !sourcePrefixesDestination,
+              !destinationPrefixesSource,
+              !sameIdentity else {
+            throw SourceDataMigrationError.sourceDestinationOverlap
         }
     }
 
-    private func rollback(journal: [MigrationJournalEntry]) throws {
-        var rollbackFailed = false
-        for entry in journal.reversed() {
-            if let backup = entry.backupURL {
-                let temporary = entry.targetURL.deletingLastPathComponent()
-                    .appendingPathComponent(".rollback-\(UUID().uuidString)")
-                do {
-                    try fileManager.copyItem(at: backup, to: temporary)
-                    guard rename(temporary.path, entry.targetURL.path) == 0 else {
-                        try? fileManager.removeItem(at: temporary)
-                        rollbackFailed = true
-                        continue
-                    }
-                } catch {
-                    try? fileManager.removeItem(at: temporary)
-                    rollbackFailed = true
-                }
-            } else if fileManager.fileExists(atPath: entry.targetURL.path) {
-                do {
-                    try fileManager.removeItem(at: entry.targetURL)
-                } catch {
-                    rollbackFailed = true
-                }
-            }
-        }
-        if rollbackFailed {
-            throw SourceDataMigrationError.rollbackFailed
-        }
-    }
-
-    private func writeJournal(
-        _ entries: [MigrationJournalEntry],
-        committedCount: Int = 0,
-        to url: URL
-    ) throws {
-        let payload: [String: Any] = [
-            "schema_version": 1,
-            "committed_count": committedCount,
-            "entries": entries.map {
-                [
-                    "item": $0.item.rawValue,
-                    "target": $0.targetURL.path,
-                    "backup": $0.backupURL?.path as Any,
-                    "existed": $0.existed,
-                ]
-            },
-        ]
-        let data = try JSONSerialization.data(
-            withJSONObject: payload,
-            options: [.prettyPrinted, .sortedKeys]
-        )
-        try data.write(to: url, options: .atomic)
-    }
-
-    private func validatedDestinationRoot(_ url: URL) throws -> URL {
-        let standardized = url.standardizedFileURL
-        guard isDirectoryNonSymlink(standardized) else {
-            throw SourceDataMigrationError.unsafeDestination(standardized.path)
-        }
-        return standardized
-    }
-
-    private func createSafeDirectory(
-        _ url: URL,
-        inside root: URL,
-        created: inout [URL]
-    ) throws {
-        guard isDescendant(url, of: root) else {
-            throw SourceDataMigrationError.unsafeDestination(url.path)
-        }
-        if fileManager.fileExists(atPath: url.path) {
-            guard isDirectoryNonSymlink(url) else {
-                throw SourceDataMigrationError.unsafeDestination(url.path)
-            }
+    private func validateProvenance(_ candidate: SourceInstallCandidate) throws {
+        guard let provenance = candidate.launchAgentProvenance else {
             return
         }
-        let parent = url.deletingLastPathComponent()
-        if parent.path != root.path {
-            try createSafeDirectory(parent, inside: root, created: &created)
-        }
-        try fileManager.createDirectory(at: url, withIntermediateDirectories: false)
-        created.append(url)
-    }
-
-    private func isSafeTarget(_ url: URL) -> Bool {
-        !fileManager.fileExists(atPath: url.path) || isRegularNonSymlink(url)
-    }
-
-    private func isRegularNonSymlink(_ url: URL) -> Bool {
-        var info = stat()
-        guard lstat(url.path, &info) == 0 else {
-            return false
-        }
-        return (info.st_mode & S_IFMT) == S_IFREG
-    }
-
-    private func isDirectoryNonSymlink(_ url: URL) -> Bool {
-        var info = stat()
-        guard lstat(url.path, &info) == 0 else {
-            return false
-        }
-        return (info.st_mode & S_IFMT) == S_IFDIR
-    }
-
-    private func isDescendant(_ candidate: URL, of root: URL) -> Bool {
-        let rootComponents = root.standardizedFileURL.pathComponents
-        let candidateComponents = candidate.standardizedFileURL.pathComponents
-        return candidateComponents.count > rootComponents.count
-            && zip(rootComponents, candidateComponents).allSatisfy(==)
-    }
-
-    private func removeCreatedDirectoriesIfEmpty(
-        _ directories: [URL],
-        preserving: URL?
-    ) {
-        for directory in directories.reversed()
-            where directory.standardizedFileURL != preserving?.standardizedFileURL {
-            guard let contents = try? fileManager.contentsOfDirectory(
-                atPath: directory.path
-            ), contents.isEmpty else {
-                continue
-            }
-            try? fileManager.removeItem(at: directory)
+        guard let snapshot = try? SecureRegularFileSnapshot(
+            url: provenance.url,
+            maximumBytes: 1 * 1_024 * 1_024
+        ), snapshot.identity == provenance.identity,
+              snapshot.size == provenance.size,
+              snapshot.modifiedSeconds == provenance.modifiedSeconds,
+              snapshot.modifiedNanoseconds == provenance.modifiedNanoseconds,
+              Array(SHA256.hash(data: snapshot.data)) == provenance.digest else {
+            throw SourceDataMigrationError.candidateProvenanceChanged
         }
     }
 
-    private func legacyCandidateRoots() -> [URL] {
-        guard let home = fileManager.homeDirectoryForCurrentUser as URL? else {
-            return []
-        }
-        let launchAgents = home.appendingPathComponent(
-            "Library/LaunchAgents",
-            isDirectory: true
-        )
-        let plistNames = [
-            "com.wuyi.mac-face-lock-agent.plist",
-            "com.wuyi.mac-face-lock-release.plist",
-            "com.wuyi.mac-face-lock-status.plist",
+    private func legacyCandidateDescriptors() -> [(URL, LaunchAgentProvenance?)] {
+        let directory = launchAgentDirectoryURL
+            ?? fileManager.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+        let specifications = [
+            (
+                name: "com.wuyi.mac-face-lock-agent.plist",
+                label: "com.wuyi.mac-face-lock-agent",
+                executableSuffix:
+                    "/dist/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent"
+            ),
+            (
+                name: "com.wuyi.mac-face-lock-status.plist",
+                label: "com.wuyi.mac-face-lock-status",
+                executableSuffix:
+                    "/dist/Mac Face Lock.app/Contents/MacOS/MacFaceLock"
+            ),
         ]
-        var roots: [URL] = []
-        for name in plistNames {
-            let plistURL = launchAgents.appendingPathComponent(name)
-            var plistInfo = stat()
-            guard lstat(plistURL.path, &plistInfo) == 0,
-                  (plistInfo.st_mode & S_IFMT) == S_IFREG,
-                  plistInfo.st_size >= 0,
-                  plistInfo.st_size <= 1 * 1_024 * 1_024,
-                  let data = try? Data(contentsOf: plistURL),
-                  data.count == Int(plistInfo.st_size),
+        var descriptors: [(URL, LaunchAgentProvenance?)] = []
+        for specification in specifications {
+            let plistURL = directory.appendingPathComponent(specification.name)
+            guard let snapshot = try? SecureRegularFileSnapshot(
+                url: plistURL,
+                maximumBytes: 1 * 1_024 * 1_024
+            ),
                   let object = try? PropertyListSerialization.propertyList(
-                      from: data,
+                      from: snapshot.data,
                       options: [],
                       format: nil
                   ),
                   let dictionary = object as? [String: Any],
-                  let arguments = dictionary["ProgramArguments"] as? [String] else {
+                  dictionary["Label"] as? String == specification.label,
+                  let arguments = dictionary["ProgramArguments"] as? [String],
+                  arguments.count == 2,
+                  arguments[1].hasPrefix("/"),
+                  arguments[0]
+                    == arguments[1] + specification.executableSuffix,
+                  dictionary["WorkingDirectory"] as? String == arguments[1] else {
                 continue
             }
-            for argument in arguments where argument.hasPrefix("/") {
-                let url = URL(fileURLWithPath: argument).standardizedFileURL
-                var isDirectory: ObjCBool = false
-                if fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
-                   isDirectory.boolValue {
-                    roots.append(url)
-                } else if ["agent.py", "run-agent.sh"].contains(url.lastPathComponent) {
-                    roots.append(url.deletingLastPathComponent())
-                }
-            }
+            descriptors.append(
+                (
+                    URL(fileURLWithPath: arguments[1]).standardizedFileURL,
+                    LaunchAgentProvenance(
+                        url: plistURL,
+                        identity: snapshot.identity,
+                        size: snapshot.size,
+                        modifiedSeconds: snapshot.modifiedSeconds,
+                        modifiedNanoseconds: snapshot.modifiedNanoseconds,
+                        digest: Array(SHA256.hash(data: snapshot.data))
+                    )
+                )
+            )
         }
-        return roots
+        return descriptors
     }
 
     private static func isValidConfiguration(_ data: Data) -> Bool {
@@ -625,77 +472,6 @@ final class SourceDataMigrator {
         return true
     }
 
-    private static func isValidOwnerTemplate(_ data: Data) -> Bool {
-        guard data.count >= 10,
-              data.count <= ownerTemplateByteLimit,
-              Array(data.prefix(6)) == [0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59],
-              data[7] == 0 else {
-            return false
-        }
-        let major = data[6]
-        let headerStart: Int
-        let headerLength: Int
-        if major == 1 {
-            headerStart = 10
-            headerLength = Int(data[8]) | (Int(data[9]) << 8)
-        } else if (major == 2 || major == 3), data.count >= 12 {
-            headerStart = 12
-            let length = UInt32(data[8])
-                | (UInt32(data[9]) << 8)
-                | (UInt32(data[10]) << 16)
-                | (UInt32(data[11]) << 24)
-            guard let converted = Int(exactly: length) else {
-                return false
-            }
-            headerLength = converted
-        } else {
-            return false
-        }
-        let payloadStart = headerStart.addingReportingOverflow(headerLength)
-        guard !payloadStart.overflow,
-              headerLength > 0,
-              headerLength <= 10_000,
-              payloadStart.partialValue <= data.count,
-              let header = String(
-                  data: data[headerStart..<payloadStart.partialValue],
-                  encoding: .ascii
-              ),
-              let expression = try? NSRegularExpression(
-                  pattern: #"^\{\s*['"]descr['"]\s*:\s*['"]<f4['"]\s*,\s*['"]fortran_order['"]\s*:\s*False\s*,\s*['"]shape['"]\s*:\s*\(\s*([0-9]+)\s*,\s*9216\s*,?\s*\)\s*,?\s*\}\s*$"#
-              ),
-              let match = expression.firstMatch(
-                  in: header,
-                  range: NSRange(header.startIndex..., in: header)
-              ),
-              match.range.location != NSNotFound,
-              let rowsRange = Range(match.range(at: 1), in: header),
-              let rows = Int(header[rowsRange]),
-              rows >= 2 else {
-            return false
-        }
-        let valueCount = rows.multipliedReportingOverflow(by: 9_216)
-        let payloadBytes = valueCount.partialValue.multipliedReportingOverflow(by: 4)
-        let payloadEnd = payloadStart.partialValue.addingReportingOverflow(
-            payloadBytes.partialValue
-        )
-        guard !valueCount.overflow, !payloadBytes.overflow, !payloadEnd.overflow,
-              payloadEnd.partialValue == data.count else {
-            return false
-        }
-        var offset = payloadStart.partialValue
-        while offset < data.count {
-            let bits = UInt32(data[offset])
-                | (UInt32(data[offset + 1]) << 8)
-                | (UInt32(data[offset + 2]) << 16)
-                | (UInt32(data[offset + 3]) << 24)
-            guard Float(bitPattern: bits).isFinite else {
-                return false
-            }
-            offset += 4
-        }
-        return true
-    }
-
     private static func validatedActivityTail(
         _ data: Data,
         startsMidFile: Bool
@@ -738,22 +514,901 @@ final class SourceDataMigrator {
     }
 }
 
-private struct StagedMigrationFile {
-    let item: MigrationItem
-    let stageURL: URL
-    let relativeDestinationPath: String
+private struct InjectedMigrationFault: Error {
+    let underlying: Error
 }
 
-private struct MigrationJournalEntry {
+private struct MigrationPayload {
     let item: MigrationItem
-    let stageURL: URL
-    let targetURL: URL
-    let backupURL: URL?
-    let existed: Bool
+    let data: Data
+}
+
+private enum MigrationJournalState: String, Codable {
+    case preparing
+    case committing
+    case complete
+    case rolledBack
+}
+
+private struct DurableMigrationJournal: Codable {
+    var schemaVersion = 1
+    var state: MigrationJournalState
+    var intentCount: Int
+    var committedCount: Int
+    var entries: [DurableMigrationEntry]
+}
+
+private struct DurableMigrationEntry: Codable {
+    let item: MigrationItem
+    let parentName: String
+    let targetName: String
+    let stageName: String
+    let backupName: String?
+    let targetExisted: Bool
+    let parentIdentity: MigrationFileIdentity
+}
+
+private final class RuntimeMigrationEntry {
+    let durable: DurableMigrationEntry
+    let parentFD: Int32
+
+    init(durable: DurableMigrationEntry, parentFD: Int32) {
+        self.durable = durable
+        self.parentFD = parentFD
+    }
+
+    deinit {
+        close(parentFD)
+    }
+}
+
+private extension MigrationFileIdentity {
+    init(_ info: stat) {
+        self.init(
+            device: UInt64(info.st_dev),
+            inode: UInt64(info.st_ino)
+        )
+    }
+}
+
+private struct SecureRegularFileSnapshot {
+    let data: Data
+    let identity: MigrationFileIdentity
+    let size: Int64
+    let modifiedSeconds: Int64
+    let modifiedNanoseconds: Int64
+
+    init(url: URL, maximumBytes: Int) throws {
+        let fd = open(
+            url.path,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard fd >= 0 else {
+            throw SourceDataMigrationError.unsafeSourceEntry(url.lastPathComponent)
+        }
+        defer { close(fd) }
+        var before = stat()
+        guard fstat(fd, &before) == 0,
+              (before.st_mode & S_IFMT) == S_IFREG,
+              before.st_nlink == 1,
+              before.st_size >= 0,
+              before.st_size <= off_t(maximumBytes) else {
+            throw SourceDataMigrationError.unsafeSourceEntry(url.lastPathComponent)
+        }
+        let bytes = try readExactData(
+            fd: fd,
+            count: Int(before.st_size),
+            error: SourceDataMigrationError.sourceChanged(url.lastPathComponent)
+        )
+        var after = stat()
+        guard fstat(fd, &after) == 0,
+              sameStableFile(before, after) else {
+            throw SourceDataMigrationError.sourceChanged(url.lastPathComponent)
+        }
+        data = bytes
+        identity = MigrationFileIdentity(before)
+        size = Int64(before.st_size)
+        modifiedSeconds = Int64(before.st_mtimespec.tv_sec)
+        modifiedNanoseconds = Int64(before.st_mtimespec.tv_nsec)
+    }
+}
+
+private final class DestinationSession {
+    private let destination: URL
+    private let rootFD: Int32
+    private let rootIdentity: MigrationFileIdentity
+    private let lockFD: Int32
+    private let createdLock: Bool
+    private let removeLockWhenDone: Bool
+
+    init(destination: URL, removeLockWhenDone: Bool) throws {
+        self.destination = destination.standardizedFileURL
+        self.removeLockWhenDone = removeLockWhenDone
+        var rootInfo = stat()
+        guard lstat(self.destination.path, &rootInfo) == 0,
+              (rootInfo.st_mode & S_IFMT) == S_IFDIR else {
+            throw SourceDataMigrationError.unsafeDestination(
+                self.destination.path
+            )
+        }
+        let openedRoot = open(
+            self.destination.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard openedRoot >= 0 else {
+            throw SourceDataMigrationError.unsafeDestination(
+                self.destination.path
+            )
+        }
+        var openedRootInfo = stat()
+        guard fstat(openedRoot, &openedRootInfo) == 0,
+              MigrationFileIdentity(openedRootInfo)
+                == MigrationFileIdentity(rootInfo) else {
+            close(openedRoot)
+            throw SourceDataMigrationError.unsafeDestination(
+                self.destination.path
+            )
+        }
+        rootFD = openedRoot
+        rootIdentity = MigrationFileIdentity(openedRootInfo)
+
+        var lockInfo = stat()
+        let lockAlreadyExisted = fstatat(
+            rootFD,
+            ".migration.lock",
+            &lockInfo,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0
+        let openedLock = openat(
+            rootFD,
+            ".migration.lock",
+            O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC,
+            0o600
+        )
+        guard openedLock >= 0 else {
+            close(rootFD)
+            throw SourceDataMigrationError.unsafeDestination(
+                ".migration.lock"
+            )
+        }
+        var openedLockInfo = stat()
+        guard fstat(openedLock, &openedLockInfo) == 0,
+              (openedLockInfo.st_mode & S_IFMT) == S_IFREG,
+              openedLockInfo.st_nlink == 1 else {
+            close(openedLock)
+            close(rootFD)
+            throw SourceDataMigrationError.unsafeDestination(
+                ".migration.lock"
+            )
+        }
+        guard flock(openedLock, LOCK_EX | LOCK_NB) == 0 else {
+            close(openedLock)
+            close(rootFD)
+            throw SourceDataMigrationError.migrationInProgress
+        }
+        lockFD = openedLock
+        createdLock = !lockAlreadyExisted
+    }
+
+    deinit {
+        if removeLockWhenDone && createdLock {
+            _ = unlinkat(rootFD, ".migration.lock", 0)
+            _ = fsync(rootFD)
+        }
+        _ = flock(lockFD, LOCK_UN)
+        close(lockFD)
+        close(rootFD)
+    }
+
+    func performImport(
+        transactionID: String,
+        payloads: [MigrationPayload],
+        inject: @escaping (MigrationFaultPoint) throws -> Void
+    ) throws -> URL {
+        try verifyRoot()
+        let backupsWasCreated = try ensureDirectory(
+            parentFD: rootFD,
+            name: "backups"
+        ).created
+        let backupsFD = try openDirectory(parentFD: rootFD, name: "backups")
+        defer { close(backupsFD) }
+        guard mkdirat(backupsFD, transactionID, 0o700) == 0 else {
+            throw SourceDataMigrationError.commitFailed
+        }
+        _ = fsync(backupsFD)
+        let transactionFD = try openDirectory(
+            parentFD: backupsFD,
+            name: transactionID
+        )
+        defer { close(transactionFD) }
+        guard mkdirat(transactionFD, "staging", 0o700) == 0,
+              mkdirat(transactionFD, "rollback", 0o700) == 0 else {
+            try? secureRemoveDirectory(parentFD: backupsFD, name: transactionID)
+            throw SourceDataMigrationError.commitFailed
+        }
+        let stagingFD = try openDirectory(
+            parentFD: transactionFD,
+            name: "staging"
+        )
+        let rollbackFD = try openDirectory(
+            parentFD: transactionFD,
+            name: "rollback"
+        )
+        defer {
+            close(stagingFD)
+            close(rollbackFD)
+        }
+
+        var runtimeEntries: [RuntimeMigrationEntry] = []
+        do {
+            for (payloadIndex, payload) in payloads.enumerated() {
+                let mapping = destinationMapping(payload.item)
+                let parentFD = try openDirectory(
+                    parentFD: rootFD,
+                    name: mapping.parent
+                )
+                var parentInfo = stat()
+                guard fstat(parentFD, &parentInfo) == 0 else {
+                    close(parentFD)
+                    throw SourceDataMigrationError.unsafeDestination(
+                        mapping.parent
+                    )
+                }
+                let stageName = "\(payload.item.rawValue).stage"
+                try writeNewFile(
+                    parentFD: stagingFD,
+                    name: stageName,
+                    data: payload.data
+                )
+                try inject(.afterStageFileFsync(payloadIndex))
+                let targetInfo = try fileInfo(
+                    parentFD: parentFD,
+                    name: mapping.target
+                )
+                let targetExisted = targetInfo != nil
+                var backupName: String?
+                if let targetInfo {
+                    guard (targetInfo.st_mode & S_IFMT) == S_IFREG,
+                          targetInfo.st_nlink == 1 else {
+                        close(parentFD)
+                        throw SourceDataMigrationError.unsafeDestination(
+                            "\(mapping.parent)/\(mapping.target)"
+                        )
+                    }
+                    let existing = try readFile(
+                        parentFD: parentFD,
+                        name: mapping.target,
+                        maximumBytes: 64 * 1_024 * 1_024
+                    )
+                    let name = "\(payload.item.rawValue).backup"
+                    try writeNewFile(
+                        parentFD: rollbackFD,
+                        name: name,
+                        data: existing
+                    )
+                    try inject(.afterBackupFileFsync(payloadIndex))
+                    backupName = name
+                }
+                let durable = DurableMigrationEntry(
+                    item: payload.item,
+                    parentName: mapping.parent,
+                    targetName: mapping.target,
+                    stageName: stageName,
+                    backupName: backupName,
+                    targetExisted: targetExisted,
+                    parentIdentity: MigrationFileIdentity(parentInfo)
+                )
+                runtimeEntries.append(
+                    RuntimeMigrationEntry(
+                        durable: durable,
+                        parentFD: parentFD
+                    )
+                )
+            }
+            guard fsync(stagingFD) == 0,
+                  fsync(rollbackFD) == 0,
+                  fsync(transactionFD) == 0,
+                  fsync(backupsFD) == 0 else {
+                throw SourceDataMigrationError.commitFailed
+            }
+            try inject(.afterPreparedDirectoryFsync)
+
+            var journal = DurableMigrationJournal(
+                state: .preparing,
+                intentCount: 0,
+                committedCount: 0,
+                entries: runtimeEntries.map(\.durable)
+            )
+            try writeJournal(
+                journal,
+                transactionFD: transactionFD,
+                checkpoint: "initial",
+                index: -1,
+                inject: inject
+            )
+
+            do {
+                for (index, entry) in runtimeEntries.enumerated() {
+                    journal.state = .committing
+                    journal.intentCount = index + 1
+                    try writeJournal(
+                        journal,
+                        transactionFD: transactionFD,
+                        checkpoint: "intent",
+                        index: index,
+                        inject: inject
+                    )
+                    guard try parentStillBound(entry) else {
+                        throw SourceDataMigrationError.unsafeDestination(
+                            entry.durable.parentName
+                        )
+                    }
+                    guard renameat(
+                        stagingFD,
+                        entry.durable.stageName,
+                        entry.parentFD,
+                        entry.durable.targetName
+                    ) == 0 else {
+                        throw SourceDataMigrationError.commitFailed
+                    }
+                    try inject(.afterTargetRename(index))
+                    guard fsync(entry.parentFD) == 0 else {
+                        throw SourceDataMigrationError.commitFailed
+                    }
+                    try inject(.afterDestinationDirectoryFsync(index))
+                    journal.committedCount = index + 1
+                    try writeJournal(
+                        journal,
+                        transactionFD: transactionFD,
+                        checkpoint: "committed",
+                        index: index,
+                        inject: inject
+                    )
+                }
+                journal.state = .complete
+                try writeJournal(
+                    journal,
+                    transactionFD: transactionFD,
+                    checkpoint: "complete",
+                    index: -1,
+                    inject: inject
+                )
+            } catch let injected as InjectedMigrationFault {
+                throw injected
+            } catch {
+                do {
+                    try rollback(
+                        journal: journal,
+                        transactionFD: transactionFD,
+                        runtimeEntries: runtimeEntries
+                    )
+                    journal.state = .rolledBack
+                    try writeJournal(journal, transactionFD: transactionFD)
+                    try secureRemoveDirectory(
+                        parentFD: backupsFD,
+                        name: transactionID
+                    )
+                    if backupsWasCreated {
+                        try? removeDirectoryIfEmpty(
+                            parentFD: rootFD,
+                            name: "backups"
+                        )
+                    }
+                } catch {
+                    throw SourceDataMigrationError.rollbackFailed
+                }
+                throw error
+            }
+            return destination
+                .appendingPathComponent("backups")
+                .appendingPathComponent(transactionID)
+        } catch let injected as InjectedMigrationFault {
+            throw injected
+        } catch {
+            if (try? readJournal(transactionFD: transactionFD)) == nil {
+                try? secureRemoveDirectory(
+                    parentFD: backupsFD,
+                    name: transactionID
+                )
+                if backupsWasCreated {
+                    try? removeDirectoryIfEmpty(
+                        parentFD: rootFD,
+                        name: "backups"
+                    )
+                }
+            }
+            throw error
+        }
+    }
+
+    func recoverPendingTransactions() throws {
+        try verifyRoot()
+        guard let backupsFD = try optionalDirectory(
+            parentFD: rootFD,
+            name: "backups"
+        ) else {
+            return
+        }
+        defer { close(backupsFD) }
+        for name in try directoryNames(backupsFD)
+            where name.hasPrefix("import-") {
+            guard let transactionFD = try optionalDirectory(
+                parentFD: backupsFD,
+                name: name
+            ) else {
+                throw SourceDataMigrationError.recoveryFailed
+            }
+            defer { close(transactionFD) }
+            guard try fileInfo(
+                parentFD: transactionFD,
+                name: "journal.json"
+            ) != nil else {
+                try secureRemoveDirectory(parentFD: backupsFD, name: name)
+                continue
+            }
+            let journal: DurableMigrationJournal
+            do {
+                journal = try readJournal(transactionFD: transactionFD)
+            } catch {
+                throw SourceDataMigrationError.recoveryFailed
+            }
+            try validateJournal(journal)
+            switch journal.state {
+            case .complete:
+                continue
+            case .rolledBack:
+                try secureRemoveDirectory(parentFD: backupsFD, name: name)
+            case .preparing, .committing:
+                let runtimeEntries = try runtimeEntriesForRecovery(journal)
+                try rollback(
+                    journal: journal,
+                    transactionFD: transactionFD,
+                    runtimeEntries: runtimeEntries
+                )
+                var rolledBack = journal
+                rolledBack.state = .rolledBack
+                try writeJournal(rolledBack, transactionFD: transactionFD)
+                try secureRemoveDirectory(parentFD: backupsFD, name: name)
+            }
+        }
+        try? removeDirectoryIfEmpty(parentFD: rootFD, name: "backups")
+    }
+
+    private func runtimeEntriesForRecovery(
+        _ journal: DurableMigrationJournal
+    ) throws -> [RuntimeMigrationEntry] {
+        try journal.entries.map { durable in
+            let parentFD = try openDirectory(
+                parentFD: rootFD,
+                name: durable.parentName
+            )
+            var info = stat()
+            guard fstat(parentFD, &info) == 0,
+                  MigrationFileIdentity(info) == durable.parentIdentity else {
+                close(parentFD)
+                throw SourceDataMigrationError.recoveryFailed
+            }
+            return RuntimeMigrationEntry(
+                durable: durable,
+                parentFD: parentFD
+            )
+        }
+    }
+
+    private func rollback(
+        journal: DurableMigrationJournal,
+        transactionFD: Int32,
+        runtimeEntries: [RuntimeMigrationEntry]
+    ) throws {
+        let rollbackFD = try openDirectory(
+            parentFD: transactionFD,
+            name: "rollback"
+        )
+        defer { close(rollbackFD) }
+        for entry in runtimeEntries.prefix(journal.intentCount).reversed() {
+            if entry.durable.targetExisted {
+                guard let backupName = entry.durable.backupName else {
+                    throw SourceDataMigrationError.rollbackFailed
+                }
+                let backup = try readFile(
+                    parentFD: rollbackFD,
+                    name: backupName,
+                    maximumBytes: 64 * 1_024 * 1_024
+                )
+                let temporary = ".rollback-\(UUID().uuidString)"
+                try writeNewFile(
+                    parentFD: entry.parentFD,
+                    name: temporary,
+                    data: backup
+                )
+                guard renameat(
+                    entry.parentFD,
+                    temporary,
+                    entry.parentFD,
+                    entry.durable.targetName
+                ) == 0 else {
+                    _ = unlinkat(entry.parentFD, temporary, 0)
+                    throw SourceDataMigrationError.rollbackFailed
+                }
+            } else if unlinkat(
+                entry.parentFD,
+                entry.durable.targetName,
+                0
+            ) != 0, errno != ENOENT {
+                throw SourceDataMigrationError.rollbackFailed
+            }
+            guard fsync(entry.parentFD) == 0 else {
+                throw SourceDataMigrationError.rollbackFailed
+            }
+        }
+    }
+
+    private func parentStillBound(
+        _ entry: RuntimeMigrationEntry
+    ) throws -> Bool {
+        var rootEntry = stat()
+        guard fstatat(
+            rootFD,
+            entry.durable.parentName,
+            &rootEntry,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0 else {
+            return false
+        }
+        return (rootEntry.st_mode & S_IFMT) == S_IFDIR
+            && MigrationFileIdentity(rootEntry) == entry.durable.parentIdentity
+    }
+
+    private func writeJournal(
+        _ journal: DurableMigrationJournal,
+        transactionFD: Int32,
+        checkpoint: String? = nil,
+        index: Int = -1,
+        inject: ((MigrationFaultPoint) throws -> Void)? = nil
+    ) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(journal)
+        let temporary = ".journal-\(UUID().uuidString)"
+        try writeNewFile(
+            parentFD: transactionFD,
+            name: temporary,
+            data: data
+        )
+        if let checkpoint {
+            try inject?(.afterJournalFileFsync(checkpoint, index))
+        }
+        guard renameat(
+            transactionFD,
+            temporary,
+            transactionFD,
+            "journal.json"
+        ) == 0 else {
+            _ = unlinkat(transactionFD, temporary, 0)
+            throw SourceDataMigrationError.commitFailed
+        }
+        if let checkpoint {
+            try inject?(.afterJournalRename(checkpoint, index))
+        }
+        guard fsync(transactionFD) == 0 else {
+            throw SourceDataMigrationError.commitFailed
+        }
+        if let checkpoint {
+            try inject?(.afterJournalDirectoryFsync(checkpoint, index))
+        }
+    }
+
+    private func readJournal(
+        transactionFD: Int32
+    ) throws -> DurableMigrationJournal {
+        let data = try readFile(
+            parentFD: transactionFD,
+            name: "journal.json",
+            maximumBytes: 1 * 1_024 * 1_024
+        )
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(DurableMigrationJournal.self, from: data)
+    }
+
+    private func validateJournal(
+        _ journal: DurableMigrationJournal
+    ) throws {
+        let allowed = Set(MigrationItem.allCases)
+        guard journal.schemaVersion == 1,
+              journal.intentCount >= 0,
+              journal.intentCount <= journal.entries.count,
+              journal.committedCount >= 0,
+              journal.committedCount <= journal.intentCount,
+              Set(journal.entries.map(\.item)).count == journal.entries.count,
+              journal.entries.allSatisfy({
+                  allowed.contains($0.item)
+                    && $0.parentName == destinationMapping($0.item).parent
+                    && $0.targetName == destinationMapping($0.item).target
+                    && !$0.stageName.contains("/")
+                    && ($0.backupName?.contains("/") != true)
+              }) else {
+            throw SourceDataMigrationError.recoveryFailed
+        }
+    }
+
+    private func verifyRoot() throws {
+        var info = stat()
+        guard fstat(rootFD, &info) == 0,
+              MigrationFileIdentity(info) == rootIdentity else {
+            throw SourceDataMigrationError.unsafeDestination(".")
+        }
+    }
+}
+
+private func destinationMapping(
+    _ item: MigrationItem
+) -> (parent: String, target: String) {
+    switch item {
+    case .configuration:
+        return ("config", "config.json")
+    case .ownerTemplate:
+        return ("data", "owner_face.npy")
+    case .uiPreferences:
+        return ("data", "ui-preferences.json")
+    case .activityHistory:
+        return ("data", "activity.jsonl")
+    }
+}
+
+private func ensureDirectory(
+    parentFD: Int32,
+    name: String
+) throws -> (created: Bool, identity: MigrationFileIdentity) {
+    var info = stat()
+    if fstatat(parentFD, name, &info, AT_SYMLINK_NOFOLLOW) == 0 {
+        guard (info.st_mode & S_IFMT) == S_IFDIR else {
+            throw SourceDataMigrationError.unsafeDestination(name)
+        }
+        return (false, MigrationFileIdentity(info))
+    }
+    guard errno == ENOENT,
+          mkdirat(parentFD, name, 0o700) == 0,
+          fsync(parentFD) == 0,
+          fstatat(parentFD, name, &info, AT_SYMLINK_NOFOLLOW) == 0,
+          (info.st_mode & S_IFMT) == S_IFDIR else {
+        throw SourceDataMigrationError.unsafeDestination(name)
+    }
+    return (true, MigrationFileIdentity(info))
+}
+
+private func openDirectory(parentFD: Int32, name: String) throws -> Int32 {
+    let fd = openat(
+        parentFD,
+        name,
+        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+    )
+    guard fd >= 0 else {
+        throw SourceDataMigrationError.unsafeDestination(name)
+    }
+    return fd
+}
+
+private func optionalDirectory(
+    parentFD: Int32,
+    name: String
+) throws -> Int32? {
+    let fd = openat(
+        parentFD,
+        name,
+        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+    )
+    if fd >= 0 {
+        return fd
+    }
+    if errno == ENOENT {
+        return nil
+    }
+    throw SourceDataMigrationError.unsafeDestination(name)
+}
+
+private func fileInfo(parentFD: Int32, name: String) throws -> stat? {
+    var info = stat()
+    if fstatat(parentFD, name, &info, AT_SYMLINK_NOFOLLOW) == 0 {
+        return info
+    }
+    if errno == ENOENT {
+        return nil
+    }
+    throw SourceDataMigrationError.unsafeDestination(name)
+}
+
+private func writeNewFile(
+    parentFD: Int32,
+    name: String,
+    data: Data
+) throws {
+    let fd = openat(
+        parentFD,
+        name,
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+        0o600
+    )
+    guard fd >= 0 else {
+        throw SourceDataMigrationError.commitFailed
+    }
+    var succeeded = false
+    defer {
+        close(fd)
+        if !succeeded {
+            _ = unlinkat(parentFD, name, 0)
+        }
+    }
+    try data.withUnsafeBytes { bytes in
+        var written = 0
+        while written < bytes.count {
+            let count = Darwin.write(
+                fd,
+                bytes.baseAddress!.advanced(by: written),
+                bytes.count - written
+            )
+            if count > 0 {
+                written += count
+            } else if count < 0 && errno == EINTR {
+                continue
+            } else {
+                throw SourceDataMigrationError.commitFailed
+            }
+        }
+    }
+    guard fsync(fd) == 0 else {
+        throw SourceDataMigrationError.commitFailed
+    }
+    succeeded = true
+}
+
+private func readFile(
+    parentFD: Int32,
+    name: String,
+    maximumBytes: Int
+) throws -> Data {
+    let fd = openat(
+        parentFD,
+        name,
+        O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+    )
+    guard fd >= 0 else {
+        throw SourceDataMigrationError.unsafeDestination(name)
+    }
+    defer { close(fd) }
+    var before = stat()
+    guard fstat(fd, &before) == 0,
+          (before.st_mode & S_IFMT) == S_IFREG,
+          before.st_nlink == 1,
+          before.st_size >= 0,
+          before.st_size <= off_t(maximumBytes) else {
+        throw SourceDataMigrationError.unsafeDestination(name)
+    }
+    let data = try readExactData(
+        fd: fd,
+        count: Int(before.st_size),
+        error: SourceDataMigrationError.unsafeDestination(name)
+    )
+    var after = stat()
+    guard fstat(fd, &after) == 0, sameStableFile(before, after) else {
+        throw SourceDataMigrationError.unsafeDestination(name)
+    }
+    return data
+}
+
+private func readExactData(
+    fd: Int32,
+    count: Int,
+    error: Error
+) throws -> Data {
+    var data = Data(count: count)
+    var total = 0
+    let success = data.withUnsafeMutableBytes { bytes -> Bool in
+        if count == 0 {
+            return true
+        }
+        guard let base = bytes.baseAddress else {
+            return false
+        }
+        while total < count {
+            let amount = Darwin.read(
+                fd,
+                base.advanced(by: total),
+                count - total
+            )
+            if amount > 0 {
+                total += amount
+            } else if amount < 0 && errno == EINTR {
+                continue
+            } else {
+                return false
+            }
+        }
+        return true
+    }
+    guard success else {
+        throw error
+    }
+    return data
+}
+
+private func sameStableFile(_ left: stat, _ right: stat) -> Bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_mode == right.st_mode
+        && left.st_nlink == right.st_nlink
+        && left.st_size == right.st_size
+        && left.st_mtimespec.tv_sec == right.st_mtimespec.tv_sec
+        && left.st_mtimespec.tv_nsec == right.st_mtimespec.tv_nsec
+        && left.st_ctimespec.tv_sec == right.st_ctimespec.tv_sec
+        && left.st_ctimespec.tv_nsec == right.st_ctimespec.tv_nsec
+}
+
+private func directoryNames(_ fd: Int32) throws -> [String] {
+    let duplicate = dup(fd)
+    guard duplicate >= 0, let directory = fdopendir(duplicate) else {
+        if duplicate >= 0 { close(duplicate) }
+        throw SourceDataMigrationError.recoveryFailed
+    }
+    defer { closedir(directory) }
+    var names: [String] = []
+    while let entry = readdir(directory) {
+        let name = withUnsafePointer(to: entry.pointee.d_name) {
+            $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) {
+                String(cString: $0)
+            }
+        }
+        if name != "." && name != ".." {
+            names.append(name)
+        }
+    }
+    return names
+}
+
+private func secureRemoveDirectory(parentFD: Int32, name: String) throws {
+    let directoryFD = try openDirectory(parentFD: parentFD, name: name)
+    defer { close(directoryFD) }
+    for child in try directoryNames(directoryFD) {
+        var info = stat()
+        guard fstatat(
+            directoryFD,
+            child,
+            &info,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0 else {
+            throw SourceDataMigrationError.recoveryFailed
+        }
+        if (info.st_mode & S_IFMT) == S_IFDIR {
+            try secureRemoveDirectory(parentFD: directoryFD, name: child)
+        } else if unlinkat(directoryFD, child, 0) != 0 {
+            throw SourceDataMigrationError.recoveryFailed
+        }
+    }
+    guard unlinkat(parentFD, name, AT_REMOVEDIR) == 0,
+          fsync(parentFD) == 0 else {
+        throw SourceDataMigrationError.recoveryFailed
+    }
+}
+
+private func removeDirectoryIfEmpty(parentFD: Int32, name: String) throws {
+    guard let fd = try optionalDirectory(parentFD: parentFD, name: name) else {
+        return
+    }
+    let isEmpty = try directoryNames(fd).isEmpty
+    close(fd)
+    guard isEmpty else {
+        return
+    }
+    guard unlinkat(parentFD, name, AT_REMOVEDIR) == 0,
+          fsync(parentFD) == 0 else {
+        throw SourceDataMigrationError.recoveryFailed
+    }
 }
 
 private final class SecureSourceReader {
     private let rootFD: Int32
+    let rootIdentity: MigrationFileIdentity
 
     init(rootURL: URL) throws {
         var info = stat()
@@ -768,6 +1423,13 @@ private final class SecureSourceReader {
         guard rootFD >= 0 else {
             throw SourceDataMigrationError.unsafeSourceRoot
         }
+        var openedInfo = stat()
+        guard fstat(rootFD, &openedInfo) == 0,
+              MigrationFileIdentity(openedInfo) == MigrationFileIdentity(info) else {
+            close(rootFD)
+            throw SourceDataMigrationError.unsafeSourceRoot
+        }
+        rootIdentity = MigrationFileIdentity(openedInfo)
     }
 
     deinit {
@@ -798,6 +1460,7 @@ private final class SecureSourceReader {
                 return false
             }
             return (info.st_mode & S_IFMT) == S_IFREG
+                && info.st_nlink == 1
         }) ?? false
     }
 
@@ -870,17 +1533,14 @@ private final class SecureSourceReader {
             defer { close(fd) }
             var before = stat()
             guard fstat(fd, &before) == 0,
-                  (before.st_mode & S_IFMT) == S_IFREG else {
+                  (before.st_mode & S_IFMT) == S_IFREG,
+                  before.st_nlink == 1 else {
                 throw SourceDataMigrationError.unsafeSourceEntry(relativePath)
             }
             let result = try operation(fd, before)
             var after = stat()
             guard fstat(fd, &after) == 0,
-                  before.st_dev == after.st_dev,
-                  before.st_ino == after.st_ino,
-                  before.st_size == after.st_size,
-                  before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,
-                  before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec else {
+                  sameStableFile(before, after) else {
                 throw SourceDataMigrationError.sourceChanged(relativePath)
             }
             return result

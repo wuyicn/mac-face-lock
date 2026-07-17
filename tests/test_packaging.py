@@ -299,6 +299,8 @@ class UnifiedPackagingTests(unittest.TestCase):
         self.assertIn("importSourceData", onboarding)
         self.assertIn("skipSourceDataImport", onboarding)
         self.assertIn("themeStore.reload()", onboarding)
+        self.assertIn("重试恢复", onboarding)
+        self.assertIn("retryMigrationRecovery", onboarding)
 
         user_facing_sources = onboarding + settings
         for shell_copy in (

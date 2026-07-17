@@ -21,7 +21,14 @@ final class NumpyOwnerProfileInspector: OwnerProfileInspecting {
         guard let data = try? Data(
             contentsOf: url,
             options: [.mappedIfSafe]
-        ), data.count >= 10, data.count <= maximumBytes,
+        ) else {
+            return OwnerProfileInspection(isValid: false, fingerprint: nil)
+        }
+        return inspect(data)
+    }
+
+    func inspect(_ data: Data) -> OwnerProfileInspection {
+        guard data.count >= 10, data.count <= maximumBytes,
               Array(data.prefix(6)) == [0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59] else {
             return OwnerProfileInspection(isValid: false, fingerprint: nil)
         }
@@ -519,7 +526,20 @@ final class SetupCoordinator: ObservableObject {
             && storedRecord.ownerProfileFingerprint == initialInspection.fingerprint
         let resolvedMigrator = sourceDataMigrator
             ?? (environment.mode == .release ? SourceDataMigrator() : nil)
-        let discoveredCandidates = storedRecord.currentStep == .preparation
+        var initialMigrationError: String?
+        if let resolvedMigrator {
+            do {
+                try resolvedMigrator.recoverPendingImports(
+                    destination: environment.supportURL
+                )
+            } catch {
+                initialMigrationError =
+                    "上次数据导入尚未安全恢复，请先重试恢复；保护保持关闭。"
+            }
+        }
+        let discoveredCandidates =
+            storedRecord.currentStep == .preparation
+                && initialMigrationError == nil
             ? (resolvedMigrator?.discoverCandidates() ?? [])
             : []
         self.environment = environment
@@ -546,7 +566,7 @@ final class SetupCoordinator: ObservableObject {
         self.ownerProfileInspector = resolvedOwnerProfileInspector
         self.sourceDataMigrator = resolvedMigrator
         self.progress = nil
-        self.currentError = nil
+        self.currentError = initialMigrationError
         self.permissionStates = [:]
         self.currentStep = restoredStep
         self.hasCompletedOnboarding = storedRecord.isComplete
@@ -556,9 +576,9 @@ final class SetupCoordinator: ObservableObject {
             ? (initialInspection.isValid ? .safetyTest : .enrollment)
             : nil
         self.sourceInstallCandidates = discoveredCandidates
-        self.migrationDecision = discoveredCandidates.isEmpty
-            ? .notRequired
-            : .pending
+        self.migrationDecision = initialMigrationError != nil
+            ? .recoveryFailed
+            : (discoveredCandidates.isEmpty ? .notRequired : .pending)
         self.ownerProfileValid = initialInspection.isValid
         self.diagnosisPassed = durableOwnerEvidence
         self.ownerTestPassed = durableOwnerEvidence
@@ -635,6 +655,10 @@ final class SetupCoordinator: ObservableObject {
 
     @discardableResult
     func prepareForSetup() async -> Bool {
+        guard migrationDecision != .recoveryFailed else {
+            currentError = "请先恢复上次未完成的数据导入；保护保持关闭。"
+            return false
+        }
         currentError = nil
         guard migrationDecision != .pending else {
             currentError = "发现旧版源码数据，请先明确选择“导入”或“跳过”。"
@@ -715,6 +739,29 @@ final class SetupCoordinator: ObservableObject {
         }
         migrationDecision = .skipped
         currentError = nil
+    }
+
+    @discardableResult
+    func retryMigrationRecovery() -> Bool {
+        guard migrationDecision == .recoveryFailed,
+              let sourceDataMigrator else {
+            return false
+        }
+        do {
+            try sourceDataMigrator.recoverPendingImports(
+                destination: environment.supportURL
+            )
+            sourceInstallCandidates = sourceDataMigrator.discoverCandidates()
+            migrationDecision = sourceInstallCandidates.isEmpty
+                ? .notRequired
+                : .pending
+            currentError = nil
+            return true
+        } catch {
+            currentError =
+                "上次数据导入仍未恢复，请保留本地数据并再次重试；保护保持关闭。"
+            return false
+        }
     }
 
     func goBack() {

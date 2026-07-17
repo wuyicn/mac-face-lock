@@ -589,6 +589,10 @@ private struct CoordinatorFixture {
             .appendingPathComponent("mac-face-lock-coordinator-\(UUID().uuidString)")
         let dataURL = root.appendingPathComponent("data", isDirectory: true)
         try FileManager.default.createDirectory(at: dataURL, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("config", isDirectory: true),
+            withIntermediateDirectories: true
+        )
         localStore = LocalJSONStore(resourcesURL: root, dataURL: dataURL)
         setupStore = try SetupStore(localStore: localStore, mode: mode)
         environment = AppEnvironment(
@@ -647,6 +651,7 @@ struct SetupCoordinatorTests {
         try await testCameraOnlyDiagnosisKeepsValidOwnerProfile()
         try await testCompletedCameraRevocationRecoveryPreservesHistoryAndSkipsEnrollment()
         try await testMigrationRequiresExplicitChoiceAndCanRetryVisibleFailure()
+        try await testPendingMigrationRecoveryBlocksPreparationAndCanRetry()
         print("Setup coordinator tests passed")
     }
 
@@ -2198,7 +2203,10 @@ struct SetupCoordinatorTests {
     private static func testMigrationRequiresExplicitChoiceAndCanRetryVisibleFailure() async throws {
         let fixture = try CoordinatorFixture(mode: .source)
         defer { fixture.remove() }
-        let source = fixture.root.appendingPathComponent("legacy-source")
+        let source = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "legacy-source-\(UUID().uuidString)"
+        )
+        defer { try? FileManager.default.removeItem(at: source) }
         try FileManager.default.createDirectory(
             at: source.appendingPathComponent("config"),
             withIntermediateDirectories: true
@@ -2303,6 +2311,54 @@ struct SetupCoordinatorTests {
         try require(
             sourceConfigAfterSkip == sourceConfig,
             "skip modified or marked the source installation"
+        )
+    }
+
+    private static func testPendingMigrationRecoveryBlocksPreparationAndCanRetry() async throws {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        try FileManager.default.createDirectory(
+            at: fixture.root.appendingPathComponent("config"),
+            withIntermediateDirectories: true
+        )
+        let transaction = fixture.root.appendingPathComponent(
+            "backups/import-corrupt"
+        )
+        try FileManager.default.createDirectory(
+            at: transaction,
+            withIntermediateDirectories: true
+        )
+        try Data("corrupt-journal".utf8).write(
+            to: transaction.appendingPathComponent("journal.json")
+        )
+        let migrator = SourceDataMigrator(candidateRootURLs: [])
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector(valid: false),
+            sourceDataMigrator: migrator
+        )
+        try require(
+            coordinator.migrationDecision == .recoveryFailed
+                && coordinator.currentError?.contains("恢复") == true,
+            "pending recovery failure was not visible at startup"
+        )
+        let prepared = await coordinator.prepareForSetup()
+        try require(!prepared, "preparation bypassed failed migration recovery")
+
+        try FileManager.default.removeItem(at: transaction)
+        try require(
+            coordinator.retryMigrationRecovery(),
+            "recovery retry did not clear a repaired pending transaction"
+        )
+        try require(
+            coordinator.migrationDecision == .notRequired
+                && coordinator.currentError == nil,
+            "successful recovery retry did not restore the first-run gate"
         )
     }
 }

@@ -183,7 +183,9 @@ struct OnboardingView: View {
                 SetupRequirementRow(text: "应用支持目录可在本机安全写入")
             }
 
-            if !setupCoordinator.sourceInstallCandidates.isEmpty {
+            if setupCoordinator.migrationDecision == .recoveryFailed {
+                migrationRecoveryCard
+            } else if !setupCoordinator.sourceInstallCandidates.isEmpty {
                 sourceImportCard
             }
 
@@ -203,8 +205,40 @@ struct OnboardingView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(isWorking || setupCoordinator.migrationDecision == .pending)
+            .disabled(
+                isWorking
+                    || setupCoordinator.migrationDecision == .pending
+                    || setupCoordinator.migrationDecision == .recoveryFailed
+            )
         }
+    }
+
+    private var migrationRecoveryCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("需要恢复上次导入", systemImage: "arrow.counterclockwise.circle")
+                .font(.headline)
+            Text(setupCoordinator.currentError ?? "上次导入尚未恢复，保护保持关闭。")
+                .font(.callout)
+                .foregroundStyle(Color(nsColor: .systemRed))
+                .fixedSize(horizontal: false, vertical: true)
+            Button("重试恢复") {
+                actionState = .working("正在恢复上次未完成的数据导入…")
+                if setupCoordinator.retryMigrationRecovery() {
+                    actionState = .success("数据恢复完成，可以继续准备检查")
+                } else {
+                    actionState = .failure(
+                        setupCoordinator.currentError ?? "恢复未完成，请再次重试"
+                    )
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(isWorking)
+        }
+        .padding(16)
+        .background(
+            Color(nsColor: .systemRed).opacity(0.08),
+            in: RoundedRectangle(cornerRadius: 14)
+        )
     }
 
     private var sourceImportCard: some View {
