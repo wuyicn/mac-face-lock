@@ -19,14 +19,16 @@ from control_store import CONTROL_PATH, ControlState, read_control
 from evidence_store import capture_camera_evidence, capture_screen_evidence
 from face_verifier import VerifyResult, evidence_matches_owner, load_owner_encoding, verify_current_user
 from lock_controller import lock_screen
+from runtime_paths import RuntimePaths
 from state_store import now_iso, replace_state, write_state
 from event_notifier import notify_lock_event
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = PROJECT_DIR / "config" / "config.json"
-LOG_PATH = PROJECT_DIR / "logs" / "agent.log"
-PID_PATH = PROJECT_DIR / "logs" / "agent.pid"
+RUNTIME_PATHS = RuntimePaths.for_source(PROJECT_DIR)
+CONFIG_PATH = RUNTIME_PATHS.config_path
+LOG_PATH = RUNTIME_PATHS.logs_dir / "agent.log"
+PID_PATH = RUNTIME_PATHS.logs_dir / "agent.pid"
 
 
 def normalize_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -135,11 +137,16 @@ class FaceLockAgent:
         self,
         config: dict[str, Any],
         *,
-        control_path: Path = CONTROL_PATH,
-        activity_path: Path = ACTIVITY_PATH,
+        runtime_paths: RuntimePaths | None = None,
+        control_path: Path | None = None,
+        activity_path: Path | None = None,
         activity_writer: Any | None = None,
         activity_thread_factory: Callable[..., threading.Thread] = threading.Thread,
     ) -> None:
+        self.runtime_paths = runtime_paths or RUNTIME_PATHS
+        self.explicit_runtime_paths = runtime_paths is not None
+        control_path = control_path or self.runtime_paths.control_path
+        activity_path = activity_path or self.runtime_paths.activity_path
         self.config = normalize_runtime_config(config)
         self.mode = str(self.config.get("mode", "observe"))
         self.control_path = control_path
@@ -156,7 +163,10 @@ class FaceLockAgent:
             )
         )
         self.protection_enabled = read_control(control_path).protection_enabled
-        self.owner_encoding = load_owner_encoding()
+        if self.explicit_runtime_paths:
+            self.owner_encoding = load_owner_encoding(self.runtime_paths.owner_face_path)
+        else:
+            self.owner_encoding = load_owner_encoding()
         self.stop_event = threading.Event()
         self.verify_lock = threading.Lock()
         self.verify_workers_lock = threading.Lock()
@@ -172,6 +182,18 @@ class FaceLockAgent:
         self.keyboard_listener: Any | None = None
         self.system_idle_supported: bool | None = None
 
+    def persist_state(self, state: dict[str, Any]) -> None:
+        if self.explicit_runtime_paths:
+            write_state(state, path=self.runtime_paths.state_path)
+        else:
+            write_state(state)
+
+    def persist_replacement_state(self, state: dict[str, Any]) -> None:
+        if self.explicit_runtime_paths:
+            replace_state(state, path=self.runtime_paths.state_path)
+        else:
+            replace_state(state)
+
     def refresh_control_state(self) -> None:
         current = ControlState(self.protection_enabled, None)
         desired = read_control(self.control_path, current)
@@ -184,7 +206,7 @@ class FaceLockAgent:
             self.last_activity_at = time.monotonic()
             self.last_active_state_at = self.last_activity_at
             if self.protection_enabled:
-                write_state(
+                self.persist_state(
                     {
                         "status": "active",
                         "mode": self.mode,
@@ -200,7 +222,7 @@ class FaceLockAgent:
                     "info",
                 )
             else:
-                write_state(
+                self.persist_state(
                     {
                         "status": "paused",
                         "mode": self.mode,
@@ -221,7 +243,7 @@ class FaceLockAgent:
             generation = self.control_generation
             if not self.protection_enabled or generation != self.control_generation:
                 return False
-            write_state(state)
+            self.persist_state(state)
             return bool(self.protection_enabled) and generation == self.control_generation
 
     def run_active_action(self, action: Callable[[], Any]) -> tuple[bool, Any]:
@@ -419,7 +441,7 @@ class FaceLockAgent:
                     def allow_cooldown() -> None:
                         self.last_activity_at = now
                         self.armed = False
-                        write_state(
+                        self.persist_state(
                             {
                                 "status": "active",
                                 "mode": self.mode,
@@ -454,7 +476,7 @@ class FaceLockAgent:
 
                 def write_active_input() -> None:
                     self.last_active_state_at = now
-                    write_state(
+                    self.persist_state(
                         {
                             "status": "active",
                             "mode": self.mode,
@@ -520,7 +542,7 @@ class FaceLockAgent:
                 self.last_pass_at = time.monotonic()
                 self.last_activity_at = time.monotonic()
                 self.armed = False
-                write_state({**state, "armed": False, "action": "allow"})
+                self.persist_state({**state, "armed": False, "action": "allow"})
 
             active, _ = self.run_active_action(accept_owner)
             if not active:
@@ -574,7 +596,7 @@ class FaceLockAgent:
             self.last_camera_error_at = time.monotonic()
             self.last_activity_at = time.monotonic()
             self.armed = False
-            write_state(
+            self.persist_state(
                 {
                     "status": "camera_unavailable",
                     "mode": self.mode,
@@ -624,10 +646,7 @@ class FaceLockAgent:
         if bool(self.config.get("capture_camera_on_lock", True)):
             try:
                 active, evidence_path = self.run_active_action(
-                    lambda: capture_camera_evidence(
-                        reason,
-                        camera_index=int(self.config.get("camera_index", 0)),
-                    )
+                    lambda: self.capture_camera_evidence(reason)
                 )
                 if not active:
                     self.last_lock_at = previous_last_lock_at
@@ -656,7 +675,7 @@ class FaceLockAgent:
                     self.last_pass_at = time.monotonic()
                     self.last_activity_at = time.monotonic()
                     self.armed = False
-                    write_state(
+                    self.persist_state(
                         {
                             **lock_state,
                             "status": "verified",
@@ -688,7 +707,7 @@ class FaceLockAgent:
         if bool(self.config.get("capture_screen_on_lock", False)):
             try:
                 active, screen_evidence_path = self.run_active_action(
-                    lambda: capture_screen_evidence(reason)
+                    lambda: self.capture_screen_evidence(reason)
                 )
                 if not active:
                     self.last_lock_at = previous_last_lock_at
@@ -730,7 +749,7 @@ class FaceLockAgent:
                     and generation == self.control_generation
                 )
                 if active and self.mode != "observe":
-                    write_state({"lock_succeeded": True})
+                    self.persist_state({"lock_succeeded": True})
             if not active:
                 return "paused"
         except Exception as exc:
@@ -815,7 +834,7 @@ class FaceLockAgent:
             "mode": self.mode,
             "armed": self.armed,
             "started_at": now_iso(),
-            "owner_profile": str(PROJECT_DIR / "data" / "owner_face.npy"),
+            "owner_profile": str(self.runtime_paths.owner_face_path),
             "lock_on_camera_error": self.config["lock_on_camera_error"],
             "cooldown_seconds_after_lock": self.config[
                 "cooldown_seconds_after_lock"
@@ -832,7 +851,7 @@ class FaceLockAgent:
                     "heartbeat": "paused",
                 }
             )
-        replace_state(initial_state)
+        self.persist_replacement_state(initial_state)
         logging.info("mac-face-lock-agent started mode=%s", self.mode)
 
         self.mouse_listener = mouse.Listener(
@@ -853,7 +872,7 @@ class FaceLockAgent:
             self.mouse_listener.stop()
             self.keyboard_listener.stop()
             shutdown_complete = self.shutdown()
-            write_state({"status": "stopped", "stopped_at": now_iso()})
+            self.persist_state({"status": "stopped", "stopped_at": now_iso()})
             logging.info(
                 "mac-face-lock-agent stopped shutdown_complete=%s",
                 shutdown_complete,
@@ -865,7 +884,7 @@ class FaceLockAgent:
     def tick(self) -> None:
         if not self.input_listeners_alive():
             logging.error("input listener stopped unexpectedly; exiting for launchd restart")
-            write_state(
+            self.persist_state(
                 {
                     "status": "input_listener_error",
                     "mode": self.mode,
@@ -884,7 +903,7 @@ class FaceLockAgent:
             )
             if now - self.last_active_state_at >= update_interval:
                 self.last_active_state_at = now
-                write_state(
+                self.persist_state(
                     {
                         "status": "paused",
                         "mode": self.mode,
@@ -913,7 +932,7 @@ class FaceLockAgent:
             update_interval = float(self.config.get("active_state_update_interval_seconds", 10))
             if now - self.last_armed_state_at >= update_interval:
                 self.last_armed_state_at = now
-                write_state(
+                self.persist_state(
                     {
                         "status": "armed",
                         "mode": self.mode,
@@ -940,7 +959,7 @@ class FaceLockAgent:
             update_interval = float(self.config.get("active_state_update_interval_seconds", 10))
             if now - self.last_active_state_at >= update_interval:
                 self.last_active_state_at = now
-                write_state(
+                self.persist_state(
                     {
                         "status": "active",
                         "mode": self.mode,
@@ -954,7 +973,7 @@ class FaceLockAgent:
         self.armed = True
         self.last_armed_state_at = time.monotonic()
         logging.info("presence guard armed idle_seconds=%.1f", idle_elapsed)
-        write_state(
+        self.persist_state(
             {
                 "status": "armed",
                 "mode": self.mode,
@@ -1001,34 +1020,55 @@ class FaceLockAgent:
         trigger_seconds = float(self.config.get("system_idle_trigger_seconds", 2.0))
         return system_idle_seconds <= trigger_seconds
 
+    def capture_camera_evidence(self, reason: str) -> Path:
+        camera_index = int(self.config.get("camera_index", 0))
+        if self.explicit_runtime_paths:
+            return capture_camera_evidence(
+                reason,
+                camera_index=camera_index,
+                evidence_dir=self.runtime_paths.evidence_dir,
+            )
+        return capture_camera_evidence(reason, camera_index=camera_index)
+
+    def capture_screen_evidence(self, reason: str) -> Path:
+        if self.explicit_runtime_paths:
+            return capture_screen_evidence(
+                reason,
+                evidence_dir=self.runtime_paths.evidence_dir,
+            )
+        return capture_screen_evidence(reason)
+
 
 def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def configure_logging(config: dict[str, Any]) -> None:
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+def configure_logging(config: dict[str, Any], log_path: Path = LOG_PATH) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     level_name = str(config.get("log_level", "info")).upper()
     logging.basicConfig(
         level=getattr(logging, level_name, logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler()],
+        handlers=[logging.FileHandler(log_path), logging.StreamHandler()],
     )
 
 
-def main() -> int:
-    config = load_config()
-    configure_logging(config)
-    PID_PATH.write_text(str(__import__("os").getpid()), encoding="utf-8")
+def main(paths: RuntimePaths = RUNTIME_PATHS) -> int:
+    paths.ensure_writable_directories()
+    config = load_config(paths.config_path)
+    log_path = paths.logs_dir / "agent.log"
+    pid_path = paths.logs_dir / "agent.pid"
+    configure_logging(config, log_path)
+    pid_path.write_text(str(__import__("os").getpid()), encoding="utf-8")
 
-    agent = FaceLockAgent(config)
+    agent = FaceLockAgent(config, runtime_paths=paths)
     signal.signal(signal.SIGTERM, agent.stop)
     signal.signal(signal.SIGINT, agent.stop)
     try:
         agent.run()
     finally:
         try:
-            PID_PATH.unlink()
+            pid_path.unlink()
         except FileNotFoundError:
             pass
     return 0

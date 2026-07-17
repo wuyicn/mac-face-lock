@@ -15,9 +15,11 @@ from typing import Any
 
 import numpy as np
 
+from runtime_paths import RuntimePaths
+
 
 PROJECT_DIR = Path(__file__).resolve().parent
-OWNER_FACE_PATH = PROJECT_DIR / "data" / "owner_face.npy"
+OWNER_FACE_PATH = RuntimePaths.for_source(PROJECT_DIR).owner_face_path
 FACE_SIZE = (96, 96)
 
 
