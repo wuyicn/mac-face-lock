@@ -2269,8 +2269,18 @@ struct SetupCoordinatorTests {
             "{\"schema_version\":1,\"appearance\":\"dark\",\"accent\":\"amethyst\"}".utf8
         ).write(to: preferencesURL)
         try require(
-            coordinator.importSourceData(candidate),
-            "corrected migration did not succeed on retry"
+            !coordinator.importSourceData(candidate),
+            "changed payload bypassed candidate provenance on retry"
+        )
+        guard let refreshedCandidate =
+            coordinator.sourceInstallCandidates.first else {
+            throw TestFailure.assertion(
+                "changed payload did not refresh the safe candidate"
+            )
+        }
+        try require(
+            coordinator.importSourceData(refreshedCandidate),
+            "corrected migration did not succeed after safe rediscovery"
         )
         guard case .imported = coordinator.migrationDecision else {
             throw TestFailure.assertion("successful migration did not record the explicit choice")
@@ -2343,12 +2353,17 @@ struct SetupCoordinatorTests {
             sourceDataMigrator: migrator
         )
         try require(
-            coordinator.migrationDecision == .recoveryFailed
+            coordinator.migrationDecision.recoveryFailureMessage != nil
                 && coordinator.currentError?.contains("恢复") == true,
             "pending recovery failure was not visible at startup"
         )
         let prepared = await coordinator.prepareForSetup()
         try require(!prepared, "preparation bypassed failed migration recovery")
+        coordinator.skipSourceDataImport()
+        try require(
+            coordinator.migrationDecision.recoveryFailureMessage != nil,
+            "skip bypassed an unresolved migration recovery"
+        )
 
         try FileManager.default.removeItem(at: transaction)
         try require(

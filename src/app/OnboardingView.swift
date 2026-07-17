@@ -183,7 +183,7 @@ struct OnboardingView: View {
                 SetupRequirementRow(text: "应用支持目录可在本机安全写入")
             }
 
-            if setupCoordinator.migrationDecision == .recoveryFailed {
+            if setupCoordinator.migrationDecision.recoveryFailureMessage != nil {
                 migrationRecoveryCard
             } else if !setupCoordinator.sourceInstallCandidates.isEmpty {
                 sourceImportCard
@@ -208,7 +208,7 @@ struct OnboardingView: View {
             .disabled(
                 isWorking
                     || setupCoordinator.migrationDecision == .pending
-                    || setupCoordinator.migrationDecision == .recoveryFailed
+                    || setupCoordinator.migrationDecision.recoveryFailureMessage != nil
             )
         }
     }
@@ -232,6 +232,11 @@ struct OnboardingView: View {
                 }
             }
             .buttonStyle(.borderedProminent)
+            .disabled(isWorking)
+            Button("查看日志") {
+                setupCoordinator.openLogs()
+            }
+            .buttonStyle(.bordered)
             .disabled(isWorking)
         }
         .padding(16)

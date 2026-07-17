@@ -273,9 +273,13 @@ struct SourceDataMigratorTests {
         try testUntrustedSourceEntries(root: root)
         try testOverlapIsRejectedBeforeAnyDestinationWrite(root: root)
         try testCandidateIdentityAndHardLinksAreRejected(root: root)
+        try testPayloadProvenanceIsRevalidated(root: root)
         try testCrashRecoveryAtEveryDurabilityBoundary(root: root)
+        try testRollbackRecoveryAtEveryDurabilityBoundary(root: root)
         try testDestinationParentReplacementCannotEscape(root: root)
+        try testDestinationRootReplacementKeepsOneLock(root: root)
         try testCrossProcessImportLock(root: root)
+        try testUnknownTransactionsBlockRecovery(root: root)
         try testReorderedNumpyHeaderUsesSharedValidator(root: root)
         try testLaunchAgentProvenanceIsExactAndRevalidated(root: root)
 
@@ -349,18 +353,10 @@ struct SourceDataMigratorTests {
             "test FIFO could not be created"
         )
         let fifoMigrator = SourceDataMigrator(candidateRootURLs: [fifoSource])
-        let candidate = try requireCandidate(fifoMigrator)
-        let destination = root.appendingPathComponent("fifo-destination")
-        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
-        do {
-            _ = try fifoMigrator.import(candidate: candidate, destination: destination)
-            throw TestFailure.assertion("special source file was accepted")
-        } catch let error as SourceDataMigrationError {
-            try require(
-                error == .unsafeSourceEntry("data/ui-preferences.json"),
-                "special source file returned the wrong error"
-            )
-        }
+        try require(
+            fifoMigrator.discoverCandidates().isEmpty,
+            "candidate discovery accepted a special source file"
+        )
     }
 
     private static func testOverlapIsRejectedBeforeAnyDestinationWrite(
@@ -432,19 +428,10 @@ struct SourceDataMigratorTests {
         try fileManager.removeItem(at: preferences)
         try fileManager.linkItem(at: outside, to: preferences)
         let hardlinkMigrator = SourceDataMigrator(candidateRootURLs: [hardlinkSource])
-        let hardlinkCandidate = try requireCandidate(hardlinkMigrator)
-        do {
-            _ = try hardlinkMigrator.import(
-                candidate: hardlinkCandidate,
-                destination: destination
-            )
-            throw TestFailure.assertion("hard-linked source input was accepted")
-        } catch let error as SourceDataMigrationError {
-            try require(
-                error == .unsafeSourceEntry("data/ui-preferences.json"),
-                "wrong hard-link rejection error"
-            )
-        }
+        try require(
+            hardlinkMigrator.discoverCandidates().isEmpty,
+            "candidate discovery accepted a hard-linked source input"
+        )
     }
 
     private static func testCrashRecoveryAtEveryDurabilityBoundary(
@@ -563,7 +550,7 @@ struct SourceDataMigratorTests {
         let migrator = SourceDataMigrator(
             candidateRootURLs: [source],
             faultInjector: { point in
-                guard point == .afterJournalDirectoryFsync("intent", 0) else {
+                guard point == .afterTargetRename(0) else {
                     return
                 }
                 let config = destination.appendingPathComponent("config")
@@ -582,7 +569,7 @@ struct SourceDataMigratorTests {
             throw TestFailure.assertion("replaced destination parent was accepted")
         } catch let error as SourceDataMigrationError {
             try require(
-                error == .unsafeDestination("config"),
+                error == .rollbackFailed,
                 "wrong destination replacement error"
             )
         }
@@ -593,12 +580,102 @@ struct SourceDataMigratorTests {
         )
     }
 
+    private static func testRollbackRecoveryAtEveryDurabilityBoundary(
+        root: URL
+    ) throws {
+        let points: [MigrationFaultPoint] = [
+            .afterRollbackTemporaryFsync(0),
+            .afterRollbackRename(0),
+            .afterRollbackDirectoryFsync(0),
+        ]
+        for (index, rollbackPoint) in points.enumerated() {
+            let source = root.appendingPathComponent(
+                "rollback-crash-source-\(index)"
+            )
+            let destination = root.appendingPathComponent(
+                "rollback-crash-destination-\(index)"
+            )
+            try createSource(at: source)
+            try FileManager.default.createDirectory(
+                at: destination.appendingPathComponent("config"),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.createDirectory(
+                at: destination.appendingPathComponent("data"),
+                withIntermediateDirectories: true
+            )
+            try Data("old-config".utf8).write(
+                to: destination.appendingPathComponent("config/config.json")
+            )
+            let baseline = try byteSnapshot(of: destination)
+            let crashingImport = SourceDataMigrator(
+                candidateRootURLs: [source],
+                faultInjector: { point in
+                    if point == .afterTargetRename(0) {
+                        throw SimulatedMigrationCrash()
+                    }
+                }
+            )
+            do {
+                _ = try crashingImport.import(
+                    candidate: try requireCandidate(crashingImport),
+                    destination: destination
+                )
+                throw TestFailure.assertion(
+                    "rollback fixture import did not crash"
+                )
+            } catch is SimulatedMigrationCrash {
+                // Expected.
+            }
+            let crashingRecovery = SourceDataMigrator(
+                candidateRootURLs: [],
+                faultInjector: { point in
+                    if point == rollbackPoint {
+                        throw SimulatedMigrationCrash()
+                    }
+                }
+            )
+            do {
+                try crashingRecovery.recoverPendingImports(
+                    destination: destination
+                )
+                throw TestFailure.assertion(
+                    "rollback fault \(rollbackPoint) did not crash"
+                )
+            } catch is SimulatedMigrationCrash {
+                // Expected.
+            }
+            try SourceDataMigrator(candidateRootURLs: [])
+                .recoverPendingImports(destination: destination)
+            let recovered = try byteSnapshot(of: destination)
+                .filter { !$0.key.hasPrefix("backups") }
+            let expected = baseline.filter { !$0.key.hasPrefix("backups") }
+            try require(
+                recovered == expected,
+                "rollback crash did not recover to all-old"
+            )
+            try require(
+                !recovered.keys.contains {
+                    $0.contains(".migration-rollback-")
+                },
+                "rollback left a sensitive temporary file"
+            )
+        }
+    }
+
     private static func testCrossProcessImportLock(root: URL) throws {
         let source = root.appendingPathComponent("lock-source")
         let destination = root.appendingPathComponent("lock-destination")
         try createSource(at: source)
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-        let lockURL = destination.appendingPathComponent(".migration.lock")
+        let digest = SHA256.hash(data: Data(destination.path.utf8))
+            .prefix(12)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let lockURL = destination.deletingLastPathComponent()
+            .appendingPathComponent(
+                ".mac-face-lock-migration-\(digest).lock"
+            )
         let fd = open(lockURL.path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o600)
         try require(fd >= 0, "could not create test migration lock")
         defer {
@@ -616,6 +693,208 @@ struct SourceDataMigratorTests {
         } catch let error as SourceDataMigrationError {
             try require(error == .migrationInProgress, "wrong lock contention error")
         }
+    }
+
+    private static func testPayloadProvenanceIsRevalidated(root: URL) throws {
+        let fileManager = FileManager.default
+        let source = root.appendingPathComponent("payload-provenance-source")
+        let destination = root.appendingPathComponent(
+            "payload-provenance-destination"
+        )
+        try createSource(at: source)
+        try fileManager.createDirectory(
+            at: destination.appendingPathComponent("config"),
+            withIntermediateDirectories: true
+        )
+        try fileManager.createDirectory(
+            at: destination.appendingPathComponent("data"),
+            withIntermediateDirectories: true
+        )
+        let migrator = SourceDataMigrator(candidateRootURLs: [source])
+        let candidate = try requireCandidate(migrator)
+        let config = source.appendingPathComponent("config/config.json")
+        try fileManager.removeItem(at: config)
+        try Data(
+            "{\"mode\":\"presence_guard\",\"camera_index\":1}".utf8
+        ).write(to: config)
+        do {
+            _ = try migrator.import(
+                candidate: candidate,
+                destination: destination
+            )
+            throw TestFailure.assertion(
+                "valid replacement payload bypassed discovery binding"
+            )
+        } catch let error as SourceDataMigrationError {
+            try require(
+                error == .sourceChanged("config/config.json"),
+                "replacement payload returned the wrong error"
+            )
+        }
+    }
+
+    private static func testDestinationRootReplacementKeepsOneLock(
+        root: URL
+    ) throws {
+        let fileManager = FileManager.default
+        let source = root.appendingPathComponent("root-race-source")
+        let destination = root.appendingPathComponent("root-race-destination")
+        let detached = root.appendingPathComponent("root-race-detached")
+        try createSource(at: source)
+        try fileManager.createDirectory(
+            at: destination.appendingPathComponent("config"),
+            withIntermediateDirectories: true
+        )
+        try fileManager.createDirectory(
+            at: destination.appendingPathComponent("data"),
+            withIntermediateDirectories: true
+        )
+        let baseline = try byteSnapshot(of: destination)
+        var concurrentError: SourceDataMigrationError?
+        let migrator = SourceDataMigrator(
+            candidateRootURLs: [source],
+            faultInjector: { point in
+                guard point == .afterJournalDirectoryFsync("initial", -1)
+                else {
+                    return
+                }
+                try fileManager.moveItem(at: destination, to: detached)
+                try fileManager.createDirectory(
+                    at: destination.appendingPathComponent("config"),
+                    withIntermediateDirectories: true
+                )
+                try fileManager.createDirectory(
+                    at: destination.appendingPathComponent("data"),
+                    withIntermediateDirectories: true
+                )
+                do {
+                    let second = SourceDataMigrator(
+                        candidateRootURLs: [source]
+                    )
+                    _ = try second.import(
+                        candidate: try requireCandidate(second),
+                        destination: destination
+                    )
+                } catch let error as SourceDataMigrationError {
+                    concurrentError = error
+                }
+            }
+        )
+        do {
+            _ = try migrator.import(
+                candidate: try requireCandidate(migrator),
+                destination: destination
+            )
+            throw TestFailure.assertion("replaced destination root was accepted")
+        } catch let error as SourceDataMigrationError {
+            try require(
+                error == .rollbackFailed || error == .unsafeDestination("."),
+                "wrong replaced-root error"
+            )
+        }
+        try require(
+            concurrentError == .migrationInProgress,
+            "root replacement created an independent migration lock"
+        )
+        let replacementSnapshot = try byteSnapshot(of: destination)
+        try require(
+            replacementSnapshot == baseline,
+            "replacement root was modified by an in-flight migration"
+        )
+    }
+
+    private static func testUnknownTransactionsBlockRecovery(
+        root: URL
+    ) throws {
+        let fileManager = FileManager.default
+        for suffix in ["missing", "corrupt", "unknown-name"] {
+            let destination = root.appendingPathComponent(
+                "strict-journal-\(suffix)"
+            )
+            try fileManager.createDirectory(
+                at: destination.appendingPathComponent("config"),
+                withIntermediateDirectories: true
+            )
+            try fileManager.createDirectory(
+                at: destination.appendingPathComponent("data"),
+                withIntermediateDirectories: true
+            )
+            let transactionName = suffix == "unknown-name"
+                ? "import-not-a-uuid"
+                : "import-\(UUID().uuidString.lowercased())"
+            let transaction = destination
+                .appendingPathComponent("backups")
+                .appendingPathComponent(transactionName)
+            try fileManager.createDirectory(
+                at: transaction,
+                withIntermediateDirectories: true
+            )
+            if suffix == "corrupt" {
+                try Data("{}".utf8).write(
+                    to: transaction.appendingPathComponent("journal.json")
+                )
+            }
+            do {
+                try SourceDataMigrator(candidateRootURLs: [])
+                    .recoverPendingImports(destination: destination)
+                throw TestFailure.assertion(
+                    "unknown transaction \(suffix) was silently removed"
+                )
+            } catch let error as SourceDataMigrationError {
+                try require(
+                    error == .recoveryFailed,
+                    "unknown transaction returned the wrong error"
+                )
+            }
+            try require(
+                fileManager.fileExists(atPath: transaction.path),
+                "unknown transaction was deleted during failed recovery"
+            )
+        }
+
+        let source = root.appendingPathComponent("strict-journal-source")
+        let destination = root.appendingPathComponent(
+            "strict-journal-inconsistent-complete"
+        )
+        try createSource(at: source)
+        try fileManager.createDirectory(
+            at: destination.appendingPathComponent("config"),
+            withIntermediateDirectories: true
+        )
+        try fileManager.createDirectory(
+            at: destination.appendingPathComponent("data"),
+            withIntermediateDirectories: true
+        )
+        let migrator = SourceDataMigrator(candidateRootURLs: [source])
+        let result = try migrator.import(
+            candidate: try requireCandidate(migrator),
+            destination: destination
+        )
+        let journalURL = result.backupURL.appendingPathComponent("journal.json")
+        var journal = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: journalURL)
+        ) as! [String: Any]
+        journal["committed_count"] = 0
+        try JSONSerialization.data(
+            withJSONObject: journal,
+            options: [.sortedKeys]
+        ).write(to: journalURL)
+        do {
+            try SourceDataMigrator(candidateRootURLs: [])
+                .recoverPendingImports(destination: destination)
+            throw TestFailure.assertion(
+                "inconsistent complete transaction suppressed recovery"
+            )
+        } catch let error as SourceDataMigrationError {
+            try require(
+                error == .recoveryFailed,
+                "inconsistent complete transaction returned the wrong error"
+            )
+        }
+        try require(
+            fileManager.fileExists(atPath: result.backupURL.path),
+            "inconsistent complete transaction was deleted"
+        )
     }
 
     private static func testReorderedNumpyHeaderUsesSharedValidator(

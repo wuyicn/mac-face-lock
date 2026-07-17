@@ -577,7 +577,10 @@ final class SetupCoordinator: ObservableObject {
             : nil
         self.sourceInstallCandidates = discoveredCandidates
         self.migrationDecision = initialMigrationError != nil
-            ? .recoveryFailed
+            ? .recoveryFailed(
+                initialMigrationError
+                    ?? "上次数据导入尚未安全恢复，请重试恢复后再继续。"
+            )
             : (discoveredCandidates.isEmpty ? .notRequired : .pending)
         self.ownerProfileValid = initialInspection.isValid
         self.diagnosisPassed = durableOwnerEvidence
@@ -655,8 +658,9 @@ final class SetupCoordinator: ObservableObject {
 
     @discardableResult
     func prepareForSetup() async -> Bool {
-        guard migrationDecision != .recoveryFailed else {
-            currentError = "请先恢复上次未完成的数据导入；保护保持关闭。"
+        guard migrationDecision.recoveryFailureMessage == nil else {
+            currentError = migrationDecision.recoveryFailureMessage
+                ?? "请先恢复上次未完成的数据导入；保护保持关闭。"
             return false
         }
         currentError = nil
@@ -726,9 +730,18 @@ final class SetupCoordinator: ObservableObject {
             updateReadiness()
             return true
         } catch {
-            migrationDecision = .pending
-            currentError = (error as? LocalizedError)?.errorDescription
+            let message = (error as? LocalizedError)?.errorDescription
                 ?? "旧版数据导入失败，未更改当前数据；请修复后重试或选择跳过。"
+            if let migrationError = error as? SourceDataMigrationError,
+               migrationError == .recoveryFailed
+                || migrationError == .rollbackFailed {
+                migrationDecision = .recoveryFailed(message)
+            } else {
+                sourceInstallCandidates =
+                    sourceDataMigrator.discoverCandidates()
+                migrationDecision = .pending
+            }
+            currentError = message
             return false
         }
     }
@@ -743,7 +756,7 @@ final class SetupCoordinator: ObservableObject {
 
     @discardableResult
     func retryMigrationRecovery() -> Bool {
-        guard migrationDecision == .recoveryFailed,
+        guard migrationDecision.recoveryFailureMessage != nil,
               let sourceDataMigrator else {
             return false
         }
@@ -758,8 +771,10 @@ final class SetupCoordinator: ObservableObject {
             currentError = nil
             return true
         } catch {
-            currentError =
-                "上次数据导入仍未恢复，请保留本地数据并再次重试；保护保持关闭。"
+            let message = (error as? LocalizedError)?.errorDescription
+                ?? "上次数据导入仍未恢复，请保留本地数据并再次重试；保护保持关闭。"
+            migrationDecision = .recoveryFailed(message)
+            currentError = message
             return false
         }
     }
