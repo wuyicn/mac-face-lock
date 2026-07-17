@@ -646,6 +646,7 @@ struct SetupCoordinatorTests {
         try await testParentCancellationPropagatesToEnrollmentChildAtStart()
         try await testCameraOnlyDiagnosisKeepsValidOwnerProfile()
         try await testCompletedCameraRevocationRecoveryPreservesHistoryAndSkipsEnrollment()
+        try await testMigrationRequiresExplicitChoiceAndCanRetryVisibleFailure()
         print("Setup coordinator tests passed")
     }
 
@@ -2192,5 +2193,116 @@ struct SetupCoordinatorTests {
 
         runner.deliverEOF()
         await enrollment.value
+    }
+
+    private static func testMigrationRequiresExplicitChoiceAndCanRetryVisibleFailure() async throws {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let source = fixture.root.appendingPathComponent("legacy-source")
+        try FileManager.default.createDirectory(
+            at: source.appendingPathComponent("config"),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: source.appendingPathComponent("data"),
+            withIntermediateDirectories: true
+        )
+        try Data("agent\n".utf8).write(
+            to: source.appendingPathComponent("agent.py")
+        )
+        let sourceConfig = Data("{\"mode\":\"presence_guard\"}".utf8)
+        try sourceConfig.write(
+            to: source.appendingPathComponent("config/config.json")
+        )
+        let preferencesURL = source.appendingPathComponent(
+            "data/ui-preferences.json"
+        )
+        try Data("{\"schema_version\":2}".utf8).write(to: preferencesURL)
+
+        let migrator = SourceDataMigrator(candidateRootURLs: [source])
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector(valid: false),
+            sourceDataMigrator: migrator
+        )
+
+        try require(
+            coordinator.sourceInstallCandidates.count == 1
+                && coordinator.migrationDecision == .pending,
+            "discovered source data did not require an explicit import decision"
+        )
+        let preparedBeforeDecision = await coordinator.prepareForSetup()
+        try require(
+            !preparedBeforeDecision,
+            "preparation advanced before import or skip was chosen"
+        )
+        try require(
+            coordinator.currentStep == .preparation,
+            "migration choice gate changed the onboarding step"
+        )
+
+        let candidate = coordinator.sourceInstallCandidates[0]
+        try require(
+            !coordinator.importSourceData(candidate),
+            "malformed migration unexpectedly succeeded"
+        )
+        try require(
+            coordinator.currentError?.contains("界面偏好") == true
+                && coordinator.migrationDecision == .pending,
+            "migration failure was not visible and retryable"
+        )
+
+        try Data(
+            "{\"schema_version\":1,\"appearance\":\"dark\",\"accent\":\"amethyst\"}".utf8
+        ).write(to: preferencesURL)
+        try require(
+            coordinator.importSourceData(candidate),
+            "corrected migration did not succeed on retry"
+        )
+        guard case .imported = coordinator.migrationDecision else {
+            throw TestFailure.assertion("successful migration did not record the explicit choice")
+        }
+        let importedConfig = try Data(contentsOf: fixture.environment.configURL)
+        try require(
+            importedConfig == sourceConfig,
+            "coordinator imported source data into the wrong destination"
+        )
+        let sourceConfigAfterImport = try Data(
+            contentsOf: source.appendingPathComponent("config/config.json")
+        )
+        try require(
+            sourceConfigAfterImport == sourceConfig,
+            "coordinator import modified the source config"
+        )
+
+        let skipFixture = try CoordinatorFixture(mode: .source)
+        defer { skipFixture.remove() }
+        let skipCoordinator = SetupCoordinator(
+            environment: skipFixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: skipFixture.setupStore,
+            localStore: skipFixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector(valid: false),
+            sourceDataMigrator: SourceDataMigrator(candidateRootURLs: [source])
+        )
+        skipCoordinator.skipSourceDataImport()
+        try require(
+            skipCoordinator.migrationDecision == .skipped,
+            "skip was not recorded as an explicit customer choice"
+        )
+        let sourceConfigAfterSkip = try Data(
+            contentsOf: source.appendingPathComponent("config/config.json")
+        )
+        try require(
+            sourceConfigAfterSkip == sourceConfig,
+            "skip modified or marked the source installation"
+        )
     }
 }

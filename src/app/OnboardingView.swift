@@ -183,6 +183,10 @@ struct OnboardingView: View {
                 SetupRequirementRow(text: "应用支持目录可在本机安全写入")
             }
 
+            if !setupCoordinator.sourceInstallCandidates.isEmpty {
+                sourceImportCard
+            }
+
             CustomerActionStatusView(state: actionState)
 
             Button("开始检查") {
@@ -199,8 +203,87 @@ struct OnboardingView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(isWorking)
+            .disabled(isWorking || setupCoordinator.migrationDecision == .pending)
         }
+    }
+
+    private var sourceImportCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("发现旧版源码数据", systemImage: "externaldrive.badge.plus")
+                .font(.headline)
+            Text("可以复制旧版配置、本人资料、界面偏好和最近的活动记录。旧目录不会被删除、修改或标记。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            ForEach(setupCoordinator.sourceInstallCandidates) { candidate in
+                VStack(alignment: .leading, spacing: 9) {
+                    Text(candidate.displayName)
+                        .font(.headline)
+                    Text(candidate.rootURL.path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                    Text(migrationItemsDescription(candidate.availableItems))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Button("导入旧版数据") {
+                            actionState = .working("正在复制并验证旧版本地数据…")
+                            if setupCoordinator.importSourceData(candidate) {
+                                themeStore.reload()
+                                actionState = .success("旧版数据已安全导入；旧目录保持不变")
+                            } else {
+                                actionState = .failure(
+                                    setupCoordinator.currentError
+                                        ?? "导入失败，当前数据未改变，可以修复后重试"
+                                )
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+
+                        Button("跳过导入") {
+                            setupCoordinator.skipSourceDataImport()
+                            actionState = .success("已跳过导入；旧目录保持不变")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    .disabled(
+                        isWorking || setupCoordinator.migrationDecision != .pending
+                    )
+                }
+                .padding(14)
+                .background(
+                    Color.primary.opacity(0.05),
+                    in: RoundedRectangle(cornerRadius: 12)
+                )
+            }
+        }
+        .padding(16)
+        .background(
+            themeStore.accentColor.opacity(0.08),
+            in: RoundedRectangle(cornerRadius: 14)
+        )
+    }
+
+    private func migrationItemsDescription(_ items: Set<MigrationItem>) -> String {
+        let labels = MigrationItem.allCases.compactMap { item -> String? in
+            guard items.contains(item) else {
+                return nil
+            }
+            switch item {
+            case .configuration:
+                return "配置"
+            case .ownerTemplate:
+                return "本人资料"
+            case .uiPreferences:
+                return "界面偏好"
+            case .activityHistory:
+                return "活动记录"
+            }
+        }
+        return "可导入：" + labels.joined(separator: "、")
     }
 
     private var permissionsStep: some View {

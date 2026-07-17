@@ -457,6 +457,8 @@ final class SetupCoordinator: ObservableObject {
     @Published private(set) var serviceStatus: ServiceStatus?
     @Published private(set) var enrollmentLifecycle: EnrollmentLifecycle
     @Published private(set) var recoveryStep: SetupStep?
+    @Published private(set) var sourceInstallCandidates: [SourceInstallCandidate]
+    @Published private(set) var migrationDecision: MigrationDecision
 
     private let environment: AppEnvironment
     private let permissionCenter: PermissionCenter
@@ -469,6 +471,7 @@ final class SetupCoordinator: ObservableObject {
     private let fileManager: FileManager
     private let logOpener: (URL) -> Bool
     private let ownerProfileInspector: OwnerProfileInspecting
+    private let sourceDataMigrator: SourceDataMigrator?
 
     private var ownerProfileValid: Bool
     private var diagnosisPassed: Bool
@@ -496,7 +499,8 @@ final class SetupCoordinator: ObservableObject {
         applicationURL: URL? = nil,
         fileManager: FileManager = .default,
         logOpener: ((URL) -> Bool)? = nil,
-        ownerProfileInspector: OwnerProfileInspecting? = nil
+        ownerProfileInspector: OwnerProfileInspecting? = nil,
+        sourceDataMigrator: SourceDataMigrator? = nil
     ) {
         let storedRecord = setupStore.record
         let resolvedOwnerProfileInspector =
@@ -513,6 +517,11 @@ final class SetupCoordinator: ObservableObject {
             && initialInspection.isValid
             && storedRecord.ownerProfileFingerprint != nil
             && storedRecord.ownerProfileFingerprint == initialInspection.fingerprint
+        let resolvedMigrator = sourceDataMigrator
+            ?? (environment.mode == .release ? SourceDataMigrator() : nil)
+        let discoveredCandidates = storedRecord.currentStep == .preparation
+            ? (resolvedMigrator?.discoverCandidates() ?? [])
+            : []
         self.environment = environment
         self.permissionCenter = permissionCenter
         self.setupStore = setupStore
@@ -535,6 +544,7 @@ final class SetupCoordinator: ObservableObject {
         self.fileManager = fileManager
         self.logOpener = logOpener ?? { NSWorkspace.shared.open($0) }
         self.ownerProfileInspector = resolvedOwnerProfileInspector
+        self.sourceDataMigrator = resolvedMigrator
         self.progress = nil
         self.currentError = nil
         self.permissionStates = [:]
@@ -545,6 +555,10 @@ final class SetupCoordinator: ObservableObject {
         self.recoveryStep = storedRecord.isComplete && !durableOwnerEvidence
             ? (initialInspection.isValid ? .safetyTest : .enrollment)
             : nil
+        self.sourceInstallCandidates = discoveredCandidates
+        self.migrationDecision = discoveredCandidates.isEmpty
+            ? .notRequired
+            : .pending
         self.ownerProfileValid = initialInspection.isValid
         self.diagnosisPassed = durableOwnerEvidence
         self.ownerTestPassed = durableOwnerEvidence
@@ -622,13 +636,17 @@ final class SetupCoordinator: ObservableObject {
     @discardableResult
     func prepareForSetup() async -> Bool {
         currentError = nil
+        guard migrationDecision != .pending else {
+            currentError = "发现旧版源码数据，请先明确选择“导入”或“跳过”。"
+            return false
+        }
         let issues = preparationIssues()
         guard issues.isEmpty else {
             currentError = issues.joined(separator: " ")
             return false
         }
         do {
-            try persistStep(.permissions, completing: .preparation)
+            try persistStep(.permissions, completing: [.preparation])
             await refreshPermissions()
             return true
         } catch {
@@ -648,13 +666,55 @@ final class SetupCoordinator: ObservableObject {
             return false
         }
         do {
-            try persistStep(.enrollment, completing: .permissions)
+            refreshStaticOwnerProfileEvidence()
+            if ownerProfileValid {
+                try persistStep(
+                    .safetyTest,
+                    completing: [.permissions, .enrollment]
+                )
+            } else {
+                try persistStep(.enrollment, completing: [.permissions])
+            }
             currentError = nil
             return true
         } catch {
             currentError = "无法保存权限检查结果，请检查应用支持目录权限后重试。"
             return false
         }
+    }
+
+    @discardableResult
+    func importSourceData(_ candidate: SourceInstallCandidate) -> Bool {
+        guard migrationDecision == .pending,
+              sourceInstallCandidates.contains(candidate),
+              let sourceDataMigrator else {
+            currentError = "当前没有可导入的旧版源码数据。"
+            return false
+        }
+        do {
+            let result = try sourceDataMigrator.import(
+                candidate: candidate,
+                destination: environment.supportURL
+            )
+            migrationDecision = .imported(result)
+            currentError = nil
+            refreshStaticOwnerProfileEvidence()
+            updateReadiness()
+            return true
+        } catch {
+            migrationDecision = .pending
+            currentError = (error as? LocalizedError)?.errorDescription
+                ?? "旧版数据导入失败，未更改当前数据；请修复后重试或选择跳过。"
+            return false
+        }
+    }
+
+    func skipSourceDataImport() {
+        guard migrationDecision == .pending else {
+            return
+        }
+        migrationDecision = .skipped
+        currentError = nil
     }
 
     func goBack() {
@@ -930,7 +990,7 @@ final class SetupCoordinator: ObservableObject {
             if hasCompletedOnboarding {
                 try persistCompletedEvidencePreservingHistory()
             } else {
-                try persistStep(.completion, completing: .safetyTest)
+                try persistStep(.completion, completing: [.safetyTest])
             }
             currentError = nil
             return true
@@ -1147,10 +1207,11 @@ final class SetupCoordinator: ObservableObject {
 
     private func persistStep(
         _ step: SetupStep,
-        completing completedStep: SetupStep? = nil
+        completing completedStepsToAdd: [SetupStep] = []
     ) throws {
         var completedSteps = setupStore.record.completedSteps
-        if let completedStep, !completedSteps.contains(completedStep) {
+        for completedStep in completedStepsToAdd
+            where !completedSteps.contains(completedStep) {
             completedSteps.append(completedStep)
         }
         let record = OnboardingRecord(

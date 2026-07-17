@@ -293,6 +293,12 @@ class UnifiedPackagingTests(unittest.TestCase):
         self.assertIn("Mac Face Lock 控制中心权限", settings)
         self.assertIn("Mac Face Lock Agent 权限", settings)
         self.assertIn("enrollmentLifecycle", onboarding)
+        self.assertIn("发现旧版源码数据", onboarding)
+        self.assertIn("导入旧版数据", onboarding)
+        self.assertIn("跳过导入", onboarding)
+        self.assertIn("importSourceData", onboarding)
+        self.assertIn("skipSourceDataImport", onboarding)
+        self.assertIn("themeStore.reload()", onboarding)
 
         user_facing_sources = onboarding + settings
         for shell_copy in (
