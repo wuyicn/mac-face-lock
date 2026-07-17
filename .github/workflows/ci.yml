@@ -58,6 +58,13 @@ jobs:
             src/app/ProjectLocator.swift tests/swift/ProjectLocatorTests.swift \
             -o "$RUNNER_TEMP/mac-face-lock-project-locator-tests"
           "$RUNNER_TEMP/mac-face-lock-project-locator-tests"
+      - name: Run Swift app-environment tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ProjectLocator.swift src/app/AppEnvironment.swift \
+            tests/swift/AppEnvironmentTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-environment-tests"
+          "$RUNNER_TEMP/mac-face-lock-environment-tests"
       - name: Run Swift agent-launcher tests
         run: |
           xcrun swiftc -parse-as-library -DTESTING \
@@ -67,7 +74,7 @@ jobs:
       - name: Typecheck the unified Swift application
         run: |
           xcrun swiftc -parse-as-library -typecheck \
-            src/app/*.swift -framework AppKit -framework SwiftUI
+            src/app/*.swift -framework AppKit -framework SwiftUI -framework AVFoundation
       - name: Build both ad-hoc signed applications
         run: |
           scripts/build-app.sh

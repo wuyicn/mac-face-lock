@@ -3,7 +3,7 @@ import Foundation
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let projectLocation: Result<ProjectLocation, ProjectLocatorError>
+    private let environment: Result<AppEnvironment, Error>
     private var localStore: LocalJSONStore?
     private var faceLockStore: FaceLockStore?
     private var themeStore: ThemeStore?
@@ -12,13 +12,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     override init() {
         do {
-            self.projectLocation = .success(
-                try ProjectLocator.locate(arguments: CommandLine.arguments)
+            let fileManager = FileManager.default
+            guard let applicationSupportURL = fileManager.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            ).first else {
+                throw AppEnvironmentError.supportDirectoryUnavailable(
+                    "Library/Application Support"
+                )
+            }
+            self.environment = .success(
+                try AppEnvironment.resolve(
+                    arguments: CommandLine.arguments,
+                    bundleURL: Bundle.main.bundleURL,
+                    applicationSupportURL: applicationSupportURL,
+                    fileManager: fileManager
+                )
             )
-        } catch let error as ProjectLocatorError {
-            self.projectLocation = .failure(error)
         } catch {
-            preconditionFailure("ProjectLocator threw an unexpected error: \(error)")
+            self.environment = .failure(error)
         }
         super.init()
     }
@@ -26,8 +38,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        guard case .success(let location) = projectLocation else {
-            guard case .failure(let error) = projectLocation else {
+        guard case .success(let environment) = environment else {
+            guard case .failure(let error) = environment else {
                 return
             }
             NSLog("Mac Face Lock 无法启动：%@", error.localizedDescription)
@@ -43,21 +55,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let localStore = LocalJSONStore(
-            projectURL: location.projectURL,
-            dataURL: location.dataURL
+            resourcesURL: environment.resourcesURL,
+            dataURL: environment.dataURL
         )
         let faceLockStore = FaceLockStore(localStore: localStore)
         let themeStore = ThemeStore(localStore: localStore)
         let desktopWindowController = DesktopWindowController(
             faceLockStore: faceLockStore,
             themeStore: themeStore,
-            projectURL: location.projectURL,
-            dataURL: location.dataURL
+            projectURL: environment.supportURL,
+            dataURL: environment.dataURL
         )
         let statusMenuController = StatusMenuController(
             faceLockStore: faceLockStore,
-            projectURL: location.projectURL,
-            dataURL: location.dataURL,
+            projectURL: environment.supportURL,
+            dataURL: environment.dataURL,
             showDesktopWindow: { [weak desktopWindowController] in
                 desktopWindowController?.show()
             }

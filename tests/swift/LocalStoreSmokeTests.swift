@@ -80,7 +80,7 @@ struct LocalStoreSmokeTests {
         }
         try activityData.write(to: activityURL)
 
-        let store = LocalJSONStore(projectURL: projectURL, dataURL: dataURL)
+        let store = LocalJSONStore(resourcesURL: projectURL, dataURL: dataURL)
         let state = store.readState()
         try require(state.status == "armed", "valid state status was not decoded")
         try require(state.armed, "valid state armed flag was not decoded")
@@ -232,7 +232,7 @@ struct LocalStoreSmokeTests {
 
         let blockedFaceStore = FaceLockStore(
             localStore: LocalJSONStore(
-                projectURL: blockedProjectURL,
+                resourcesURL: blockedProjectURL,
                 dataURL: blockedProjectURL.appendingPathComponent("data", isDirectory: true)
             )
         )

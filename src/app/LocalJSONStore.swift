@@ -10,14 +10,14 @@ final class LocalJSONStore {
     private static let activityRecordByteLimit = 256 * 1_024
     private static let activityLineLimit = 10_000
 
-    let projectURL: URL
+    let resourcesURL: URL
     let dataURL: URL
 
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
 
-    init(projectURL: URL, dataURL: URL) {
-        self.projectURL = projectURL
+    init(resourcesURL: URL, dataURL: URL) {
+        self.resourcesURL = resourcesURL
         self.dataURL = dataURL
 
         let decoder = JSONDecoder()

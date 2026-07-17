@@ -235,7 +235,7 @@ class UnifiedPackagingTests(unittest.TestCase):
                 )
 
         local_store_source = (PROJECT_DIR / "src/app/LocalJSONStore.swift").read_text()
-        self.assertIn("init(projectURL: URL, dataURL: URL)", local_store_source)
+        self.assertIn("init(resourcesURL: URL, dataURL: URL)", local_store_source)
 
     def test_status_names_the_combined_ui(self) -> None:
         status_script = (PROJECT_DIR / "scripts" / "status.sh").read_text()
