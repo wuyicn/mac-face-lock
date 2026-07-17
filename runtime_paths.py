@@ -11,15 +11,18 @@ class RuntimePaths:
     config_path: Path
     data_dir: Path
     logs_dir: Path
+    control_fallback_enabled: bool
 
     @classmethod
     def for_source(cls, root: Path) -> "RuntimePaths":
+        resolved_root = root.resolve()
         return cls(
-            resources_dir=root.resolve(),
-            support_dir=root.resolve(),
-            config_path=root / "config" / "config.json",
-            data_dir=root / "data",
-            logs_dir=root / "logs",
+            resources_dir=resolved_root,
+            support_dir=resolved_root,
+            config_path=resolved_root / "config" / "config.json",
+            data_dir=resolved_root / "data",
+            logs_dir=resolved_root / "logs",
+            control_fallback_enabled=True,
         )
 
     @classmethod
@@ -28,12 +31,15 @@ class RuntimePaths:
         resources_dir: Path,
         support_dir: Path,
     ) -> "RuntimePaths":
+        resolved_resources_dir = resources_dir.resolve()
+        resolved_support_dir = support_dir.resolve()
         return cls(
-            resources_dir=resources_dir.resolve(),
-            support_dir=support_dir.resolve(),
-            config_path=support_dir / "config" / "config.json",
-            data_dir=support_dir / "data",
-            logs_dir=support_dir / "logs",
+            resources_dir=resolved_resources_dir,
+            support_dir=resolved_support_dir,
+            config_path=resolved_support_dir / "config" / "config.json",
+            data_dir=resolved_support_dir / "data",
+            logs_dir=resolved_support_dir / "logs",
+            control_fallback_enabled=False,
         )
 
     @property

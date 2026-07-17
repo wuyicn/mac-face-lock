@@ -162,7 +162,14 @@ class FaceLockAgent:
                 thread_factory=activity_thread_factory,
             )
         )
-        self.protection_enabled = read_control(control_path).protection_enabled
+        control_fallback = ControlState(
+            self.runtime_paths.control_fallback_enabled,
+            None,
+        )
+        self.protection_enabled = read_control(
+            control_path,
+            control_fallback,
+        ).protection_enabled
         if self.explicit_runtime_paths:
             self.owner_encoding = load_owner_encoding(self.runtime_paths.owner_face_path)
         else:

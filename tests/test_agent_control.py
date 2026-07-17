@@ -9,6 +9,7 @@ from unittest.mock import patch
 from agent import FaceLockAgent
 from control_store import read_control, write_control
 from face_verifier import VerifyResult
+from runtime_paths import RuntimePaths
 
 
 def wait_until(predicate, timeout=1.0):
@@ -110,6 +111,39 @@ class AgentControlTests(unittest.TestCase):
         agent = self.make_agent()
 
         self.assertTrue(agent.protection_enabled)
+
+    def test_explicit_source_paths_propagate_enabled_control_fallback(self) -> None:
+        root = Path(self.temporary_directory.name) / "source"
+        paths = RuntimePaths.for_source(root)
+        agent = FaceLockAgent(
+            {"mode": "presence_guard"},
+            runtime_paths=paths,
+            activity_writer=InlineActivityWriter(
+                self.append_activity,
+                paths.activity_path,
+            ),
+        )
+
+        self.assertEqual(agent.control_path, paths.control_path)
+        self.assertTrue(agent.protection_enabled)
+
+    def test_release_paths_propagate_disabled_control_fallback(self) -> None:
+        root = Path(self.temporary_directory.name)
+        paths = RuntimePaths.for_release(
+            root / "resources",
+            root / "support",
+        )
+        agent = FaceLockAgent(
+            {"mode": "presence_guard"},
+            runtime_paths=paths,
+            activity_writer=InlineActivityWriter(
+                self.append_activity,
+                paths.activity_path,
+            ),
+        )
+
+        self.assertEqual(agent.control_path, paths.control_path)
+        self.assertFalse(agent.protection_enabled)
 
     def test_disabling_protection_pauses_and_emits_one_event(self) -> None:
         agent = self.make_agent()
