@@ -89,12 +89,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let themeStore = ThemeStore(localStore: localStore)
         let desktopWindowController = DesktopWindowController(
             faceLockStore: faceLockStore,
+            setupCoordinator: setupCoordinator,
             themeStore: themeStore,
             projectURL: environment.supportURL,
             dataURL: environment.dataURL
         )
         let statusMenuController = StatusMenuController(
             faceLockStore: faceLockStore,
+            setupCoordinator: setupCoordinator,
             projectURL: environment.supportURL,
             dataURL: environment.dataURL,
             showDesktopWindow: { [weak desktopWindowController] in
@@ -111,6 +113,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         faceLockStore.startPolling()
         statusMenuController.startRefreshing()
+        if !setupCoordinator.hasCompletedOnboarding {
+            desktopWindowController.show()
+        }
+        Task {
+            await setupCoordinator.refreshLiveReadiness()
+            faceLockStore.refresh()
+            statusMenuController.refresh()
+        }
     }
 
     func applicationShouldHandleReopen(
@@ -119,6 +129,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) -> Bool {
         desktopWindowController?.show()
         return true
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Task {
+            await setupCoordinator?.refreshLiveReadiness()
+            faceLockStore?.refresh()
+            statusMenuController?.refresh()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

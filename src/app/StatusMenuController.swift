@@ -6,6 +6,7 @@ final class StatusMenuController: NSObject {
     private(set) var statusItem: NSStatusItem
 
     private let faceLockStore: FaceLockStore
+    private let setupCoordinator: SetupCoordinator
     private let projectURL: URL
     private let dataURL: URL
     private let showDesktopWindow: () -> Void
@@ -13,11 +14,13 @@ final class StatusMenuController: NSObject {
 
     init(
         faceLockStore: FaceLockStore,
+        setupCoordinator: SetupCoordinator,
         projectURL: URL,
         dataURL: URL,
         showDesktopWindow: @escaping () -> Void
     ) {
         self.faceLockStore = faceLockStore
+        self.setupCoordinator = setupCoordinator
         self.projectURL = projectURL
         self.dataURL = dataURL
         self.showDesktopWindow = showDesktopWindow
@@ -57,11 +60,19 @@ final class StatusMenuController: NSObject {
         menu.addItem(disabledItem("更新时间：\(faceLockStore.state.updatedAt ?? "无")"))
         menu.addItem(.separator())
         menu.addItem(actionItem("打开控制中心", action: #selector(openControlCenter), key: "o"))
-        menu.addItem(actionItem(
-            faceLockStore.protectionEnabled ? "暂停保护" : "恢复保护",
-            action: #selector(toggleProtection),
-            key: "p"
-        ))
+        if setupCoordinator.hasCompletedOnboarding && setupCoordinator.isLiveReady {
+            menu.addItem(actionItem(
+                faceLockStore.protectionEnabled ? "暂停保护" : "恢复保护",
+                action: #selector(toggleProtection),
+                key: "p"
+            ))
+        } else {
+            menu.addItem(actionItem(
+                "完成首次安全设置",
+                action: #selector(openControlCenter),
+                key: "p"
+            ))
+        }
         menu.addItem(actionItem("刷新状态", action: #selector(refreshFromMenu), key: "r"))
         menu.addItem(actionItem("打开证据目录", action: #selector(openEvidence), key: "e"))
         menu.addItem(actionItem("打开日志", action: #selector(openLog), key: "l"))
@@ -87,8 +98,20 @@ final class StatusMenuController: NSObject {
     }
 
     @objc private func toggleProtection() {
-        faceLockStore.setProtectionEnabled(!faceLockStore.protectionEnabled)
-        refresh()
+        if faceLockStore.protectionEnabled {
+            faceLockStore.setProtectionEnabled(false)
+            refresh()
+            return
+        }
+        Task {
+            do {
+                try await setupCoordinator.enableProtection()
+                faceLockStore.refresh()
+            } catch {
+                showDesktopWindow()
+            }
+            refresh()
+        }
     }
 
     @objc private func refreshFromMenu() {

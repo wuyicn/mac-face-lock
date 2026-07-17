@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 
@@ -32,6 +33,9 @@ final class SetupCoordinator: ObservableObject {
     @Published private(set) var permissionStates: [SetupPermission: PermissionState]
     @Published private(set) var checks: [SetupCheck: Bool]
     @Published private(set) var readiness: SetupReadiness
+    @Published private(set) var currentStep: SetupStep
+    @Published private(set) var hasCompletedOnboarding: Bool
+    @Published private(set) var serviceStatus: ServiceStatus?
 
     private let environment: AppEnvironment
     private let permissionCenter: PermissionCenter
@@ -44,8 +48,8 @@ final class SetupCoordinator: ObservableObject {
     private let fileManager: FileManager
 
     private var ownerProfileValid: Bool
-    private var diagnosisPassed = false
-    private var ownerTestPassed = false
+    private var diagnosisPassed: Bool
+    private var ownerTestPassed: Bool
     private var serviceHealthy = false
     private var enrollmentTask: Task<RuntimeResult, Error>?
     private var enrollmentGeneration: UUID?
@@ -62,6 +66,14 @@ final class SetupCoordinator: ObservableObject {
         applicationURL: URL? = nil,
         fileManager: FileManager = .default
     ) {
+        let storedRecord = setupStore.record
+        let initialOwnerProfileValid = fileManager.fileExists(
+            atPath: environment.dataURL.appendingPathComponent("owner_face.npy").path
+        )
+        let restoredStep = Self.safeRestoredStep(
+            for: storedRecord,
+            ownerProfileValid: initialOwnerProfileValid
+        )
         self.environment = environment
         self.permissionCenter = permissionCenter
         self.setupStore = setupStore
@@ -85,23 +97,136 @@ final class SetupCoordinator: ObservableObject {
         self.progress = nil
         self.currentError = nil
         self.permissionStates = [:]
-        self.ownerProfileValid = fileManager.fileExists(
-            atPath: environment.dataURL.appendingPathComponent("owner_face.npy").path
-        )
+        self.currentStep = restoredStep
+        self.hasCompletedOnboarding = storedRecord.isComplete
+        self.serviceStatus = nil
+        self.ownerProfileValid = initialOwnerProfileValid
+        self.diagnosisPassed = storedRecord.isComplete
+        self.ownerTestPassed = storedRecord.isComplete
         let initialReadiness = SetupReadiness.evaluate(
             permissions: [:],
             ownerProfileValid: self.ownerProfileValid,
-            diagnosisPassed: false,
-            ownerTestPassed: false,
+            diagnosisPassed: self.diagnosisPassed,
+            ownerTestPassed: self.ownerTestPassed,
             serviceHealthy: false
         )
         self.readiness = initialReadiness
         self.checks = initialReadiness.checks
+        if restoredStep != storedRecord.currentStep {
+            let repairedRecord = OnboardingRecord(
+                currentStep: restoredStep,
+                completedSteps: storedRecord.completedSteps,
+                completedAt: nil,
+                appVersion: storedRecord.appVersion
+            )
+            try? setupStore.save(repairedRecord)
+            self.hasCompletedOnboarding = false
+        }
+    }
+
+    var isLiveReady: Bool {
+        readiness.canEnableProtection
+    }
+
+    func refreshLiveReadiness() async {
+        await refreshPermissions()
+        await refreshServiceHealthForEnable()
+        updateReadiness()
     }
 
     func refreshPermissions() async {
         permissionStates = await permissionCenter.refresh()
         updateReadiness()
+    }
+
+    func requestPermission(_ permission: SetupPermission) async {
+        currentError = nil
+        switch permission {
+        case .camera:
+            await permissionCenter.requestCamera()
+        case .inputMonitoring:
+            permissionCenter.requestInputMonitoring()
+        case .accessibility:
+            permissionCenter.requestAccessibility()
+        case .screenRecording:
+            permissionCenter.requestScreenRecording()
+        }
+        await refreshPermissions()
+    }
+
+    func openPermissionSettings(_ permission: SetupPermission) {
+        permissionCenter.openSettings(for: permission)
+    }
+
+    func setPermissionStepVisible(_ visible: Bool) {
+        permissionCenter.setPermissionStepVisible(visible)
+    }
+
+    @discardableResult
+    func prepareForSetup() async -> Bool {
+        currentError = nil
+        let issues = preparationIssues()
+        guard issues.isEmpty else {
+            currentError = issues.joined(separator: " ")
+            return false
+        }
+        do {
+            try persistStep(.permissions, completing: .preparation)
+            await refreshPermissions()
+            return true
+        } catch {
+            currentError = "无法保存准备检查结果，请检查应用支持目录权限后重试。"
+            return false
+        }
+    }
+
+    @discardableResult
+    func continueFromPermissions() async -> Bool {
+        await refreshPermissions()
+        let requiredPermissions: [SetupPermission] = [
+            .camera,
+            .inputMonitoring,
+            .accessibility,
+        ]
+        guard requiredPermissions.allSatisfy({
+            permissionStates[$0] == .granted
+        }) else {
+            currentError = "请先完成摄像头、输入监控和辅助功能授权。"
+            return false
+        }
+        do {
+            try persistStep(.enrollment, completing: .permissions)
+            currentError = nil
+            return true
+        } catch {
+            currentError = "无法保存权限检查结果，请检查应用支持目录权限后重试。"
+            return false
+        }
+    }
+
+    func goBack() {
+        let previous: SetupStep?
+        switch currentStep {
+        case .preparation:
+            previous = nil
+        case .permissions:
+            previous = .preparation
+        case .enrollment:
+            previous = .permissions
+        case .safetyTest:
+            previous = .enrollment
+        case .completion:
+            previous = .safetyTest
+        }
+        guard let previous else {
+            return
+        }
+        do {
+            try persistStep(previous)
+            currentError = nil
+        } catch {
+            currentError = "无法保存当前设置步骤，请稍后重试。"
+        }
     }
 
     func startEnrollment() async {
@@ -199,6 +324,30 @@ final class SetupCoordinator: ObservableObject {
         updateReadiness()
     }
 
+    @discardableResult
+    func runSafetyTest() async -> Bool {
+        await runDiagnosis()
+        guard diagnosisPassed else {
+            return false
+        }
+        await verifyOwnerWithoutLocking()
+        updateReadiness()
+        guard readiness.canEnableProtection else {
+            if currentError == nil {
+                currentError = "安全测试尚未全部通过，请修复未通过的项目后重试。"
+            }
+            return false
+        }
+        do {
+            try persistStep(.completion, completing: .safetyTest)
+            currentError = nil
+            return true
+        } catch {
+            currentError = "无法保存安全测试结果，请检查应用支持目录权限后重试。"
+            return false
+        }
+    }
+
     func verifyOwnerWithoutLocking() async {
         guard enrollmentTask == nil else {
             ownerTestPassed = false
@@ -264,6 +413,8 @@ final class SetupCoordinator: ObservableObject {
         do {
             try setupStore.save(completedRecord)
             _ = try localStore.writeControl(enabled: true)
+            currentStep = completedRecord.currentStep
+            hasCompletedOnboarding = completedRecord.isComplete
             currentError = nil
         } catch {
             try? setupStore.save(previousRecord)
@@ -271,6 +422,51 @@ final class SetupCoordinator: ObservableObject {
             currentError = coordinatorError.localizedDescription
             throw coordinatorError
         }
+    }
+
+    func restartService() async {
+        guard let serviceManager else {
+            currentError = "当前安装没有可管理的后台服务。"
+            return
+        }
+        currentError = nil
+        do {
+            try await serviceManager.restart()
+            await refreshServiceHealthForEnable()
+        } catch {
+            currentError = localizedRuntimeError(error)
+            serviceHealthy = false
+        }
+        updateReadiness()
+    }
+
+    func reinstallService() async {
+        guard let serviceManager else {
+            currentError = "当前安装没有可管理的后台服务。"
+            return
+        }
+        currentError = nil
+        do {
+            _ = try localStore.writeControl(enabled: false)
+            try await serviceManager.install(
+                appURL: applicationURL,
+                supportURL: environment.supportURL
+            )
+            await refreshServiceHealthForEnable()
+        } catch {
+            currentError = localizedRuntimeError(error)
+            serviceHealthy = false
+        }
+        updateReadiness()
+    }
+
+    func openLogs() {
+        let logsURL = environment.logsURL
+        try? fileManager.createDirectory(
+            at: logsURL,
+            withIntermediateDirectories: true
+        )
+        NSWorkspace.shared.open(logsURL)
     }
 
     private var appVersion: String {
@@ -292,6 +488,99 @@ final class SetupCoordinator: ObservableObject {
             appVersion: appVersion
         )
         try setupStore.save(record)
+        currentStep = record.currentStep
+        hasCompletedOnboarding = record.isComplete
+    }
+
+    private func persistStep(
+        _ step: SetupStep,
+        completing completedStep: SetupStep? = nil
+    ) throws {
+        var completedSteps = setupStore.record.completedSteps
+        if let completedStep, !completedSteps.contains(completedStep) {
+            completedSteps.append(completedStep)
+        }
+        let record = OnboardingRecord(
+            currentStep: step,
+            completedSteps: completedSteps,
+            completedAt: nil,
+            appVersion: appVersion
+        )
+        try setupStore.save(record)
+        currentStep = step
+        hasCompletedOnboarding = false
+    }
+
+    private func preparationIssues() -> [String] {
+        var issues: [String] = []
+#if !arch(arm64)
+        issues.append("此版本仅支持 Apple Silicon Mac。")
+#endif
+        if !ProcessInfo.processInfo.isOperatingSystemAtLeast(
+            OperatingSystemVersion(majorVersion: 12, minorVersion: 0, patchVersion: 0)
+        ) {
+            issues.append("需要 macOS 12 或更高版本。")
+        }
+        do {
+            try fileManager.createDirectory(
+                at: environment.supportURL,
+                withIntermediateDirectories: true
+            )
+            try fileManager.createDirectory(
+                at: environment.dataURL,
+                withIntermediateDirectories: true
+            )
+            try fileManager.createDirectory(
+                at: environment.logsURL,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            issues.append("应用支持目录不可写。")
+        }
+        guard environment.mode == .release else {
+            return issues
+        }
+        let applicationPath = applicationURL.standardizedFileURL.path
+        let userApplicationsPath = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications", isDirectory: true)
+            .standardizedFileURL.path
+        let isInApplications = applicationPath.hasPrefix("/Applications/")
+            || applicationPath.hasPrefix(userApplicationsPath + "/")
+        if !isInApplications {
+            issues.append("请先将应用移到“应用程序”文件夹。")
+        }
+        if !fileManager.isExecutableFile(atPath: environment.runtimeExecutableURL.path) {
+            issues.append("内置运行组件不完整，请重新下载应用。")
+        }
+        return issues
+    }
+
+    private static func safeRestoredStep(
+        for record: OnboardingRecord,
+        ownerProfileValid: Bool
+    ) -> SetupStep {
+        guard !record.isComplete else {
+            return .completion
+        }
+        let completed = Set(record.completedSteps)
+        let furthestSafeStep: SetupStep
+        if !completed.contains(.preparation) {
+            furthestSafeStep = .preparation
+        } else if !completed.contains(.permissions) {
+            furthestSafeStep = .permissions
+        } else if !completed.contains(.enrollment) || !ownerProfileValid {
+            furthestSafeStep = .enrollment
+        } else if !completed.contains(.safetyTest) {
+            furthestSafeStep = .safetyTest
+        } else {
+            furthestSafeStep = .completion
+        }
+        let order = SetupStep.allCases
+        guard let currentIndex = order.firstIndex(of: record.currentStep),
+              let furthestIndex = order.firstIndex(of: furthestSafeStep) else {
+            return .preparation
+        }
+        return order[min(currentIndex, furthestIndex)]
     }
 
     private func applyEnrollment(
@@ -359,6 +648,7 @@ final class SetupCoordinator: ObservableObject {
                 return
             }
             let serviceStatus = await serviceManager.status()
+            self.serviceStatus = serviceStatus
             serviceHealthy = serviceStatus.isHealthy
             switch serviceStatus.state {
             case .healthy:
@@ -372,6 +662,7 @@ final class SetupCoordinator: ObservableObject {
             }
         } else {
             serviceHealthy = await serviceHealthProvider.isServiceHealthy()
+            serviceStatus = nil
         }
     }
 
@@ -387,6 +678,7 @@ final class SetupCoordinator: ObservableObject {
                 supportURL: environment.supportURL
             )
             let serviceStatus = await serviceManager.status()
+            self.serviceStatus = serviceStatus
             serviceHealthy = serviceStatus.isHealthy
             switch serviceStatus.state {
             case .healthy:
@@ -400,6 +692,7 @@ final class SetupCoordinator: ObservableObject {
             }
         } catch {
             serviceHealthy = false
+            serviceStatus = nil
             _ = try? localStore.writeControl(enabled: false)
             currentError = localizedRuntimeError(error)
         }

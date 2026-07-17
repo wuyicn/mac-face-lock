@@ -253,6 +253,52 @@ class UnifiedPackagingTests(unittest.TestCase):
             with self.subTest(source=source.name):
                 self.assertNotIn("/" + "Users" + "/", source.read_text())
 
+    def test_onboarding_sources_define_complete_customer_flow(self) -> None:
+        onboarding = (PROJECT_DIR / "src/app" / "OnboardingView.swift").read_text()
+        settings = (PROJECT_DIR / "src/app" / "SettingsView.swift").read_text()
+        views = (PROJECT_DIR / "src/app" / "Views.swift").read_text()
+
+        for label in (
+            "准备检查",
+            "权限中心",
+            "录入本人",
+            "安全测试",
+            "完成并开启",
+        ):
+            with self.subTest(onboarding_step=label):
+                self.assertIn(label, onboarding)
+
+        for label in (
+            "权限与运行状态",
+            "本人资料",
+            "保护规则",
+            "服务诊断与修复",
+            "外观",
+            "重新录入本人",
+            "刷新权限",
+            "打开系统设置",
+            "重新启动服务",
+            "重新安装服务",
+            "查看日志",
+        ):
+            with self.subTest(settings_label=label):
+                self.assertIn(label, settings)
+
+        self.assertIn("setupCoordinator.hasCompletedOnboarding", views)
+        self.assertIn("setupCoordinator.isLiveReady", views)
+        self.assertIn("OnboardingView(", views)
+
+        user_facing_sources = onboarding + settings
+        for shell_copy in (
+            "launchctl ",
+            "python ",
+            "python3 ",
+            "终端运行",
+            "打开终端",
+        ):
+            with self.subTest(shell_copy=shell_copy):
+                self.assertNotIn(shell_copy, user_facing_sources)
+
     def test_ui_consumers_do_not_rebuild_the_validated_data_path(self) -> None:
         for relative_path in (
             "src/app/AppDelegate.swift",

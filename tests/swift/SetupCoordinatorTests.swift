@@ -23,6 +23,8 @@ private func require(_ condition: @autoclosure () -> Bool, _ message: String) th
 private final class CoordinatorPermissionProvider: PermissionProviding {
     var cameraStatus: AVAuthorizationStatus = .authorized
     var granted: Set<SetupPermission> = [.inputMonitoring, .accessibility]
+    private(set) var requested: [SetupPermission] = []
+    private(set) var openedSettingsURLs: [URL] = []
 
     func cameraAuthorizationStatus() -> AVAuthorizationStatus {
         cameraStatus
@@ -36,13 +38,22 @@ private final class CoordinatorPermissionProvider: PermissionProviding {
         false
     }
 
-    func requestCameraAccess() async {}
-    func requestInputMonitoringAccess() {}
-    func requestAccessibilityAccess() {}
-    func requestScreenRecordingAccess() {}
+    func requestCameraAccess() async {
+        requested.append(.camera)
+    }
+    func requestInputMonitoringAccess() {
+        requested.append(.inputMonitoring)
+    }
+    func requestAccessibilityAccess() {
+        requested.append(.accessibility)
+    }
+    func requestScreenRecordingAccess() {
+        requested.append(.screenRecording)
+    }
 
     func open(_ url: URL) -> Bool {
-        true
+        openedSettingsURLs.append(url)
+        return true
     }
 }
 
@@ -372,6 +383,9 @@ struct SetupCoordinatorTests {
         try await testEnableProtectionRefusesWhenAnyGateIsFalse()
         try await testEnableProtectionRechecksReleaseServiceAfterDiagnosis()
         try await testEnableProtectionRechecksSourceServiceProvider()
+        try await testRestoresSafeStepAndForwardsPermissionActions()
+        try testUnsafePersistedStepFallsBackToLastSatisfiedGate()
+        try await testOperationalServiceRepairActionsUseServiceManager()
         print("Setup coordinator tests passed")
     }
 
@@ -616,6 +630,124 @@ struct SetupCoordinatorTests {
         try require(
             !fixture.localStore.readControl().protectionEnabled,
             "source service death still wrote protection enabled"
+        )
+    }
+
+    private static func testRestoresSafeStepAndForwardsPermissionActions() async throws {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        try fixture.setupStore.save(
+            OnboardingRecord(
+                currentStep: .enrollment,
+                completedSteps: [.preparation, .permissions],
+                completedAt: nil,
+                appVersion: "test"
+            )
+        )
+        let provider = CoordinatorPermissionProvider()
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: provider),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+        )
+
+        try require(
+            coordinator.currentStep == .enrollment,
+            "coordinator did not restore the last persisted safe step"
+        )
+        try require(
+            !coordinator.hasCompletedOnboarding,
+            "incomplete record was reported as completed"
+        )
+
+        await coordinator.requestPermission(.camera)
+        await coordinator.requestPermission(.inputMonitoring)
+        await coordinator.requestPermission(.accessibility)
+        await coordinator.requestPermission(.screenRecording)
+        coordinator.openPermissionSettings(.inputMonitoring)
+
+        try require(
+            provider.requested == SetupPermission.allCases,
+            "customer permission actions were not forwarded through PermissionCenter"
+        )
+        try require(
+            provider.openedSettingsURLs.last?.absoluteString.contains("Privacy_ListenEvent")
+                == true,
+            "input monitoring settings action did not open the focused system page"
+        )
+
+        coordinator.goBack()
+        try require(
+            coordinator.currentStep == .permissions,
+            "back navigation did not return to the prior setup step"
+        )
+        try require(
+            fixture.setupStore.record.currentStep == .permissions,
+            "back navigation was not persisted for safe resume"
+        )
+    }
+
+    private static func testOperationalServiceRepairActionsUseServiceManager() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let serviceManager = FakeServiceManager(state: .healthy)
+        let appURL = fixture.root.appendingPathComponent("Mac Face Lock.app")
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: serviceManager,
+            applicationURL: appURL
+        )
+
+        await coordinator.restartService()
+        await coordinator.reinstallService()
+
+        try require(serviceManager.restartCount == 1, "service restart action was not forwarded")
+        try require(serviceManager.installs.count == 1, "service reinstall action was not forwarded")
+        try require(
+            serviceManager.installs.first?.appURL == appURL,
+            "service reinstall did not use the current application URL"
+        )
+        try require(
+            coordinator.checks[.serviceHealth] == true,
+            "service repair actions did not refresh live readiness"
+        )
+    }
+
+    private static func testUnsafePersistedStepFallsBackToLastSatisfiedGate() throws {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        try fixture.setupStore.save(
+            OnboardingRecord(
+                currentStep: .completion,
+                completedSteps: [.preparation, .permissions],
+                completedAt: nil,
+                appVersion: "test"
+            )
+        )
+
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+        )
+
+        try require(
+            coordinator.currentStep == .enrollment,
+            "an unsafe persisted step skipped the missing enrollment gate"
+        )
+        try require(
+            fixture.setupStore.record.currentStep == .enrollment,
+            "safe fallback step was not persisted for the next relaunch"
         )
     }
 

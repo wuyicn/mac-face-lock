@@ -71,6 +71,7 @@ struct PermissionStateTests {
         try await testCameraAuthorizationMappings()
         try await testRefreshMapsBooleanPermissionsAndRestartRequirement()
         try await testRequestsForwardToProvider()
+        try testSettingsAnchorsTargetFocusedPrivacyPages()
         try testSettingsAnchorFallsBackToGeneralPrivacyPage()
         try await testActivationAndVisibleStepPollingRefreshPermissions()
         print("Permission state tests passed")
@@ -149,6 +150,30 @@ struct PermissionStateTests {
             provider.openedURLs[1].absoluteString.hasSuffix("?Privacy"),
             "general Privacy & Security fallback was not used"
         )
+    }
+
+    private static func testSettingsAnchorsTargetFocusedPrivacyPages() throws {
+        let expectedAnchors: [(SetupPermission, String)] = [
+            (.inputMonitoring, "Privacy_ListenEvent"),
+            (.accessibility, "Privacy_Accessibility"),
+            (.screenRecording, "Privacy_ScreenCapture"),
+        ]
+
+        for (permission, expectedAnchor) in expectedAnchors {
+            let provider = FakePermissionProvider()
+            let center = PermissionCenter(provider: provider)
+
+            center.openSettings(for: permission)
+
+            try require(
+                provider.openedURLs.count == 1,
+                "\(permission.rawValue) settings should open one focused page"
+            )
+            try require(
+                provider.openedURLs[0].absoluteString.contains(expectedAnchor),
+                "\(permission.rawValue) did not use \(expectedAnchor)"
+            )
+        }
     }
 
     private static func testActivationAndVisibleStepPollingRefreshPermissions() async throws {
