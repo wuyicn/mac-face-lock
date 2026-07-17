@@ -4,13 +4,16 @@ import Foundation
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let environment: Result<AppEnvironment, Error>
+    private let permissionCenter: PermissionCenter
     private var localStore: LocalJSONStore?
     private var faceLockStore: FaceLockStore?
+    private var setupCoordinator: SetupCoordinator?
     private var themeStore: ThemeStore?
     private var desktopWindowController: DesktopWindowController?
     private var statusMenuController: StatusMenuController?
 
     override init() {
+        self.permissionCenter = PermissionCenter()
         do {
             let fileManager = FileManager.default
             guard let applicationSupportURL = fileManager.urls(
@@ -58,6 +61,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             resourcesURL: environment.resourcesURL,
             dataURL: environment.dataURL
         )
+        let setupStore: SetupStore
+        do {
+            setupStore = try SetupStore(
+                localStore: localStore,
+                mode: environment.mode
+            )
+        } catch {
+            NSLog("Mac Face Lock 无法初始化安全设置：%@", error.localizedDescription)
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "Mac Face Lock 无法安全启动"
+            alert.informativeText = "无法保持保护关闭，请检查应用支持目录权限后重试。"
+            alert.addButton(withTitle: "退出")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            NSApp.terminate(nil)
+            return
+        }
+        let setupCoordinator = SetupCoordinator(
+            environment: environment,
+            permissionCenter: permissionCenter,
+            setupStore: setupStore,
+            localStore: localStore
+        )
         let faceLockStore = FaceLockStore(localStore: localStore)
         let themeStore = ThemeStore(localStore: localStore)
         let desktopWindowController = DesktopWindowController(
@@ -77,6 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         self.localStore = localStore
         self.faceLockStore = faceLockStore
+        self.setupCoordinator = setupCoordinator
         self.themeStore = themeStore
         self.desktopWindowController = desktopWindowController
         self.statusMenuController = statusMenuController

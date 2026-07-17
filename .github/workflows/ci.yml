@@ -71,6 +71,27 @@ jobs:
             -framework ApplicationServices -framework CoreGraphics \
             -o "$RUNNER_TEMP/mac-face-lock-permission-tests"
           "$RUNNER_TEMP/mac-face-lock-permission-tests"
+      - name: Run Swift runtime-command-runner tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ProjectLocator.swift src/app/AppEnvironment.swift \
+            src/app/RuntimeCommandRunner.swift \
+            tests/swift/RuntimeCommandRunnerTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-runtime-command-tests"
+          "$RUNNER_TEMP/mac-face-lock-runtime-command-tests"
+      - name: Run Swift setup-coordinator tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ProjectLocator.swift src/app/AppEnvironment.swift \
+            src/app/Models.swift src/app/SetupModels.swift \
+            src/app/LocalJSONStore.swift src/app/SetupStore.swift \
+            src/app/PermissionCenter.swift src/app/RuntimeCommandRunner.swift \
+            src/app/SetupCoordinator.swift \
+            tests/swift/SetupCoordinatorTests.swift \
+            -framework AppKit -framework AVFoundation \
+            -framework ApplicationServices -framework CoreGraphics \
+            -o "$RUNNER_TEMP/mac-face-lock-setup-coordinator-tests"
+          "$RUNNER_TEMP/mac-face-lock-setup-coordinator-tests"
       - name: Run Swift project-locator tests
         run: |
           xcrun swiftc -parse-as-library -DTESTING \
