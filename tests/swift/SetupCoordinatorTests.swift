@@ -67,12 +67,31 @@ private final class FakeRuntimeRunner: RuntimeCommandRunning {
         onEvent: @escaping (RuntimeEvent) -> Void
     ) async throws -> RuntimeResult {
         commands.append(command)
-        for event in events[command, default: []] {
+        var emittedEvents = events[command, default: []]
+        if command == .diagnose,
+           emittedEvents.contains(where: {
+               $0.event == "diagnosis_complete" && $0.status == "success"
+           }),
+           !emittedEvents.contains(where: {
+               $0.event == "diagnosis_check" && $0.check == "template"
+           }) {
+            emittedEvents.insert(
+                RuntimeEvent(
+                    schemaVersion: 1,
+                    event: "diagnosis_check",
+                    status: "success",
+                    message: "template",
+                    check: "template"
+                ),
+                at: 0
+            )
+        }
+        for event in emittedEvents {
             onEvent(event)
         }
         return results[command] ?? RuntimeResult(
             exitCode: 0,
-            events: events[command, default: []],
+            events: emittedEvents,
             stderr: "",
             stderrTruncated: false
         )
@@ -90,6 +109,23 @@ private final class FakeServiceHealthProvider: SetupServiceHealthProviding {
     func isServiceHealthy() async -> Bool {
         checks += 1
         return healthy
+    }
+}
+
+private final class FakeOwnerProfileInspector: OwnerProfileInspecting {
+    var inspection: OwnerProfileInspection
+    private(set) var inspections = 0
+
+    init(valid: Bool = true, fingerprint: String? = "stable-owner") {
+        inspection = OwnerProfileInspection(
+            isValid: valid,
+            fingerprint: valid ? fingerprint : nil
+        )
+    }
+
+    func inspect(_ url: URL) -> OwnerProfileInspection {
+        inspections += 1
+        return inspection
     }
 }
 
@@ -176,6 +212,7 @@ private final class VerificationEnrollmentOverlapRunner: RuntimeCommandRunning {
     private let replacementURL: URL
     private var verificationContinuation: CheckedContinuation<Void, Never>?
     private(set) var verificationStarted = false
+    private(set) var enrollmentStarted = false
 
     init(replacementURL: URL) {
         self.replacementURL = replacementURL
@@ -205,6 +242,7 @@ private final class VerificationEnrollmentOverlapRunner: RuntimeCommandRunning {
                 stderrTruncated: false
             )
         case .enroll:
+            enrollmentStarted = true
             try Data("replacement-template".utf8).write(to: replacementURL)
             let terminal = RuntimeEvent(
                 schemaVersion: 1,
@@ -360,6 +398,54 @@ private final class CancellationEOFWindowRunner: RuntimeCommandRunning {
     }
 }
 
+private final class SerializedDiagnosisRunner: RuntimeCommandRunning {
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private(set) var activeCount = 0
+    private(set) var maximumActiveCount = 0
+    private(set) var commands: [RuntimeCommand] = []
+
+    func run(
+        command: RuntimeCommand,
+        onEvent: @escaping (RuntimeEvent) -> Void
+    ) async throws -> RuntimeResult {
+        commands.append(command)
+        activeCount += 1
+        maximumActiveCount = max(maximumActiveCount, activeCount)
+        await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+        }
+        activeCount -= 1
+        let terminal = RuntimeEvent(
+            schemaVersion: 1,
+            event: "diagnosis_complete",
+            status: "success",
+            message: "complete"
+        )
+        return RuntimeResult(
+            exitCode: 0,
+            events: [
+                RuntimeEvent(
+                    schemaVersion: 1,
+                    event: "diagnosis_check",
+                    status: "success",
+                    message: "template",
+                    check: "template"
+                ),
+                terminal,
+            ],
+            stderr: "",
+            stderrTruncated: false
+        )
+    }
+
+    func completeNext() {
+        guard !continuations.isEmpty else {
+            return
+        }
+        continuations.removeFirst().resume()
+    }
+}
+
 private struct CoordinatorFixture {
     let root: URL
     let localStore: LocalJSONStore
@@ -418,6 +504,12 @@ struct SetupCoordinatorTests {
         try await testCancelImmediateRetryWaitsForRuntimeCleanup()
         try await testServiceErrorsAreSanitizedBeforePublishing()
         try testOpenLogsReportsCustomerSafeFailure()
+        try await testHealthyCompletedRelaunchAndForegroundStayReadyWithoutRuntime()
+        try await testFreshPreparationPassiveRefreshRunsNoRuntimeCommand()
+        try await testRuntimeDiagnosticsAreSerialized()
+        try testStrictStaticOwnerProfileInspection()
+        try await testCameraOnlyDiagnosisKeepsValidOwnerProfile()
+        try await testCompletedCameraRevocationRecoveryPreservesHistoryAndSkipsEnrollment()
         print("Setup coordinator tests passed")
     }
 
@@ -468,7 +560,8 @@ struct SetupCoordinatorTests {
             setupStore: fixture.setupStore,
             localStore: fixture.localStore,
             runtimeRunner: runner,
-            serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector()
         )
 
         await coordinator.refreshPermissions()
@@ -856,9 +949,16 @@ struct SetupCoordinatorTests {
             "final enable did not re-probe the revoked permission"
         )
         try require(
-            coordinator.currentStep == .permissions
-                && !coordinator.hasCompletedOnboarding,
-            "permission revocation did not fall back to the permission step"
+            coordinator.currentStep == .completion
+                && coordinator.hasCompletedOnboarding
+                && coordinator.recoveryStep == .permissions,
+            "permission revocation did not preserve completion with permission recovery"
+        )
+        try require(
+            fixture.setupStore.record.completedAt == "2026-07-17T12:00:00Z"
+                && Set(fixture.setupStore.record.completedSteps)
+                    == Set(SetupStep.allCases),
+            "permission revocation discarded completed onboarding history"
         )
         try require(
             !fixture.localStore.readControl().protectionEnabled,
@@ -937,9 +1037,10 @@ struct SetupCoordinatorTests {
         await coordinator.refreshCurrentAuthorizationStatus()
 
         try require(
-            coordinator.currentStep == .permissions
-                && !coordinator.hasCompletedOnboarding,
-            "completion polling did not fall back after a required permission was revoked"
+            coordinator.currentStep == .completion
+                && coordinator.hasCompletedOnboarding
+                && coordinator.recoveryStep == .permissions,
+            "completion polling did not preserve completion with permission recovery"
         )
     }
 
@@ -953,7 +1054,8 @@ struct SetupCoordinatorTests {
             setupStore: fixture.setupStore,
             localStore: fixture.localStore,
             runtimeRunner: runner,
-            serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector()
         )
         let firstEnrollment = Task {
             await coordinator.startEnrollment()
@@ -991,7 +1093,8 @@ struct SetupCoordinatorTests {
         let fixture = try CoordinatorFixture()
         defer { fixture.remove() }
         let serviceManager = FakeServiceManager(state: .unhealthy)
-        let privatePath = "/Users/private-customer/Library/LaunchAgents/secret-token"
+        let privatePath =
+            "/" + "Users/private-customer/Library/LaunchAgents/secret-token"
         serviceManager.restartError = ServiceManagerError.commandFailed(
             command: "launchctl kickstart \(privatePath)",
             exitCode: 77,
@@ -1035,6 +1138,274 @@ struct SetupCoordinatorTests {
         try require(
             coordinator.currentError == "无法打开日志文件夹，请稍后重试。",
             "log open failure did not publish a concise customer repair"
+        )
+    }
+
+    private static func testHealthyCompletedRelaunchAndForegroundStayReadyWithoutRuntime()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try Data("owner-placeholder".utf8).write(
+            to: fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        )
+        try fixture.setupStore.save(
+            OnboardingRecord(
+                currentStep: .completion,
+                completedSteps: SetupStep.allCases,
+                completedAt: "2026-07-17T12:00:00Z",
+                appVersion: "0.1.0-beta",
+                ownerProfileFingerprint: "stable-owner",
+                requiresOwnerReverification: false
+            )
+        )
+        let runner = FakeRuntimeRunner()
+        let inspector = FakeOwnerProfileInspector()
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: FakeServiceManager(state: .healthy),
+            ownerProfileInspector: inspector
+        )
+
+        await coordinator.refreshLiveReadiness()
+        try require(coordinator.isLiveReady, "healthy completed relaunch was not ready")
+        await coordinator.refreshLiveReadiness()
+
+        try require(coordinator.isLiveReady, "foreground refresh cleared durable readiness")
+        try require(
+            runner.commands.isEmpty,
+            "passive relaunch/foreground refresh launched a runtime camera command"
+        )
+        try require(
+            coordinator.recoveryStep == nil,
+            "healthy completed relaunch published a recovery step"
+        )
+    }
+
+    private static func testFreshPreparationPassiveRefreshRunsNoRuntimeCommand()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let runner = FakeRuntimeRunner()
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: FakeServiceManager(state: .notInstalled),
+            ownerProfileInspector: FakeOwnerProfileInspector(valid: false)
+        )
+
+        await coordinator.refreshLiveReadiness()
+        await coordinator.refreshCurrentAuthorizationStatus()
+
+        try require(
+            coordinator.currentStep == .preparation,
+            "passive first-run refresh advanced preparation"
+        )
+        try require(
+            runner.commands.isEmpty,
+            "passive first-run refresh launched diagnose before customer action"
+        )
+    }
+
+    private static func testRuntimeDiagnosticsAreSerialized() async throws {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let runner = SerializedDiagnosisRunner()
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        let first = Task { await coordinator.runDiagnosis() }
+        for _ in 0..<40 where runner.commands.count < 1 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let second = Task { await coordinator.runDiagnosis() }
+        try await Task.sleep(nanoseconds: 30_000_000)
+        try require(
+            runner.commands.count == 1,
+            "second diagnosis entered runtime before first released the camera"
+        )
+
+        runner.completeNext()
+        for _ in 0..<40 where runner.commands.count < 2 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        runner.completeNext()
+        await first.value
+        await second.value
+
+        try require(
+            runner.maximumActiveCount == 1,
+            "runtime readiness operations overlapped"
+        )
+    }
+
+    private static func testStrictStaticOwnerProfileInspection() throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        let inspector = NumpyOwnerProfileInspector()
+
+        try numpyOwnerProfileData().write(to: ownerURL)
+        let valid = inspector.inspect(ownerURL)
+        try require(
+            valid.isValid && valid.fingerprint?.count == 64,
+            "strict static inspection rejected a valid finite owner profile"
+        )
+
+        try numpyOwnerProfileData(firstValueIsNaN: true).write(to: ownerURL)
+        try require(
+            !inspector.inspect(ownerURL).isValid,
+            "strict static inspection accepted non-finite template data"
+        )
+
+        try Data([0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59]).write(to: ownerURL)
+        try require(
+            !inspector.inspect(ownerURL).isValid,
+            "strict static inspection accepted a truncated NPY file"
+        )
+    }
+
+    private static func numpyOwnerProfileData(firstValueIsNaN: Bool = false) -> Data {
+        var header = "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 9216), }"
+        let padding = (16 - ((10 + header.utf8.count + 1) % 16)) % 16
+        header += String(repeating: " ", count: padding) + "\n"
+        let headerBytes = Data(header.utf8)
+        let headerLength = UInt16(headerBytes.count)
+        var data = Data([0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59, 0x01, 0x00])
+        data.append(UInt8(headerLength & 0x00FF))
+        data.append(UInt8((headerLength >> 8) & 0x00FF))
+        data.append(headerBytes)
+        var payload = Data(repeating: 0, count: 2 * 9_216 * 4)
+        if firstValueIsNaN {
+            payload[0] = 0x00
+            payload[1] = 0x00
+            payload[2] = 0xC0
+            payload[3] = 0x7F
+        }
+        data.append(payload)
+        return data
+    }
+
+    private static func testCameraOnlyDiagnosisKeepsValidOwnerProfile() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let runner = FakeRuntimeRunner()
+        runner.results[.diagnose] = RuntimeResult(
+            exitCode: 10,
+            events: [
+                event("diagnosis_check", check: "template"),
+                event("diagnosis_check", status: "error", check: "camera"),
+                RuntimeEvent(
+                    schemaVersion: 1,
+                    event: "diagnosis_complete",
+                    status: "error",
+                    message: "camera only",
+                    failedChecks: ["camera"]
+                ),
+            ],
+            stderr: "",
+            stderrTruncated: false
+        )
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: FakeServiceManager(state: .healthy),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        await coordinator.runDiagnosis()
+
+        try require(
+            coordinator.checks[.ownerProfile] == true,
+            "camera-only diagnosis failure invalidated a successful template check"
+        )
+        try require(
+            coordinator.checks[.diagnosis] == false,
+            "camera-only diagnosis failure was reported as full diagnosis success"
+        )
+        try require(
+            coordinator.currentError?.contains("摄像头") == true,
+            "camera-only diagnosis did not publish the camera repair"
+        )
+    }
+
+    private static func testCompletedCameraRevocationRecoveryPreservesHistoryAndSkipsEnrollment()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let completedAt = "2026-07-17T12:00:00Z"
+        try fixture.setupStore.save(
+            OnboardingRecord(
+                currentStep: .completion,
+                completedSteps: SetupStep.allCases,
+                completedAt: completedAt,
+                appVersion: "0.1.0-beta",
+                ownerProfileFingerprint: "stable-owner",
+                requiresOwnerReverification: false
+            )
+        )
+        let provider = CoordinatorPermissionProvider()
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: provider),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: FakeServiceManager(state: .healthy),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+        await coordinator.refreshLiveReadiness()
+        provider.cameraStatus = .denied
+
+        await coordinator.refreshCurrentAuthorizationStatus()
+
+        try require(
+            coordinator.hasCompletedOnboarding,
+            "camera revocation destroyed historical onboarding completion"
+        )
+        try require(
+            fixture.setupStore.record.completedAt == completedAt
+                && Set(fixture.setupStore.record.completedSteps)
+                    == Set(SetupStep.allCases),
+            "camera revocation discarded completed steps or timestamp"
+        )
+        try require(
+            coordinator.recoveryStep == .permissions,
+            "camera revocation did not identify the permission recovery step"
+        )
+
+        provider.cameraStatus = .authorized
+        await coordinator.refreshCurrentAuthorizationStatus()
+
+        try require(
+            coordinator.hasCompletedOnboarding
+                && coordinator.currentStep == .completion,
+            "restored camera permission forced the completed install into onboarding"
+        )
+        try require(
+            coordinator.recoveryStep == .safetyTest,
+            "restored camera did not advance recovery to owner re-verification"
+        )
+        try require(
+            coordinator.recoveryStep != .enrollment
+                && coordinator.checks[.ownerProfile] == true,
+            "restored camera unnecessarily requested owner enrollment"
         )
     }
 
@@ -1091,7 +1462,8 @@ struct SetupCoordinatorTests {
             setupStore: fixture.setupStore,
             localStore: fixture.localStore,
             runtimeRunner: runner,
-            serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector()
         )
 
         await coordinator.runDiagnosis()
@@ -1151,7 +1523,8 @@ struct SetupCoordinatorTests {
             setupStore: fixture.setupStore,
             localStore: fixture.localStore,
             runtimeRunner: runner,
-            serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector()
         )
         let verification = Task {
             await coordinator.verifyOwnerWithoutLocking()
@@ -1161,9 +1534,17 @@ struct SetupCoordinatorTests {
         }
         try require(runner.verificationStarted, "owner verification did not start")
 
-        await coordinator.startEnrollment()
+        let enrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        try await Task.sleep(nanoseconds: 30_000_000)
+        try require(
+            !runner.enrollmentStarted,
+            "enrollment overlapped the active owner-verification camera operation"
+        )
         runner.completeVerification()
         await verification.value
+        await enrollment.value
 
         try require(
             coordinator.checks[.ownerTest] == false,
@@ -1229,7 +1610,8 @@ struct SetupCoordinatorTests {
             setupStore: fixture.setupStore,
             localStore: fixture.localStore,
             runtimeRunner: runner,
-            serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector()
         )
 
         let enrollment = Task {

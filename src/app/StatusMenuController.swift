@@ -66,6 +66,12 @@ final class StatusMenuController: NSObject {
                 action: #selector(toggleProtection),
                 key: "p"
             ))
+        } else if setupCoordinator.hasCompletedOnboarding {
+            menu.addItem(actionItem(
+                "检查与修复保护",
+                action: #selector(openControlCenter),
+                key: "p"
+            ))
         } else {
             menu.addItem(actionItem(
                 "完成首次安全设置",

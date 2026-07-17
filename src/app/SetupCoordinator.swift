@@ -1,6 +1,103 @@
 import AppKit
 import Combine
+import CryptoKit
 import Foundation
+
+struct OwnerProfileInspection: Equatable {
+    let isValid: Bool
+    let fingerprint: String?
+}
+
+protocol OwnerProfileInspecting: AnyObject {
+    func inspect(_ url: URL) -> OwnerProfileInspection
+}
+
+final class NumpyOwnerProfileInspector: OwnerProfileInspecting {
+    private let maximumBytes = 64 * 1_024 * 1_024
+    private let expectedColumns = 96 * 96
+
+    func inspect(_ url: URL) -> OwnerProfileInspection {
+        guard let data = try? Data(
+            contentsOf: url,
+            options: [.mappedIfSafe]
+        ), data.count >= 16, data.count <= maximumBytes,
+              Array(data.prefix(6)) == [0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59] else {
+            return OwnerProfileInspection(isValid: false, fingerprint: nil)
+        }
+        let major = data[6]
+        let headerStart: Int
+        let headerLength: Int
+        if major == 1, data.count >= 10 {
+            headerStart = 10
+            headerLength = Int(data[8]) | (Int(data[9]) << 8)
+        } else if (major == 2 || major == 3), data.count >= 12 {
+            headerStart = 12
+            headerLength = Int(data[8])
+                | (Int(data[9]) << 8)
+                | (Int(data[10]) << 16)
+                | (Int(data[11]) << 24)
+        } else {
+            return OwnerProfileInspection(isValid: false, fingerprint: nil)
+        }
+        let payloadStart = headerStart + headerLength
+        guard headerLength > 0, payloadStart <= data.count,
+              let header = String(
+                  data: data[headerStart..<payloadStart],
+                  encoding: .ascii
+              ),
+              header.contains("'fortran_order': False")
+                || header.contains("\"fortran_order\": False"),
+              header.contains("'<f4'")
+                || header.contains("\"<f4\"")
+                || header.contains("'=f4'")
+                || header.contains("\"=f4\""),
+              let shape = parseShape(header),
+              shape.rows >= 2,
+              shape.columns == expectedColumns else {
+            return OwnerProfileInspection(isValid: false, fingerprint: nil)
+        }
+        let valueCount = shape.rows.multipliedReportingOverflow(by: shape.columns)
+        guard !valueCount.overflow else {
+            return OwnerProfileInspection(isValid: false, fingerprint: nil)
+        }
+        let payloadBytes = valueCount.partialValue.multipliedReportingOverflow(by: 4)
+        guard !payloadBytes.overflow,
+              payloadStart + payloadBytes.partialValue == data.count else {
+            return OwnerProfileInspection(isValid: false, fingerprint: nil)
+        }
+        var offset = payloadStart
+        while offset < data.count {
+            let bits = UInt32(data[offset])
+                | (UInt32(data[offset + 1]) << 8)
+                | (UInt32(data[offset + 2]) << 16)
+                | (UInt32(data[offset + 3]) << 24)
+            guard Float(bitPattern: bits).isFinite else {
+                return OwnerProfileInspection(isValid: false, fingerprint: nil)
+            }
+            offset += 4
+        }
+        let fingerprint = SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return OwnerProfileInspection(isValid: true, fingerprint: fingerprint)
+    }
+
+    private func parseShape(_ header: String) -> (rows: Int, columns: Int)? {
+        let pattern = #"'shape'\s*:\s*\(\s*([0-9]+)\s*,\s*([0-9]+)\s*,?\s*\)"#
+        guard let expression = try? NSRegularExpression(pattern: pattern),
+              let match = expression.firstMatch(
+                  in: header,
+                  range: NSRange(header.startIndex..., in: header)
+              ),
+              let rowsRange = Range(match.range(at: 1), in: header),
+              let columnsRange = Range(match.range(at: 2), in: header),
+              let rows = Int(header[rowsRange]),
+              let columns = Int(header[columnsRange]) else {
+            return nil
+        }
+        return (rows, columns)
+    }
+}
 
 enum SetupCoordinatorError: Error, Equatable, LocalizedError {
     case notReady([SetupCheck])
@@ -37,6 +134,7 @@ final class SetupCoordinator: ObservableObject {
     @Published private(set) var hasCompletedOnboarding: Bool
     @Published private(set) var serviceStatus: ServiceStatus?
     @Published private(set) var enrollmentLifecycle: EnrollmentLifecycle
+    @Published private(set) var recoveryStep: SetupStep?
 
     private let environment: AppEnvironment
     private let permissionCenter: PermissionCenter
@@ -48,6 +146,7 @@ final class SetupCoordinator: ObservableObject {
     private let applicationURL: URL
     private let fileManager: FileManager
     private let logOpener: (URL) -> Bool
+    private let ownerProfileInspector: OwnerProfileInspecting
 
     private var ownerProfileValid: Bool
     private var diagnosisPassed: Bool
@@ -56,6 +155,10 @@ final class SetupCoordinator: ObservableObject {
     private var enrollmentTask: Task<RuntimeResult, Error>?
     private var enrollmentGeneration: UUID?
     private var profileRevision: UInt64 = 0
+    private var currentOwnerFingerprint: String?
+    private var runtimeValidationRequired: Bool
+    private var runtimeReadinessBusy = false
+    private var runtimeReadinessWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         environment: AppEnvironment,
@@ -67,16 +170,24 @@ final class SetupCoordinator: ObservableObject {
         serviceHealthProvider: SetupServiceHealthProviding? = nil,
         applicationURL: URL? = nil,
         fileManager: FileManager = .default,
-        logOpener: ((URL) -> Bool)? = nil
+        logOpener: ((URL) -> Bool)? = nil,
+        ownerProfileInspector: OwnerProfileInspecting? = nil
     ) {
         let storedRecord = setupStore.record
-        let initialOwnerProfileValid = fileManager.fileExists(
-            atPath: environment.dataURL.appendingPathComponent("owner_face.npy").path
+        let resolvedOwnerProfileInspector =
+            ownerProfileInspector ?? NumpyOwnerProfileInspector()
+        let initialInspection = resolvedOwnerProfileInspector.inspect(
+            environment.dataURL.appendingPathComponent("owner_face.npy")
         )
         let restoredStep = Self.safeRestoredStep(
             for: storedRecord,
-            ownerProfileValid: initialOwnerProfileValid
+            ownerProfileValid: initialInspection.isValid
         )
+        let durableOwnerEvidence = storedRecord.isComplete
+            && storedRecord.requiresOwnerReverification != true
+            && initialInspection.isValid
+            && storedRecord.ownerProfileFingerprint != nil
+            && storedRecord.ownerProfileFingerprint == initialInspection.fingerprint
         self.environment = environment
         self.permissionCenter = permissionCenter
         self.setupStore = setupStore
@@ -98,6 +209,7 @@ final class SetupCoordinator: ObservableObject {
             serviceHealthProvider ?? UnavailableSetupServiceHealthProvider()
         self.fileManager = fileManager
         self.logOpener = logOpener ?? { NSWorkspace.shared.open($0) }
+        self.ownerProfileInspector = resolvedOwnerProfileInspector
         self.progress = nil
         self.currentError = nil
         self.permissionStates = [:]
@@ -105,9 +217,14 @@ final class SetupCoordinator: ObservableObject {
         self.hasCompletedOnboarding = storedRecord.isComplete
         self.serviceStatus = nil
         self.enrollmentLifecycle = .idle
-        self.ownerProfileValid = false
-        self.diagnosisPassed = false
-        self.ownerTestPassed = false
+        self.recoveryStep = storedRecord.isComplete && !durableOwnerEvidence
+            ? (initialInspection.isValid ? .safetyTest : .enrollment)
+            : nil
+        self.ownerProfileValid = initialInspection.isValid
+        self.diagnosisPassed = durableOwnerEvidence
+        self.ownerTestPassed = durableOwnerEvidence
+        self.currentOwnerFingerprint = initialInspection.fingerprint
+        self.runtimeValidationRequired = !durableOwnerEvidence
         let initialReadiness = SetupReadiness.evaluate(
             permissions: [:],
             ownerProfileValid: self.ownerProfileValid,
@@ -134,18 +251,19 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func refreshLiveReadiness() async {
+        refreshStaticOwnerProfileEvidence()
         await refreshPermissions()
-        await probeRuntimeDiagnosis()
         await refreshServiceHealthForEnable()
         updateReadiness()
-        fallBackIfRequiredPermissionWasRevoked()
+        updateCompletedRecoveryState()
     }
 
     func refreshCurrentAuthorizationStatus() async {
+        refreshStaticOwnerProfileEvidence()
         await refreshPermissions()
         await refreshServiceHealthForEnable()
         updateReadiness()
-        fallBackIfRequiredPermissionWasRevoked()
+        updateCompletedRecoveryState()
     }
 
     func refreshPermissions() async {
@@ -244,6 +362,12 @@ final class SetupCoordinator: ObservableObject {
             return
         }
         enrollmentLifecycle = .running
+        await acquireRuntimeReadinessPermit()
+        guard enrollmentLifecycle == .running else {
+            releaseRuntimeReadinessPermit()
+            enrollmentLifecycle = .idle
+            return
+        }
         profileRevision &+= 1
         currentError = nil
         progress = 0
@@ -266,6 +390,7 @@ final class SetupCoordinator: ObservableObject {
                 enrollmentGeneration = nil
             }
             enrollmentLifecycle = .idle
+            releaseRuntimeReadinessPermit()
         }
 
         do {
@@ -282,9 +407,7 @@ final class SetupCoordinator: ObservableObject {
                 updateReadiness()
                 return
             }
-            ownerProfileValid = fileManager.fileExists(
-                atPath: environment.dataURL.appendingPathComponent("owner_face.npy").path
-            )
+            refreshStaticOwnerProfileEvidence()
             guard ownerProfileValid else {
                 currentError = "录入结束但未找到本人人脸资料，请重新录入。"
                 updateReadiness()
@@ -314,46 +437,61 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func runDiagnosis() async {
+        await acquireRuntimeReadinessPermit()
+        defer { releaseRuntimeReadinessPermit() }
         await probeRuntimeDiagnosis()
+        await refreshServiceAfterDiagnosis()
+        updateReadiness()
+    }
+
+    private func refreshServiceAfterDiagnosis() async {
         if environment.mode == .release {
             await installAndRefreshReleaseService()
         } else {
             serviceHealthy = await serviceHealthProvider.isServiceHealthy()
         }
-        updateReadiness()
     }
 
     private func probeRuntimeDiagnosis() async {
         currentError = nil
         diagnosisPassed = false
-        ownerTestPassed = false
-        ownerProfileValid = false
+        runtimeValidationRequired = true
+        refreshStaticOwnerProfileEvidence()
         do {
             let result = try await runtimeRunner.run(command: .diagnose) { _ in }
             diagnosisPassed = result.exitCode == 0
                 && result.events.contains {
                     $0.event == "diagnosis_complete" && $0.status == "success"
                 }
-            ownerProfileValid = diagnosisPassed
+            if let templateCheck = result.events.last(where: {
+                $0.event == "diagnosis_check" && $0.check == "template"
+            }) {
+                ownerProfileValid = templateCheck.status == "success"
+                if !ownerProfileValid {
+                    currentOwnerFingerprint = nil
+                    ownerTestPassed = false
+                }
+            }
             if !handleExitCode(result.exitCode) {
                 diagnosisPassed = false
-                ownerProfileValid = false
             }
         } catch {
             currentError = localizedRuntimeError(error)
             diagnosisPassed = false
-            ownerProfileValid = false
         }
         updateReadiness()
     }
 
     @discardableResult
     func runSafetyTest() async -> Bool {
-        await runDiagnosis()
+        await acquireRuntimeReadinessPermit()
+        defer { releaseRuntimeReadinessPermit() }
+        await probeRuntimeDiagnosis()
+        await refreshServiceAfterDiagnosis()
         guard diagnosisPassed else {
             return false
         }
-        await verifyOwnerWithoutLocking()
+        await verifyOwnerWithoutLockingInsidePermit()
         updateReadiness()
         guard readiness.canEnableProtection else {
             if currentError == nil {
@@ -362,7 +500,13 @@ final class SetupCoordinator: ObservableObject {
             return false
         }
         do {
-            try persistStep(.completion, completing: .safetyTest)
+            runtimeValidationRequired = false
+            recoveryStep = nil
+            if hasCompletedOnboarding {
+                try persistCompletedEvidencePreservingHistory()
+            } else {
+                try persistStep(.completion, completing: .safetyTest)
+            }
             currentError = nil
             return true
         } catch {
@@ -372,6 +516,18 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func verifyOwnerWithoutLocking() async {
+        guard enrollmentTask == nil, enrollmentLifecycle == .idle else {
+            ownerTestPassed = false
+            currentError = "本人录入正在进行，请完成或取消录入后再测试。"
+            updateReadiness()
+            return
+        }
+        await acquireRuntimeReadinessPermit()
+        defer { releaseRuntimeReadinessPermit() }
+        await verifyOwnerWithoutLockingInsidePermit()
+    }
+
+    private func verifyOwnerWithoutLockingInsidePermit() async {
         guard enrollmentTask == nil else {
             ownerTestPassed = false
             currentError = "本人录入正在进行，请完成或取消录入后再测试。"
@@ -396,6 +552,9 @@ final class SetupCoordinator: ObservableObject {
             if !handleExitCode(result.exitCode) {
                 ownerTestPassed = false
             }
+            if ownerTestPassed, diagnosisPassed, ownerProfileValid {
+                runtimeValidationRequired = false
+            }
         } catch {
             guard verificationRevision == profileRevision else {
                 updateReadiness()
@@ -413,11 +572,13 @@ final class SetupCoordinator: ObservableObject {
             currentError = "本人录入仍在结束处理中，请稍后再试。"
             throw error
         }
+        await acquireRuntimeReadinessPermit()
+        defer { releaseRuntimeReadinessPermit() }
         currentError = nil
         await refreshPermissions()
         await probeRuntimeDiagnosis()
         if diagnosisPassed {
-            await verifyOwnerWithoutLocking()
+            await verifyOwnerWithoutLockingInsidePermit()
         }
         await refreshServiceHealthForEnable()
         await refreshPermissions()
@@ -445,14 +606,20 @@ final class SetupCoordinator: ObservableObject {
         let completedRecord = OnboardingRecord(
             currentStep: .completion,
             completedSteps: SetupStep.allCases,
-            completedAt: ISO8601DateFormatter().string(from: Date()),
-            appVersion: appVersion
+            completedAt: previousRecord.isComplete
+                ? previousRecord.completedAt
+                : ISO8601DateFormatter().string(from: Date()),
+            appVersion: appVersion,
+            ownerProfileFingerprint: currentOwnerFingerprint,
+            requiresOwnerReverification: false
         )
         do {
             try setupStore.save(completedRecord)
             _ = try localStore.writeControl(enabled: true)
             currentStep = completedRecord.currentStep
             hasCompletedOnboarding = completedRecord.isComplete
+            recoveryStep = nil
+            runtimeValidationRequired = false
             currentError = nil
         } catch {
             try? setupStore.save(previousRecord)
@@ -536,7 +703,9 @@ final class SetupCoordinator: ObservableObject {
             currentStep: .safetyTest,
             completedSteps: completedSteps,
             completedAt: nil,
-            appVersion: appVersion
+            appVersion: appVersion,
+            ownerProfileFingerprint: currentOwnerFingerprint,
+            requiresOwnerReverification: true
         )
         try setupStore.save(record)
         currentStep = record.currentStep
@@ -555,11 +724,61 @@ final class SetupCoordinator: ObservableObject {
             currentStep: step,
             completedSteps: completedSteps,
             completedAt: nil,
-            appVersion: appVersion
+            appVersion: appVersion,
+            ownerProfileFingerprint: currentOwnerFingerprint,
+            requiresOwnerReverification: true
         )
         try setupStore.save(record)
         currentStep = step
         hasCompletedOnboarding = false
+    }
+
+    private func persistCompletedEvidencePreservingHistory() throws {
+        let previous = setupStore.record
+        let record = OnboardingRecord(
+            currentStep: .completion,
+            completedSteps: previous.completedSteps,
+            completedAt: previous.completedAt,
+            appVersion: appVersion,
+            ownerProfileFingerprint: currentOwnerFingerprint,
+            requiresOwnerReverification: false
+        )
+        try setupStore.save(record)
+        currentStep = .completion
+        hasCompletedOnboarding = true
+    }
+
+    private func refreshStaticOwnerProfileEvidence() {
+        let inspection = ownerProfileInspector.inspect(
+            environment.dataURL.appendingPathComponent("owner_face.npy")
+        )
+        currentOwnerFingerprint = inspection.fingerprint
+        ownerProfileValid = inspection.isValid
+        guard inspection.isValid else {
+            diagnosisPassed = false
+            ownerTestPassed = false
+            runtimeValidationRequired = true
+            if hasCompletedOnboarding {
+                recoveryStep = .enrollment
+            }
+            return
+        }
+        let record = setupStore.record
+        let fingerprintMatches = record.ownerProfileFingerprint != nil
+            && record.ownerProfileFingerprint == inspection.fingerprint
+        if record.requiresOwnerReverification == true || !fingerprintMatches {
+            ownerTestPassed = false
+            runtimeValidationRequired = true
+            if hasCompletedOnboarding {
+                recoveryStep = .safetyTest
+            }
+            return
+        }
+        if record.isComplete && !runtimeValidationRequired {
+            diagnosisPassed = true
+            ownerTestPassed = true
+            recoveryStep = nil
+        }
     }
 
     private func preparationIssues() -> [String] {
@@ -694,6 +913,20 @@ final class SetupCoordinator: ObservableObject {
 
     private func fallBackForFailedEnable(_ missingChecks: [SetupCheck]) {
         let missing = Set(missingChecks)
+        if hasCompletedOnboarding {
+            if missing.contains(.cameraPermission)
+                || missing.contains(.screenRecordingPermission) {
+                invalidateDurableOwnerEvidenceAfterPermissionRevocation()
+                recoveryStep = .permissions
+            } else if missing.contains(.ownerProfile) {
+                recoveryStep = .enrollment
+            } else if missing.contains(.diagnosis) || missing.contains(.ownerTest) {
+                recoveryStep = .safetyTest
+            } else {
+                recoveryStep = .completion
+            }
+            return
+        }
         do {
             if missing.contains(.cameraPermission)
                 || missing.contains(.screenRecordingPermission) {
@@ -708,20 +941,49 @@ final class SetupCoordinator: ObservableObject {
         }
     }
 
-    private func fallBackIfRequiredPermissionWasRevoked() {
-        guard currentStep == .completion else {
+    private func updateCompletedRecoveryState() {
+        guard hasCompletedOnboarding else {
             return
         }
-        let requiredPermissionChecks: [SetupCheck] = [
-            .cameraPermission,
-        ]
-        let missing = requiredPermissionChecks.filter {
-            readiness.checks[$0] != true
-        }
-        guard !missing.isEmpty else {
+        guard readiness.checks[.cameraPermission] == true else {
+            invalidateDurableOwnerEvidenceAfterPermissionRevocation()
+            recoveryStep = .permissions
             return
         }
-        fallBackForFailedEnable(missing)
+        if !ownerProfileValid {
+            recoveryStep = .enrollment
+        } else if setupStore.record.requiresOwnerReverification == true
+                    || !ownerTestPassed
+                    || !diagnosisPassed {
+            recoveryStep = .safetyTest
+        } else if !serviceHealthy {
+            recoveryStep = .completion
+        } else {
+            recoveryStep = nil
+        }
+    }
+
+    private func invalidateDurableOwnerEvidenceAfterPermissionRevocation() {
+        ownerTestPassed = false
+        runtimeValidationRequired = true
+        let previous = setupStore.record
+        guard previous.isComplete,
+              previous.requiresOwnerReverification != true else {
+            return
+        }
+        let updated = OnboardingRecord(
+            currentStep: previous.currentStep,
+            completedSteps: previous.completedSteps,
+            completedAt: previous.completedAt,
+            appVersion: previous.appVersion,
+            ownerProfileFingerprint: previous.ownerProfileFingerprint,
+            requiresOwnerReverification: true
+        )
+        do {
+            try setupStore.save(updated)
+        } catch {
+            currentError = "无法保存安全恢复状态，请稍后重试。"
+        }
     }
 
     private func recordDiagnosticError(_ error: Error, operation: String) {
@@ -748,6 +1010,24 @@ final class SetupCoordinator: ObservableObject {
         } catch {
             // Diagnostics are best-effort; customer-facing errors stay sanitized.
         }
+    }
+
+    private func acquireRuntimeReadinessPermit() async {
+        if !runtimeReadinessBusy {
+            runtimeReadinessBusy = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            runtimeReadinessWaiters.append(continuation)
+        }
+    }
+
+    private func releaseRuntimeReadinessPermit() {
+        guard !runtimeReadinessWaiters.isEmpty else {
+            runtimeReadinessBusy = false
+            return
+        }
+        runtimeReadinessWaiters.removeFirst().resume()
     }
 
     private func updateReadiness() {

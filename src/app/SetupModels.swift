@@ -16,14 +16,17 @@ enum EnrollmentLifecycle: Equatable {
 
 enum RootDestination: Equatable {
     case onboarding
-    case main
+    case mainReady
+    case mainRecovery
 
     static func resolve(
         hasCompletedOnboarding: Bool,
         isLiveReady: Bool
     ) -> RootDestination {
-        _ = isLiveReady
-        return hasCompletedOnboarding ? .main : .onboarding
+        guard hasCompletedOnboarding else {
+            return .onboarding
+        }
+        return isLiveReady ? .mainReady : .mainRecovery
     }
 }
 
@@ -58,19 +61,25 @@ struct OnboardingRecord: Codable, Equatable {
     var completedSteps: [SetupStep]
     var completedAt: String?
     var appVersion: String
+    var ownerProfileFingerprint: String?
+    var requiresOwnerReverification: Bool?
 
     init(
         schemaVersion: Int = 1,
         currentStep: SetupStep,
         completedSteps: [SetupStep],
         completedAt: String?,
-        appVersion: String
+        appVersion: String,
+        ownerProfileFingerprint: String? = nil,
+        requiresOwnerReverification: Bool? = false
     ) {
         self.schemaVersion = schemaVersion
         self.currentStep = currentStep
         self.completedSteps = completedSteps
         self.completedAt = completedAt
         self.appVersion = appVersion
+        self.ownerProfileFingerprint = ownerProfileFingerprint
+        self.requiresOwnerReverification = requiresOwnerReverification
     }
 
     static let incomplete = OnboardingRecord(

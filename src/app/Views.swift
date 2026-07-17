@@ -38,7 +38,7 @@ struct RootView: View {
             if RootDestination.resolve(
                 hasCompletedOnboarding: setupCoordinator.hasCompletedOnboarding,
                 isLiveReady: setupCoordinator.isLiveReady
-            ) == .main {
+            ) != .onboarding {
                 mainInterface
             } else {
                 OnboardingView(

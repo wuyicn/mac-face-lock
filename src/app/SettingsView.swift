@@ -17,11 +17,31 @@ struct SettingsView: View {
                     .font(.system(size: 30, weight: .bold))
 
                 if !setupCoordinator.isLiveReady {
-                    Label(
-                        "首次设置已完成，但当前安全状态尚未全部确认。修复入口保持可用，恢复保护前会重新验证全部门槛。",
-                        systemImage: "exclamationmark.shield.fill"
-                    )
-                    .foregroundStyle(Color(nsColor: .systemOrange))
+                    VStack(alignment: .leading, spacing: 12) {
+                        Label(
+                            recoveryMessage,
+                            systemImage: "exclamationmark.shield.fill"
+                        )
+                        .foregroundStyle(Color(nsColor: .systemOrange))
+
+                        if setupCoordinator.recoveryStep == .safetyTest {
+                            Button("重新运行安全测试") {
+                                protectionAction = .working("正在重新确认当前安全状态…")
+                                Task {
+                                    if await setupCoordinator.runSafetyTest() {
+                                        protectionAction = .success("当前安全状态已重新确认")
+                                    } else {
+                                        protectionAction = .failure(
+                                            setupCoordinator.currentError
+                                                ?? "安全测试未全部通过"
+                                        )
+                                    }
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(isWorking(protectionAction))
+                        }
+                    }
                     .padding(16)
                     .background(
                         Color(nsColor: .systemOrange).opacity(0.10),
@@ -340,6 +360,21 @@ struct SettingsView: View {
             return "运行异常，需要诊断"
         case .needsRepair:
             return "应用位置已变化，需要重新安装"
+        }
+    }
+
+    private var recoveryMessage: String {
+        switch setupCoordinator.recoveryStep {
+        case .permissions:
+            return "首次设置记录仍然保留。请恢复控制中心摄像头权限，随后重新确认本人。"
+        case .enrollment:
+            return "首次设置记录仍然保留，但当前本人模板无效，请重新录入本人。"
+        case .safetyTest:
+            return "首次设置记录仍然保留。请重新运行安全测试确认本人和当前环境。"
+        case .completion:
+            return "首次设置记录仍然保留。后台服务需要诊断或修复。"
+        case .preparation, .none:
+            return "首次设置已完成，但当前安全状态尚未全部确认。恢复保护前会重新验证全部门槛。"
         }
     }
 

@@ -255,8 +255,15 @@ struct SetupStateTests {
             RootDestination.resolve(
                 hasCompletedOnboarding: true,
                 isLiveReady: false
-            ) == .main,
+            ) == .mainRecovery,
             "completed install lost the settings recovery surface when health was false"
+        )
+        try require(
+            RootDestination.resolve(
+                hasCompletedOnboarding: true,
+                isLiveReady: true
+            ) == .mainReady,
+            "healthy completed install did not resolve to the ready main state"
         )
         try require(
             RootDestination.resolve(
