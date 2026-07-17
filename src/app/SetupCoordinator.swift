@@ -47,6 +47,7 @@ final class SetupCoordinator: ObservableObject {
     private var serviceHealthy = false
     private var enrollmentTask: Task<RuntimeResult, Error>?
     private var enrollmentGeneration: UUID?
+    private var profileRevision: UInt64 = 0
 
     init(
         environment: AppEnvironment,
@@ -91,6 +92,7 @@ final class SetupCoordinator: ObservableObject {
         guard enrollmentTask == nil else {
             return
         }
+        profileRevision &+= 1
         currentError = nil
         progress = 0
         ownerTestPassed = false
@@ -150,7 +152,10 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func cancelEnrollment() {
-        enrollmentTask?.cancel()
+        enrollmentGeneration = nil
+        progress = nil
+        let task = enrollmentTask
+        task?.cancel()
     }
 
     func runDiagnosis() async {
@@ -176,8 +181,13 @@ final class SetupCoordinator: ObservableObject {
     func verifyOwnerWithoutLocking() async {
         currentError = nil
         ownerTestPassed = false
+        let verificationRevision = profileRevision
         do {
             let result = try await runtimeRunner.run(command: .verifyOwner) { _ in }
+            guard verificationRevision == profileRevision else {
+                updateReadiness()
+                return
+            }
             ownerTestPassed = result.exitCode == 0
                 && result.events.contains {
                     $0.event == "owner_verification_complete"
@@ -188,6 +198,10 @@ final class SetupCoordinator: ObservableObject {
                 ownerTestPassed = false
             }
         } catch {
+            guard verificationRevision == profileRevision else {
+                updateReadiness()
+                return
+            }
             currentError = localizedRuntimeError(error)
             ownerTestPassed = false
         }

@@ -40,19 +40,6 @@ enum RuntimeCommand: String, CaseIterable, Hashable {
             )
         }
     }
-
-    fileprivate var successTerminalEvent: String {
-        switch self {
-        case .agent:
-            return "agent_stopped"
-        case .enroll:
-            return "enrollment_complete"
-        case .diagnose:
-            return "diagnosis_complete"
-        case .verifyOwner:
-            return "owner_verification_complete"
-        }
-    }
 }
 
 struct RuntimeEvent: Decodable, Equatable {
@@ -65,6 +52,7 @@ struct RuntimeEvent: Decodable, Equatable {
     let check: String?
     let failedChecks: [String]?
     let decision: String?
+    let failureKind: String?
 
     init(
         schemaVersion: Int,
@@ -75,7 +63,8 @@ struct RuntimeEvent: Decodable, Equatable {
         requiredSamples: Int? = nil,
         check: String? = nil,
         failedChecks: [String]? = nil,
-        decision: String? = nil
+        decision: String? = nil,
+        failureKind: String? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.event = event
@@ -86,6 +75,7 @@ struct RuntimeEvent: Decodable, Equatable {
         self.check = check
         self.failedChecks = failedChecks
         self.decision = decision
+        self.failureKind = failureKind
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -98,6 +88,7 @@ struct RuntimeEvent: Decodable, Equatable {
         case check
         case failedChecks = "failed_checks"
         case decision
+        case failureKind = "failure_kind"
     }
 }
 
@@ -108,10 +99,91 @@ struct RuntimeResult: Equatable {
     let stderrTruncated: Bool
 }
 
+enum RuntimeTerminalCompatibility {
+    static func accepts(
+        command: RuntimeCommand,
+        terminalEvent: RuntimeEvent,
+        events: [RuntimeEvent],
+        exitCode: Int32
+    ) -> Bool {
+        switch command {
+        case .agent:
+            switch (terminalEvent.event, terminalEvent.status, exitCode) {
+            case ("agent_stopped", "success", 0),
+                 ("camera_unavailable", "error", 10),
+                 ("runtime_failure", "error", 20):
+                return true
+            default:
+                return false
+            }
+        case .enroll:
+            switch (terminalEvent.event, terminalEvent.status, exitCode) {
+            case ("enrollment_complete", "success", 0),
+                 ("camera_unavailable", "error", 10),
+                 ("runtime_failure", "error", 20):
+                return true
+            default:
+                return false
+            }
+        case .diagnose:
+            switch (terminalEvent.event, terminalEvent.status, exitCode) {
+            case ("camera_unavailable", "error", 10),
+                 ("runtime_failure", "error", 20),
+                 ("diagnosis_complete", "success", 0):
+                return true
+            case ("diagnosis_complete", "error", _):
+                return exitCode == diagnosisFailureExitCode(
+                    terminalEvent: terminalEvent,
+                    events: events
+                )
+            default:
+                return false
+            }
+        case .verifyOwner:
+            switch (terminalEvent.event, terminalEvent.status, exitCode) {
+            case ("owner_verification_complete", "success", 0),
+                 ("owner_profile_invalid", "error", 11),
+                 ("owner_verification_complete", "error", 12),
+                 ("camera_unavailable", "error", 10),
+                 ("runtime_failure", "error", 20):
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    private static func diagnosisFailureExitCode(
+        terminalEvent: RuntimeEvent,
+        events: [RuntimeEvent]
+    ) -> Int32? {
+        let failedChecks = Set(terminalEvent.failedChecks ?? [])
+        guard !failedChecks.isEmpty else {
+            return nil
+        }
+        let hasRuntimeFailure = events.contains {
+            $0.event == "diagnosis_check"
+                && $0.status != "success"
+                && $0.failureKind == "runtime"
+        }
+        if hasRuntimeFailure {
+            return 20
+        }
+        if failedChecks.contains("camera") {
+            return 10
+        }
+        if failedChecks.contains("template") {
+            return 11
+        }
+        return 20
+    }
+}
+
 enum RuntimeCommandRunnerError: Error, Equatable, LocalizedError {
     case launchFailed
     case malformedEvent
     case outputLineTooLong
+    case eventBudgetExceeded
     case unsupportedSchemaVersion(Int)
     case unexpectedEvent(String)
     case duplicateTerminalEvent
@@ -126,6 +198,8 @@ enum RuntimeCommandRunnerError: Error, Equatable, LocalizedError {
             return "无法解析运行组件返回的进度，请重新运行诊断。"
         case .outputLineTooLong:
             return "运行组件返回的数据过长，已安全停止；请重新运行诊断。"
+        case .eventBudgetExceeded:
+            return "运行组件返回的事件数量过多，已安全停止；请重新运行诊断。"
         case .unsupportedSchemaVersion:
             return "运行组件版本与应用不兼容，请更新或重新安装应用。"
         case .unexpectedEvent, .duplicateTerminalEvent, .missingTerminalEvent,
@@ -190,6 +264,8 @@ private final class RuntimeProcessSession {
 
     private static let maximumLineBytes = 256 * 1_024
     private static let maximumStderrBytes = 1 * 1_024 * 1_024
+    private static let maximumRetainedEventCount = 1_024
+    private static let maximumRetainedEventBytes = 2 * 1_024 * 1_024
 
     private let process: Process
     private let command: RuntimeCommand
@@ -204,6 +280,7 @@ private final class RuntimeProcessSession {
     private var retainedStderr = Data()
     private var stderrTruncated = false
     private var events: [RuntimeEvent] = []
+    private var retainedEventBytes = 0
     private var terminalEvent: RuntimeEvent?
     private var terminalError: Error?
     private var exitCode: Int32?
@@ -366,6 +443,11 @@ private final class RuntimeProcessSession {
             terminalError = RuntimeCommandRunnerError.unexpectedEvent(event.event)
             return
         }
+        guard events.count < Self.maximumRetainedEventCount,
+              retainedEventBytes <= Self.maximumRetainedEventBytes - line.count else {
+            terminalError = RuntimeCommandRunnerError.eventBudgetExceeded
+            return
+        }
         if command.terminalEvents.contains(event.event) {
             guard terminalEvent == nil else {
                 terminalError = RuntimeCommandRunnerError.duplicateTerminalEvent
@@ -377,6 +459,7 @@ private final class RuntimeProcessSession {
             return
         }
         events.append(event)
+        retainedEventBytes += line.count
         deliveredEvents.append(event)
     }
 
@@ -467,15 +550,12 @@ private final class RuntimeProcessSession {
                 result: .failure(RuntimeCommandRunnerError.missingTerminalEvent)
             )
         }
-        let hasConsistentTerminalStatus: Bool
-        if exitCode == 0 {
-            hasConsistentTerminalStatus =
-                terminalEvent.event == command.successTerminalEvent
-                && terminalEvent.status == "success"
-        } else {
-            hasConsistentTerminalStatus = terminalEvent.status == "error"
-        }
-        guard hasConsistentTerminalStatus else {
+        guard RuntimeTerminalCompatibility.accepts(
+            command: command,
+            terminalEvent: terminalEvent,
+            events: events,
+            exitCode: exitCode
+        ) else {
             return Completion(
                 continuation: activeContinuation,
                 result: .failure(RuntimeCommandRunnerError.inconsistentSuccessfulExit)

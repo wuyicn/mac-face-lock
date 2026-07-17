@@ -64,6 +64,8 @@ struct RuntimeCommandRunnerTests {
         try await testUnsupportedSchemaAndUnknownEventAreRejected()
         try await testContradictoryTerminalStatusIsRejected()
         try await testLineAndStderrBuffersAreBounded()
+        try await testCommandSpecificTerminalCompatibility()
+        try await testTotalRetainedEventsAreBoundedAndTerminateChild()
         try await testNonzeroExitIsReturnedForRepairMapping()
         try await testCancellationTerminatesChildProcess()
         print("Runtime command runner tests passed")
@@ -208,6 +210,240 @@ struct RuntimeCommandRunnerTests {
         ) { _ in }
         try require(result.stderr.utf8.count <= 1_048_576, "stderr exceeded the 1 MiB limit")
         try require(result.stderrTruncated, "stderr truncation was not surfaced")
+    }
+
+    private static func testTotalRetainedEventsAreBoundedAndTerminateChild() async throws {
+        let fixture = try RuntimeFixture(script: """
+        #!/usr/bin/env python3
+        import signal
+        import sys
+        import time
+
+        marker = r"__MARKER__"
+
+        def terminate(_signal, _frame):
+            with open(marker, "w", encoding="utf-8") as output:
+                output.write("terminated")
+            raise SystemExit(20)
+
+        signal.signal(signal.SIGTERM, terminate)
+        line = '{"schema_version":1,"event":"diagnosis_check","status":"success","message":"ok","check":"camera"}'
+        for _ in range(1100):
+            print(line)
+        sys.stdout.flush()
+        time.sleep(2)
+        print('{"schema_version":1,"event":"diagnosis_complete","status":"success","message":"done"}')
+        """)
+        defer { fixture.remove() }
+        let markerURL = fixture.root.appendingPathComponent("event-overflow-terminated")
+        let executableURL = fixture.environment.runtimeExecutableURL
+        var script = try String(contentsOf: executableURL, encoding: .utf8)
+        script = script.replacingOccurrences(of: "__MARKER__", with: markerURL.path)
+        try Data(script.utf8).write(to: executableURL)
+
+        do {
+            _ = try await RuntimeCommandRunner(environment: fixture.environment).run(
+                command: .diagnose
+            ) { _ in }
+            throw TestFailure.assertion("unbounded runtime event stream was accepted")
+        } catch let error as RuntimeCommandRunnerError {
+            try require(
+                error.errorDescription?.contains("数量过多") == true,
+                "event overflow returned the wrong protocol error: \(error)"
+            )
+        }
+
+        for _ in 0..<40 where !FileManager.default.fileExists(atPath: markerURL.path) {
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        try require(
+            FileManager.default.fileExists(atPath: markerURL.path),
+            "event overflow did not terminate the runtime child process"
+        )
+    }
+
+    private static func testCommandSpecificTerminalCompatibility() async throws {
+        let accepted: [(RuntimeCommand, [String], Int32)] = [
+            (
+                .diagnose,
+                [
+                    #"{"schema_version":1,"event":"diagnosis_check","status":"error","message":"camera","check":"camera"}"#,
+                    #"{"schema_version":1,"event":"diagnosis_complete","status":"error","message":"failed","failed_checks":["camera"]}"#,
+                ],
+                10
+            ),
+            (
+                .diagnose,
+                [
+                    #"{"schema_version":1,"event":"diagnosis_check","status":"error","message":"template","check":"template"}"#,
+                    #"{"schema_version":1,"event":"diagnosis_complete","status":"error","message":"failed","failed_checks":["template"]}"#,
+                ],
+                11
+            ),
+            (
+                .diagnose,
+                [
+                    #"{"schema_version":1,"event":"diagnosis_check","status":"error","message":"runtime","check":"config","failure_kind":"runtime"}"#,
+                    #"{"schema_version":1,"event":"diagnosis_complete","status":"error","message":"failed","failed_checks":["config"]}"#,
+                ],
+                20
+            ),
+            (
+                .diagnose,
+                [#"{"schema_version":1,"event":"camera_unavailable","status":"error","message":"camera"}"#],
+                10
+            ),
+            (
+                .diagnose,
+                [#"{"schema_version":1,"event":"runtime_failure","status":"error","message":"runtime"}"#],
+                20
+            ),
+            (
+                .verifyOwner,
+                [#"{"schema_version":1,"event":"owner_verification_complete","status":"success","message":"owner","decision":"owner"}"#],
+                0
+            ),
+            (
+                .verifyOwner,
+                [#"{"schema_version":1,"event":"owner_profile_invalid","status":"error","message":"invalid"}"#],
+                11
+            ),
+            (
+                .verifyOwner,
+                [#"{"schema_version":1,"event":"owner_verification_complete","status":"error","message":"not owner","decision":"stranger"}"#],
+                12
+            ),
+            (
+                .verifyOwner,
+                [#"{"schema_version":1,"event":"camera_unavailable","status":"error","message":"camera"}"#],
+                10
+            ),
+            (
+                .verifyOwner,
+                [#"{"schema_version":1,"event":"runtime_failure","status":"error","message":"runtime"}"#],
+                20
+            ),
+            (
+                .enroll,
+                [#"{"schema_version":1,"event":"enrollment_complete","status":"success","message":"done"}"#],
+                0
+            ),
+            (
+                .enroll,
+                [#"{"schema_version":1,"event":"camera_unavailable","status":"error","message":"camera"}"#],
+                10
+            ),
+            (
+                .enroll,
+                [#"{"schema_version":1,"event":"runtime_failure","status":"error","message":"runtime"}"#],
+                20
+            ),
+        ]
+        for (command, lines, exitCode) in accepted {
+            let events = try lines.map {
+                try JSONDecoder().decode(RuntimeEvent.self, from: Data($0.utf8))
+            }
+            try require(
+                RuntimeTerminalCompatibility.accepts(
+                    command: command,
+                    terminalEvent: events[events.count - 1],
+                    events: events,
+                    exitCode: exitCode
+                ),
+                "\(command.rawValue) rejected a valid terminal/exit pairing"
+            )
+        }
+
+        let rejected: [(RuntimeCommand, [String], Int32)] = [
+            (
+                .diagnose,
+                [
+                    #"{"schema_version":1,"event":"diagnosis_check","status":"error","message":"camera","check":"camera"}"#,
+                    #"{"schema_version":1,"event":"diagnosis_complete","status":"error","message":"failed","failed_checks":["camera"]}"#,
+                ],
+                11
+            ),
+            (
+                .diagnose,
+                [
+                    #"{"schema_version":1,"event":"diagnosis_check","status":"error","message":"template","check":"template"}"#,
+                    #"{"schema_version":1,"event":"diagnosis_complete","status":"error","message":"failed","failed_checks":["template"]}"#,
+                ],
+                10
+            ),
+            (
+                .diagnose,
+                [
+                    #"{"schema_version":1,"event":"diagnosis_check","status":"error","message":"runtime","check":"config","failure_kind":"runtime"}"#,
+                    #"{"schema_version":1,"event":"diagnosis_complete","status":"error","message":"failed","failed_checks":["config"]}"#,
+                ],
+                10
+            ),
+            (
+                .diagnose,
+                [#"{"schema_version":1,"event":"camera_unavailable","status":"error","message":"camera"}"#],
+                20
+            ),
+            (
+                .diagnose,
+                [#"{"schema_version":1,"event":"runtime_failure","status":"error","message":"runtime"}"#],
+                10
+            ),
+            (
+                .verifyOwner,
+                [#"{"schema_version":1,"event":"owner_verification_complete","status":"success","message":"owner","decision":"owner"}"#],
+                12
+            ),
+            (
+                .verifyOwner,
+                [#"{"schema_version":1,"event":"owner_profile_invalid","status":"error","message":"invalid"}"#],
+                12
+            ),
+            (
+                .verifyOwner,
+                [#"{"schema_version":1,"event":"owner_verification_complete","status":"error","message":"not owner","decision":"stranger"}"#],
+                11
+            ),
+            (
+                .verifyOwner,
+                [#"{"schema_version":1,"event":"camera_unavailable","status":"error","message":"camera"}"#],
+                20
+            ),
+            (
+                .verifyOwner,
+                [#"{"schema_version":1,"event":"runtime_failure","status":"error","message":"runtime"}"#],
+                10
+            ),
+            (
+                .enroll,
+                [#"{"schema_version":1,"event":"camera_unavailable","status":"error","message":"camera"}"#],
+                20
+            ),
+            (
+                .enroll,
+                [#"{"schema_version":1,"event":"runtime_failure","status":"error","message":"runtime"}"#],
+                10
+            ),
+            (
+                .enroll,
+                [#"{"schema_version":1,"event":"enrollment_complete","status":"success","message":"done"}"#],
+                10
+            ),
+        ]
+        for (command, lines, exitCode) in rejected {
+            let events = try lines.map {
+                try JSONDecoder().decode(RuntimeEvent.self, from: Data($0.utf8))
+            }
+            try require(
+                !RuntimeTerminalCompatibility.accepts(
+                    command: command,
+                    terminalEvent: events[events.count - 1],
+                    events: events,
+                    exitCode: exitCode
+                ),
+                "\(command.rawValue) accepted misleading terminal/exit pairing at \(exitCode)"
+            )
+        }
     }
 
     private static func testNonzeroExitIsReturnedForRepairMapping() async throws {

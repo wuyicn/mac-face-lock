@@ -116,6 +116,112 @@ private final class LateEventCancellationRunner: RuntimeCommandRunning {
     }
 }
 
+private final class VerificationEnrollmentOverlapRunner: RuntimeCommandRunning {
+    private let replacementURL: URL
+    private var verificationContinuation: CheckedContinuation<Void, Never>?
+    private(set) var verificationStarted = false
+
+    init(replacementURL: URL) {
+        self.replacementURL = replacementURL
+    }
+
+    func run(
+        command: RuntimeCommand,
+        onEvent: @escaping (RuntimeEvent) -> Void
+    ) async throws -> RuntimeResult {
+        switch command {
+        case .verifyOwner:
+            verificationStarted = true
+            await withCheckedContinuation { continuation in
+                verificationContinuation = continuation
+            }
+            let terminal = RuntimeEvent(
+                schemaVersion: 1,
+                event: "owner_verification_complete",
+                status: "success",
+                message: "owner",
+                decision: "owner"
+            )
+            return RuntimeResult(
+                exitCode: 0,
+                events: [terminal],
+                stderr: "",
+                stderrTruncated: false
+            )
+        case .enroll:
+            try Data("replacement-template".utf8).write(to: replacementURL)
+            let terminal = RuntimeEvent(
+                schemaVersion: 1,
+                event: "enrollment_complete",
+                status: "success",
+                message: "complete"
+            )
+            onEvent(terminal)
+            return RuntimeResult(
+                exitCode: 0,
+                events: [terminal],
+                stderr: "",
+                stderrTruncated: false
+            )
+        default:
+            return RuntimeResult(
+                exitCode: 20,
+                events: [],
+                stderr: "",
+                stderrTruncated: false
+            )
+        }
+    }
+
+    func completeVerification() {
+        verificationContinuation?.resume()
+        verificationContinuation = nil
+    }
+}
+
+private final class CancellationEOFWindowRunner: RuntimeCommandRunning {
+    private var eofContinuation: CheckedContinuation<Void, Never>?
+    private(set) var started = false
+
+    func run(
+        command: RuntimeCommand,
+        onEvent: @escaping (RuntimeEvent) -> Void
+    ) async throws -> RuntimeResult {
+        started = true
+        return try await withTaskCancellationHandler(
+            operation: {
+                await withCheckedContinuation { continuation in
+                    eofContinuation = continuation
+                }
+                try Task.checkCancellation()
+                return RuntimeResult(
+                    exitCode: 0,
+                    events: [],
+                    stderr: "",
+                    stderrTruncated: false
+                )
+            },
+            onCancel: {
+                onEvent(
+                    RuntimeEvent(
+                        schemaVersion: 1,
+                        event: "enrollment_progress",
+                        status: "success",
+                        message: "during termination",
+                        capturedSamples: 7,
+                        requiredSamples: 8
+                    )
+                )
+            }
+        )
+    }
+
+    func deliverEOF() {
+        eofContinuation?.resume()
+        eofContinuation = nil
+    }
+}
+
 private struct CoordinatorFixture {
     let root: URL
     let localStore: LocalJSONStore
@@ -154,6 +260,8 @@ struct SetupCoordinatorTests {
         try await testFailedReenrollmentPreservesExistingOwnerProfile()
         try await testSuccessfulEnrollmentRequiresSuccessfulTerminalStatus()
         try await testCancellationIgnoresLateProgress()
+        try await testCancellationInvalidatesCallbacksBeforeRuntimeEOF()
+        try await testVerificationCannotPassAfterEnrollmentReplacesProfile()
         try await testEnableProtectionRefusesWhenAnyGateIsFalse()
         print("Setup coordinator tests passed")
     }
@@ -371,6 +479,38 @@ struct SetupCoordinatorTests {
         )
     }
 
+    private static func testVerificationCannotPassAfterEnrollmentReplacesProfile() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let profileURL = fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        try Data("original-template".utf8).write(to: profileURL)
+        let runner = VerificationEnrollmentOverlapRunner(replacementURL: profileURL)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+        )
+        let verification = Task {
+            await coordinator.verifyOwnerWithoutLocking()
+        }
+        for _ in 0..<40 where !runner.verificationStarted {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try require(runner.verificationStarted, "owner verification did not start")
+
+        await coordinator.startEnrollment()
+        runner.completeVerification()
+        await verification.value
+
+        try require(
+            coordinator.checks[.ownerTest] == false,
+            "verification for the replaced profile incorrectly passed owner readiness"
+        )
+    }
+
     private static func testCancellationIgnoresLateProgress() async throws {
         let fixture = try CoordinatorFixture()
         defer { fixture.remove() }
@@ -399,5 +539,41 @@ struct SetupCoordinatorTests {
             coordinator.progress == nil,
             "late progress restored state after enrollment cancellation"
         )
+    }
+
+    private static func testCancellationInvalidatesCallbacksBeforeRuntimeEOF() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let runner = CancellationEOFWindowRunner()
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
+        )
+        let enrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        for _ in 0..<40 where !runner.started {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try require(runner.started, "EOF-window enrollment did not start")
+
+        coordinator.cancelEnrollment()
+        try require(
+            coordinator.progress == nil,
+            "cancelEnrollment did not synchronously clear visible progress"
+        )
+        await Task.yield()
+        await Task.yield()
+        try require(
+            coordinator.progress == nil,
+            "callback during the TERM/EOF window restored cancelled progress"
+        )
+
+        runner.deliverEOF()
+        await enrollment.value
     }
 }
