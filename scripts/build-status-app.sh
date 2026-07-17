@@ -93,6 +93,9 @@ xcrun swiftc "${SOURCE_FILES[@]}" \
   -target arm64-apple-macosx12.0 \
   -framework AppKit \
   -framework SwiftUI \
+  -framework AVFoundation \
+  -framework ApplicationServices \
+  -framework CoreGraphics \
   -o "$EXECUTABLE"
 chmod +x "$EXECUTABLE"
 codesign --sign - --force --deep "$BUILD_DIR" >/dev/null

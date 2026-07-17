@@ -62,6 +62,15 @@ jobs:
             tests/swift/SetupStateTests.swift \
             -o "$RUNNER_TEMP/mac-face-lock-setup-state-tests"
           "$RUNNER_TEMP/mac-face-lock-setup-state-tests"
+      - name: Run Swift permission-state tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/SetupModels.swift src/app/PermissionCenter.swift \
+            tests/swift/PermissionStateTests.swift \
+            -framework AppKit -framework AVFoundation \
+            -framework ApplicationServices -framework CoreGraphics \
+            -o "$RUNNER_TEMP/mac-face-lock-permission-tests"
+          "$RUNNER_TEMP/mac-face-lock-permission-tests"
       - name: Run Swift project-locator tests
         run: |
           xcrun swiftc -parse-as-library -DTESTING \
@@ -84,7 +93,9 @@ jobs:
       - name: Typecheck the unified Swift application
         run: |
           xcrun swiftc -parse-as-library -typecheck \
-            src/app/*.swift -framework AppKit -framework SwiftUI -framework AVFoundation
+            src/app/*.swift -framework AppKit -framework SwiftUI \
+            -framework AVFoundation -framework ApplicationServices \
+            -framework CoreGraphics
       - name: Build both ad-hoc signed applications
         run: |
           scripts/build-app.sh
