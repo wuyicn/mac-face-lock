@@ -235,12 +235,20 @@ final class SetupCoordinator: ObservableObject {
         updateReadiness()
     }
 
-    func enableProtection() throws {
+    func enableProtection() async throws {
+        await refreshServiceHealthForEnable()
         updateReadiness()
         let missingChecks = readiness.requiredChecks
             .filter { readiness.checks[$0] != true }
             .sorted { $0.rawValue < $1.rawValue }
         guard missingChecks.isEmpty else {
+            do {
+                _ = try localStore.writeControl(enabled: false)
+            } catch {
+                let coordinatorError = SetupCoordinatorError.persistenceFailed
+                currentError = coordinatorError.localizedDescription
+                throw coordinatorError
+            }
             let error = SetupCoordinatorError.notReady(missingChecks)
             currentError = error.localizedDescription
             throw error
@@ -342,6 +350,29 @@ final class SetupCoordinator: ObservableObject {
         )
         readiness = evaluated
         checks = evaluated.checks
+    }
+
+    private func refreshServiceHealthForEnable() async {
+        if environment.mode == .release {
+            guard let serviceManager else {
+                serviceHealthy = false
+                return
+            }
+            let serviceStatus = await serviceManager.status()
+            serviceHealthy = serviceStatus.isHealthy
+            switch serviceStatus.state {
+            case .healthy:
+                break
+            case .needsRepair:
+                currentError = "应用位置已变化，请重新安装后台服务后再开启保护。"
+            case .notInstalled:
+                currentError = "后台服务尚未安装，请重新运行诊断。"
+            case .unhealthy:
+                currentError = "后台 Agent 权限或运行状态未就绪，请完成授权并重新运行诊断。"
+            }
+        } else {
+            serviceHealthy = await serviceHealthProvider.isServiceHealthy()
+        }
     }
 
     private func installAndRefreshReleaseService() async {

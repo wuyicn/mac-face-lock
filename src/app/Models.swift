@@ -20,6 +20,8 @@ struct FaceLockState: Codable, Equatable {
     var cameraReady: Bool?
     var inputMonitoringReady: Bool?
     var accessibilityReady: Bool?
+    var heartbeatTimestamp: String?
+    var heartbeatSequence: UInt64?
 
     init(
         status: String,
@@ -40,7 +42,9 @@ struct FaceLockState: Codable, Equatable {
         agentPid: Int32? = nil,
         cameraReady: Bool? = nil,
         inputMonitoringReady: Bool? = nil,
-        accessibilityReady: Bool? = nil
+        accessibilityReady: Bool? = nil,
+        heartbeatTimestamp: String? = nil,
+        heartbeatSequence: UInt64? = nil
     ) {
         self.status = status
         self.mode = mode
@@ -61,6 +65,8 @@ struct FaceLockState: Codable, Equatable {
         self.cameraReady = cameraReady
         self.inputMonitoringReady = inputMonitoringReady
         self.accessibilityReady = accessibilityReady
+        self.heartbeatTimestamp = heartbeatTimestamp
+        self.heartbeatSequence = heartbeatSequence
     }
 
     static let missing = FaceLockState(status: "missing", armed: false)

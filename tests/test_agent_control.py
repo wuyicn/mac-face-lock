@@ -25,9 +25,13 @@ def wait_until(predicate, timeout=1.0):
 class FakeListener:
     def __init__(self, **callbacks: object) -> None:
         self.callbacks = callbacks
+        self.ready = False
 
     def start(self) -> None:
         pass
+
+    def wait(self) -> None:
+        self.ready = True
 
     def stop(self) -> None:
         pass
@@ -100,6 +104,145 @@ class AgentControlTests(unittest.TestCase):
                 "accessibility_ready": True,
             },
         )
+
+    def test_agent_permission_request_uses_agent_owned_public_prompt_apis(self) -> None:
+        camera_statuses = iter([0, 3])
+        camera_requests = []
+        input_requests = []
+        accessibility_options = []
+
+        capture_device = types.SimpleNamespace(
+            authorizationStatusForMediaType_=lambda _media_type: next(camera_statuses),
+            requestAccessForMediaType_completionHandler_=lambda media_type, completion: (
+                camera_requests.append(media_type),
+                completion(True),
+            ),
+        )
+        av_foundation = types.ModuleType("AVFoundation")
+        av_foundation.AVMediaTypeVideo = "video"
+        av_foundation.AVAuthorizationStatusNotDetermined = 0
+        av_foundation.AVAuthorizationStatusAuthorized = 3
+        av_foundation.AVCaptureDevice = capture_device
+        quartz = types.ModuleType("Quartz")
+        quartz.CGPreflightListenEventAccess = lambda: False
+        quartz.CGRequestListenEventAccess = lambda: input_requests.append(True) or True
+        application_services = types.ModuleType("ApplicationServices")
+        application_services.kAXTrustedCheckOptionPrompt = "prompt"
+        application_services.AXIsProcessTrusted = lambda: False
+        application_services.AXIsProcessTrustedWithOptions = (
+            lambda options: accessibility_options.append(options) or True
+        )
+
+        real_import = __import__
+
+        def import_probe(name, *args, **kwargs):
+            if name == "AVFoundation":
+                return av_foundation
+            if name == "Quartz":
+                return quartz
+            if name == "ApplicationServices":
+                return application_services
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_probe):
+            readiness = probe_agent_permissions(
+                request=True,
+                camera_request_timeout_seconds=0.1,
+            )
+
+        self.assertEqual(camera_requests, ["video"])
+        self.assertEqual(input_requests, [True])
+        self.assertEqual(accessibility_options, [{"prompt": True}])
+        self.assertEqual(
+            readiness,
+            {
+                "camera_ready": True,
+                "input_monitoring_ready": True,
+                "accessibility_ready": True,
+            },
+        )
+
+    def test_agent_permission_request_keeps_denied_permissions_false(self) -> None:
+        capture_device = types.SimpleNamespace(
+            authorizationStatusForMediaType_=lambda _media_type: 2,
+            requestAccessForMediaType_completionHandler_=lambda *_args: self.fail(
+                "denied camera permission was requested again"
+            ),
+        )
+        av_foundation = types.ModuleType("AVFoundation")
+        av_foundation.AVMediaTypeVideo = "video"
+        av_foundation.AVAuthorizationStatusNotDetermined = 0
+        av_foundation.AVAuthorizationStatusAuthorized = 3
+        av_foundation.AVCaptureDevice = capture_device
+        quartz = types.ModuleType("Quartz")
+        quartz.CGPreflightListenEventAccess = lambda: False
+        quartz.CGRequestListenEventAccess = lambda: False
+        application_services = types.ModuleType("ApplicationServices")
+        application_services.kAXTrustedCheckOptionPrompt = "prompt"
+        application_services.AXIsProcessTrusted = lambda: False
+        application_services.AXIsProcessTrustedWithOptions = lambda _options: False
+
+        real_import = __import__
+
+        def import_probe(name, *args, **kwargs):
+            if name == "AVFoundation":
+                return av_foundation
+            if name == "Quartz":
+                return quartz
+            if name == "ApplicationServices":
+                return application_services
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_probe):
+            readiness = probe_agent_permissions(request=True)
+
+        self.assertEqual(
+            readiness,
+            {
+                "camera_ready": False,
+                "input_monitoring_ready": False,
+                "accessibility_ready": False,
+            },
+        )
+
+    def test_agent_camera_permission_request_completion_is_bounded(self) -> None:
+        capture_device = types.SimpleNamespace(
+            authorizationStatusForMediaType_=lambda _media_type: 0,
+            requestAccessForMediaType_completionHandler_=lambda *_args: None,
+        )
+        av_foundation = types.ModuleType("AVFoundation")
+        av_foundation.AVMediaTypeVideo = "video"
+        av_foundation.AVAuthorizationStatusNotDetermined = 0
+        av_foundation.AVAuthorizationStatusAuthorized = 3
+        av_foundation.AVCaptureDevice = capture_device
+        quartz = types.ModuleType("Quartz")
+        quartz.CGPreflightListenEventAccess = lambda: True
+        quartz.CGRequestListenEventAccess = lambda: True
+        application_services = types.ModuleType("ApplicationServices")
+        application_services.kAXTrustedCheckOptionPrompt = "prompt"
+        application_services.AXIsProcessTrusted = lambda: True
+        application_services.AXIsProcessTrustedWithOptions = lambda _options: True
+
+        real_import = __import__
+
+        def import_probe(name, *args, **kwargs):
+            if name == "AVFoundation":
+                return av_foundation
+            if name == "Quartz":
+                return quartz
+            if name == "ApplicationServices":
+                return application_services
+            return real_import(name, *args, **kwargs)
+
+        started = time.monotonic()
+        with patch("builtins.__import__", side_effect=import_probe):
+            readiness = probe_agent_permissions(
+                request=True,
+                camera_request_timeout_seconds=0.01,
+            )
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertFalse(readiness["camera_ready"])
 
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -457,10 +600,19 @@ class AgentControlTests(unittest.TestCase):
         agent = self.make_agent()
         agent.stop_event.set()
         started = []
+        ready = []
 
         class OrderingListener(FakeListener):
             def start(self) -> None:
                 started.append(self)
+
+            def wait(self) -> None:
+                self.assert_started()
+                ready.append(self)
+
+            def assert_started(self) -> None:
+                if self not in started:
+                    raise AssertionError("wait called before listener start")
 
         pynput = types.ModuleType("pynput")
         pynput.keyboard = types.SimpleNamespace(Listener=OrderingListener)
@@ -471,6 +623,11 @@ class AgentControlTests(unittest.TestCase):
                 len(started),
                 2,
                 "Agent readiness was published before both input listeners started",
+            )
+            self.assertEqual(
+                len(ready),
+                2,
+                "Agent readiness was published before both input listeners were ready",
             )
 
         with (
@@ -486,6 +643,150 @@ class AgentControlTests(unittest.TestCase):
             patch("agent.replace_state", side_effect=publish_state),
         ):
             agent.run()
+
+    def test_run_listener_readiness_failure_never_publishes_healthy_state(self) -> None:
+        write_control(False, self.control_path)
+        agent = self.make_agent()
+        published = []
+
+        class FailingListener(FakeListener):
+            waits = 0
+
+            def wait(self) -> None:
+                type(self).waits += 1
+                if type(self).waits == 2:
+                    raise RuntimeError("listener backend failed")
+                super().wait()
+
+        pynput = types.ModuleType("pynput")
+        pynput.keyboard = types.SimpleNamespace(Listener=FailingListener)
+        pynput.mouse = types.SimpleNamespace(Listener=FailingListener)
+
+        with (
+            patch.dict("sys.modules", {"pynput": pynput}),
+            patch(
+                "agent.probe_agent_permissions",
+                return_value={
+                    "camera_ready": True,
+                    "input_monitoring_ready": True,
+                    "accessibility_ready": True,
+                },
+            ),
+            patch("agent.replace_state", side_effect=published.append),
+            patch("agent.write_state", side_effect=published.append),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "listener"):
+                agent.run()
+
+        self.assertFalse(
+            any(
+                state.get("camera_ready")
+                and state.get("input_monitoring_ready")
+                and state.get("accessibility_ready")
+                for state in published
+            )
+        )
+        self.assertEqual(published[-1]["status"], "input_listener_error")
+
+    def test_run_listener_start_failure_stops_already_started_listener(self) -> None:
+        write_control(False, self.control_path)
+        agent = self.make_agent()
+        listeners = []
+
+        class StartFailingListener(FakeListener):
+            def __init__(self, **callbacks: object) -> None:
+                super().__init__(**callbacks)
+                self.stopped = False
+                listeners.append(self)
+
+            def start(self) -> None:
+                if len([listener for listener in listeners if listener.ready]) == 1:
+                    raise RuntimeError("listener start failed")
+                self.ready = True
+
+            def stop(self) -> None:
+                self.stopped = True
+
+        pynput = types.ModuleType("pynput")
+        pynput.keyboard = types.SimpleNamespace(Listener=StartFailingListener)
+        pynput.mouse = types.SimpleNamespace(Listener=StartFailingListener)
+
+        with (
+            patch.dict("sys.modules", {"pynput": pynput}),
+            patch(
+                "agent.probe_agent_permissions",
+                return_value={
+                    "camera_ready": True,
+                    "input_monitoring_ready": True,
+                    "accessibility_ready": True,
+                },
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "listener"):
+                agent.run()
+
+        self.assertTrue(listeners[0].stopped)
+
+    def test_run_listener_readiness_wait_has_bounded_timeout(self) -> None:
+        write_control(False, self.control_path)
+        agent = self.make_agent(listener_ready_timeout_seconds=0.01)
+        release_wait = threading.Event()
+
+        class BlockingListener(FakeListener):
+            def wait(self) -> None:
+                release_wait.wait(1)
+
+        pynput = types.ModuleType("pynput")
+        pynput.keyboard = types.SimpleNamespace(Listener=BlockingListener)
+        pynput.mouse = types.SimpleNamespace(Listener=BlockingListener)
+
+        started = time.monotonic()
+        try:
+            with (
+                patch.dict("sys.modules", {"pynput": pynput}),
+                patch(
+                    "agent.probe_agent_permissions",
+                    return_value={
+                        "camera_ready": True,
+                        "input_monitoring_ready": True,
+                        "accessibility_ready": True,
+                    },
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "timed out"):
+                    agent.run()
+        finally:
+            release_wait.set()
+
+        self.assertLess(time.monotonic() - started, 0.2)
+
+    def test_tick_reprobes_permissions_and_publishes_revocation(self) -> None:
+        agent = self.make_agent(permission_probe_interval_seconds=0)
+        agent.mouse_listener = FakeListener()
+        agent.keyboard_listener = FakeListener()
+        agent.mouse_listener.ready = True
+        agent.keyboard_listener.ready = True
+        agent.permission_readiness = {
+            "camera_ready": True,
+            "input_monitoring_ready": True,
+            "accessibility_ready": True,
+        }
+        agent.live_state_started = True
+
+        with patch(
+            "agent.probe_agent_permissions",
+            return_value={
+                "camera_ready": True,
+                "input_monitoring_ready": False,
+                "accessibility_ready": True,
+            },
+        ):
+            agent.tick()
+
+        published = self.write_state.call_args.args[0]
+        self.assertFalse(published["input_monitoring_ready"])
+        self.assertTrue(published["camera_ready"])
+        self.assertTrue(published["accessibility_ready"])
 
     def test_entering_armed_state_emits_activity_event(self) -> None:
         agent = self.make_agent(idle_seconds_before_armed=60)

@@ -20,9 +20,14 @@ private func require(_ condition: @autoclosure () -> Bool, _ message: String) th
 private final class MemoryServiceFileSystem: ServiceFileSystem {
     private(set) var files: [String: Data] = [:]
     private(set) var operations: [String] = []
+    private var readSequences: [String: [Data]] = [:]
 
     func seed(_ data: Data, at url: URL) {
         files[url.standardizedFileURL.path] = data
+    }
+
+    func seedReadSequence(_ data: [Data], at url: URL) {
+        readSequences[url.standardizedFileURL.path] = data
     }
 
     func fileExists(at url: URL) -> Bool {
@@ -31,6 +36,12 @@ private final class MemoryServiceFileSystem: ServiceFileSystem {
 
     func readData(at url: URL) throws -> Data {
         let path = url.standardizedFileURL.path
+        if var sequence = readSequences[path], !sequence.isEmpty {
+            let data = sequence.removeFirst()
+            readSequences[path] = sequence
+            files[path] = data
+            return data
+        }
         guard let data = files[path] else {
             throw CocoaError(.fileNoSuchFile)
         }
@@ -75,6 +86,7 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
     var loaded: Bool
     var printPIDs: [Int32]
     var bootoutExitCode: Int32 = 0
+    var printError: Error?
 
     init(loaded: Bool = false, printPIDs: [Int32] = []) {
         self.loaded = loaded
@@ -89,6 +101,9 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
         calls.append(Call(arguments: arguments, timeout: timeout))
         switch arguments.first {
         case "print":
+            if let printError {
+                throw printError
+            }
             guard loaded else {
                 return ServiceCommandResult(exitCode: 113, stdout: "", stderr: "not found")
             }
@@ -129,6 +144,7 @@ private struct ServiceFixture {
     let stateURL: URL
     let fileSystem = MemoryServiceFileSystem()
     let runner: FakeServiceCommandRunner
+    let now = ISO8601DateFormatter().date(from: "2026-07-17T00:00:10Z")!
 
     init(loaded: Bool = false, printPIDs: [Int32] = []) throws {
         appURL = root.appendingPathComponent("Applications/Mac Face Lock.app")
@@ -158,7 +174,9 @@ private struct ServiceFixture {
             userID: 501,
             commandTimeout: 2,
             healthPollAttempts: pollAttempts,
-            healthPollIntervalNanoseconds: 0
+            healthPollIntervalNanoseconds: 0,
+            heartbeatMaxAge: 5,
+            now: { now }
         )
     }
 
@@ -166,7 +184,9 @@ private struct ServiceFixture {
         pid: Int32 = 42,
         camera: Bool = true,
         inputMonitoring: Bool = true,
-        accessibility: Bool = true
+        accessibility: Bool = true,
+        heartbeatSequence: UInt64 = 1,
+        heartbeatTimestamp: String = "2026-07-17T00:00:09Z"
     ) throws {
         let object: [String: Any] = [
             "status": "paused",
@@ -175,11 +195,35 @@ private struct ServiceFixture {
             "camera_ready": camera,
             "input_monitoring_ready": inputMonitoring,
             "accessibility_ready": accessibility,
+            "heartbeat_sequence": heartbeatSequence,
+            "heartbeat_timestamp": heartbeatTimestamp,
         ]
         fileSystem.seed(
             try JSONSerialization.data(withJSONObject: object),
             at: stateURL
         )
+    }
+
+    func seedHealthyStateSequence(
+        pid: Int32 = 42,
+        sequences: [UInt64],
+        timestamp: String = "2026-07-17T00:00:09Z"
+    ) throws {
+        let data = try sequences.map { sequence in
+            try JSONSerialization.data(
+                withJSONObject: [
+                    "status": "paused",
+                    "armed": false,
+                    "agent_pid": Int(pid),
+                    "camera_ready": true,
+                    "input_monitoring_ready": true,
+                    "accessibility_ready": true,
+                    "heartbeat_sequence": sequence,
+                    "heartbeat_timestamp": timestamp,
+                ] as [String: Any]
+            )
+        }
+        fileSystem.seedReadSequence(data, at: stateURL)
     }
 
     static func templateData() throws -> Data {
@@ -215,13 +259,17 @@ struct ServiceManagerTests {
         try await testUninstallPreservesApplicationData()
         try await testUninstallDoesNotHideRunningJobRemovalFailure()
         try await testAgentPermissionFailureCannotReportHealthy()
+        try await testStaleOrMissingHeartbeatCannotReportHealthy()
+        try await testStableInstallRequiresAdvancingHeartbeat()
+        try await testStableInstallWaitsThroughDuplicateHeartbeatPolls()
+        try await testPriorJobPrintTimeoutAbortsBeforeAnyMutation()
         try await testMovedApplicationNeedsRepair()
         print("Service manager tests passed")
     }
 
     private static func testInstallRendersOnlyApplicationAndSupportPaths() async throws {
         let fixture = try ServiceFixture(printPIDs: [42, 42, 42])
-        try fixture.seedHealthyState()
+        try fixture.seedHealthyStateSequence(sequences: [1, 2, 3])
 
         try await fixture.manager().install(
             appURL: fixture.appURL,
@@ -281,7 +329,7 @@ struct ServiceManagerTests {
             options: 0
         )
         fixture.fileSystem.seed(previousData, at: fixture.plistURL)
-        try fixture.seedHealthyState(pid: 42)
+        try fixture.seedHealthyStateSequence(pid: 42, sequences: [1, 2, 3])
 
         do {
             try await fixture.manager(pollAttempts: 3).install(
@@ -375,6 +423,116 @@ struct ServiceManagerTests {
         try require(status.cameraReady, "camera readiness was lost")
         try require(!status.inputMonitoringReady, "input monitoring denial was ignored")
         try require(status.accessibilityReady, "accessibility readiness was lost")
+    }
+
+    private static func testStaleOrMissingHeartbeatCannotReportHealthy() async throws {
+        for (sequence, timestamp, label) in [
+            (UInt64?.none, "2026-07-17T00:00:09Z", "missing sequence"),
+            (UInt64?.some(7), "2026-07-16T23:59:00Z", "stale timestamp"),
+        ] {
+            let fixture = try ServiceFixture(loaded: true, printPIDs: [42])
+            let rendered = try renderTemplate(
+                try fixture.fileSystem.readData(at: fixture.templateURL),
+                appURL: fixture.appURL,
+                supportURL: fixture.supportURL
+            )
+            fixture.fileSystem.seed(rendered, at: fixture.plistURL)
+            var object: [String: Any] = [
+                "status": "paused",
+                "armed": false,
+                "agent_pid": 42,
+                "camera_ready": true,
+                "input_monitoring_ready": true,
+                "accessibility_ready": true,
+                "heartbeat_timestamp": timestamp,
+            ]
+            if let sequence {
+                object["heartbeat_sequence"] = sequence
+            }
+            fixture.fileSystem.seed(
+                try JSONSerialization.data(withJSONObject: object),
+                at: fixture.stateURL
+            )
+
+            let status = await fixture.manager().status()
+
+            try require(
+                status.state == .unhealthy,
+                "\(label) Agent state reported healthy"
+            )
+        }
+    }
+
+    private static func testStableInstallRequiresAdvancingHeartbeat() async throws {
+        let fixture = try ServiceFixture(printPIDs: [42, 42, 42])
+        try fixture.seedHealthyStateSequence(sequences: [7, 7, 7])
+
+        do {
+            try await fixture.manager().install(
+                appURL: fixture.appURL,
+                supportURL: fixture.supportURL
+            )
+            throw TestFailure.assertion(
+                "stable install accepted a non-advancing heartbeat sequence"
+            )
+        } catch is ServiceManagerError {
+            // Expected.
+        }
+
+        try require(
+            !fixture.fileSystem.fileExists(at: fixture.plistURL),
+            "non-advancing heartbeat failure did not roll back the new plist"
+        )
+    }
+
+    private static func testStableInstallWaitsThroughDuplicateHeartbeatPolls() async throws {
+        let fixture = try ServiceFixture(printPIDs: [42, 42, 42, 42, 42])
+        try fixture.seedHealthyStateSequence(sequences: [1, 1, 2, 2, 3])
+
+        try await fixture.manager(pollAttempts: 5).install(
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+
+        try require(
+            fixture.fileSystem.fileExists(at: fixture.plistURL),
+            "stable install reset progress instead of waiting for heartbeat advancement"
+        )
+    }
+
+    private static func testPriorJobPrintTimeoutAbortsBeforeAnyMutation() async throws {
+        let fixture = try ServiceFixture(loaded: true)
+        let previousData = Data("previous plist".utf8)
+        fixture.fileSystem.seed(previousData, at: fixture.plistURL)
+        fixture.runner.printError = ServiceManagerError.commandTimedOut(
+            command: "launchctl print"
+        )
+
+        do {
+            try await fixture.manager().install(
+                appURL: fixture.appURL,
+                supportURL: fixture.supportURL
+            )
+            throw TestFailure.assertion("install continued after prior-job print timeout")
+        } catch ServiceManagerError.commandTimedOut {
+            // Expected.
+        }
+
+        try require(
+            fixture.fileSystem.operations.isEmpty,
+            "prior-job print timeout mutated files or directories"
+        )
+        let retainedData = try fixture.fileSystem.readData(at: fixture.plistURL)
+        try require(
+            retainedData == previousData,
+            "prior-job print timeout changed the existing plist"
+        )
+        try require(
+            fixture.runner.calls.map(\.arguments) == [
+                ["print", "gui/501/com.wuyi.mac-face-lock-agent"],
+            ],
+            "prior-job print timeout continued into launchctl mutation"
+        )
     }
 
     private static func testMovedApplicationNeedsRepair() async throws {

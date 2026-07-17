@@ -31,8 +31,12 @@ LOG_PATH = RUNTIME_PATHS.logs_dir / "agent.log"
 PID_PATH = RUNTIME_PATHS.logs_dir / "agent.pid"
 
 
-def probe_agent_permissions() -> dict[str, bool]:
-    """Read this Agent process's TCC readiness without opening the camera."""
+def probe_agent_permissions(
+    *,
+    request: bool = False,
+    camera_request_timeout_seconds: float = 5.0,
+) -> dict[str, bool]:
+    """Read or request this Agent process's TCC readiness without camera capture."""
 
     camera_ready = False
     input_monitoring_ready = False
@@ -46,6 +50,25 @@ def probe_agent_permissions() -> dict[str, bool]:
                     AVFoundation.AVMediaTypeVideo
                 )
             )
+            if (
+                request
+                and camera_status == AVFoundation.AVAuthorizationStatusNotDetermined
+            ):
+                completion_event = threading.Event()
+
+                def camera_completion(_granted: bool) -> None:
+                    completion_event.set()
+
+                AVFoundation.AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+                    AVFoundation.AVMediaTypeVideo,
+                    camera_completion,
+                )
+                if completion_event.wait(max(0.0, camera_request_timeout_seconds)):
+                    camera_status = (
+                        AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(
+                            AVFoundation.AVMediaTypeVideo
+                        )
+                    )
             camera_ready = (
                 camera_status == AVFoundation.AVAuthorizationStatusAuthorized
             )
@@ -59,9 +82,24 @@ def probe_agent_permissions() -> dict[str, bool]:
             if bundle is None or not bundle.load():
                 raise RuntimeError("AVFoundation framework is unavailable")
             capture_device = objc.lookUpClass("AVCaptureDevice")
-            camera_ready = (
-                int(capture_device.authorizationStatusForMediaType_("vide")) == 3
+            camera_status = int(
+                capture_device.authorizationStatusForMediaType_("vide")
             )
+            if request and camera_status == 0:
+                completion_event = threading.Event()
+
+                def camera_completion(_granted: bool) -> None:
+                    completion_event.set()
+
+                capture_device.requestAccessForMediaType_completionHandler_(
+                    "vide",
+                    camera_completion,
+                )
+                if completion_event.wait(max(0.0, camera_request_timeout_seconds)):
+                    camera_status = int(
+                        capture_device.authorizationStatusForMediaType_("vide")
+                    )
+            camera_ready = camera_status == 3
     except Exception as exc:
         logging.warning("camera permission readiness probe failed error=%s", exc)
 
@@ -69,6 +107,8 @@ def probe_agent_permissions() -> dict[str, bool]:
         import Quartz
 
         input_monitoring_ready = bool(Quartz.CGPreflightListenEventAccess())
+        if request and not input_monitoring_ready:
+            input_monitoring_ready = bool(Quartz.CGRequestListenEventAccess())
     except Exception as exc:
         logging.warning("input monitoring readiness probe failed error=%s", exc)
 
@@ -76,6 +116,14 @@ def probe_agent_permissions() -> dict[str, bool]:
         import ApplicationServices
 
         accessibility_ready = bool(ApplicationServices.AXIsProcessTrusted())
+        if request and not accessibility_ready:
+            accessibility_ready = bool(
+                ApplicationServices.AXIsProcessTrustedWithOptions(
+                    {
+                        ApplicationServices.kAXTrustedCheckOptionPrompt: True,
+                    }
+                )
+            )
     except Exception as exc:
         logging.warning("accessibility readiness probe failed error=%s", exc)
 
@@ -243,18 +291,89 @@ class FaceLockAgent:
         self.mouse_listener: Any | None = None
         self.keyboard_listener: Any | None = None
         self.system_idle_supported: bool | None = None
+        self.state_lock = threading.Lock()
+        self.live_state_started = False
+        self.heartbeat_sequence = 0
+        self.last_heartbeat_at = -float("inf")
+        self.last_permission_probe_at = -float("inf")
+        self.permission_readiness = {
+            "camera_ready": False,
+            "input_monitoring_ready": False,
+            "accessibility_ready": False,
+        }
 
     def persist_state(self, state: dict[str, Any]) -> None:
-        if self.explicit_runtime_paths:
-            write_state(state, path=self.runtime_paths.state_path)
-        else:
-            write_state(state)
+        with self.state_lock:
+            payload = self.decorate_live_state(state)
+            if self.explicit_runtime_paths:
+                write_state(payload, path=self.runtime_paths.state_path)
+            else:
+                write_state(payload)
 
     def persist_replacement_state(self, state: dict[str, Any]) -> None:
-        if self.explicit_runtime_paths:
-            replace_state(state, path=self.runtime_paths.state_path)
-        else:
-            replace_state(state)
+        with self.state_lock:
+            payload = self.decorate_live_state(state)
+            if self.explicit_runtime_paths:
+                replace_state(payload, path=self.runtime_paths.state_path)
+            else:
+                replace_state(payload)
+
+    def decorate_live_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(state)
+        if not self.live_state_started:
+            return payload
+        self.heartbeat_sequence += 1
+        self.last_heartbeat_at = time.monotonic()
+        payload.update(self.permission_readiness)
+        payload["agent_pid"] = __import__("os").getpid()
+        payload["heartbeat_timestamp"] = now_iso()
+        payload["heartbeat_sequence"] = self.heartbeat_sequence
+        return payload
+
+    def publish_live_heartbeat_if_due(self) -> None:
+        if not self.live_state_started:
+            return
+        now = time.monotonic()
+        permission_interval = max(
+            0.0,
+            float(self.config.get("permission_probe_interval_seconds", 5)),
+        )
+        if now - self.last_permission_probe_at >= permission_interval:
+            self.last_permission_probe_at = now
+            self.permission_readiness = probe_agent_permissions()
+            self.persist_state(self.current_live_state())
+            return
+        heartbeat_interval = max(
+            0.1,
+            float(self.config.get("heartbeat_interval_seconds", 1)),
+        )
+        if now - self.last_heartbeat_at >= heartbeat_interval:
+            self.persist_state(self.current_live_state())
+
+    def current_live_state(self) -> dict[str, Any]:
+        if not self.protection_enabled:
+            return {
+                "status": "paused",
+                "mode": self.mode,
+                "armed": False,
+                "action": "allow_paused",
+                "heartbeat": "paused",
+            }
+        if self.armed:
+            return {
+                "status": "armed",
+                "mode": self.mode,
+                "armed": True,
+                "action": "wait_for_input_verify",
+                "heartbeat": "armed",
+            }
+        return {
+            "status": "active",
+            "mode": self.mode,
+            "armed": False,
+            "action": "wait_until_idle",
+            "heartbeat": "active",
+        }
 
     def refresh_control_state(self) -> None:
         current = ControlState(self.protection_enabled, None)
@@ -891,6 +1010,12 @@ class FaceLockAgent:
         except ImportError as exc:
             raise RuntimeError("Missing input dependency. Run scripts/bootstrap.sh first.") from exc
 
+        self.permission_readiness = probe_agent_permissions(
+            request=True,
+            camera_request_timeout_seconds=float(
+                self.config.get("camera_permission_request_timeout_seconds", 5)
+            ),
+        )
         initial_state = {
             "status": "running",
             "mode": self.mode,
@@ -905,7 +1030,7 @@ class FaceLockAgent:
             "camera_error_cooldown_seconds": self.config[
                 "camera_error_cooldown_seconds"
             ],
-            **probe_agent_permissions(),
+            **self.permission_readiness,
         }
         if not self.protection_enabled:
             initial_state.update(
@@ -923,8 +1048,28 @@ class FaceLockAgent:
         self.keyboard_listener = keyboard.Listener(
             on_press=lambda *_: self.on_input("keyboard")
         )
-        self.mouse_listener.start()
-        self.keyboard_listener.start()
+        try:
+            self.mouse_listener.start()
+            self.keyboard_listener.start()
+            self.wait_for_input_listeners_ready()
+        except Exception as exc:
+            self.stop_input_listeners()
+            self.persist_replacement_state(
+                {
+                    "status": "input_listener_error",
+                    "mode": self.mode,
+                    "armed": False,
+                    "action": "restart_required",
+                    "agent_pid": __import__("os").getpid(),
+                    "camera_ready": False,
+                    "input_monitoring_ready": False,
+                    "accessibility_ready": False,
+                    "listener_error": str(exc),
+                }
+            )
+            raise RuntimeError(f"input listener readiness failed: {exc}") from exc
+        self.live_state_started = True
+        self.last_permission_probe_at = time.monotonic()
         self.persist_replacement_state(initial_state)
         logging.info("mac-face-lock-agent started mode=%s", self.mode)
 
@@ -932,8 +1077,7 @@ class FaceLockAgent:
             while not self.stop_event.wait(1):
                 self.tick()
         finally:
-            self.mouse_listener.stop()
-            self.keyboard_listener.stop()
+            self.stop_input_listeners()
             shutdown_complete = self.shutdown()
             self.persist_state({"status": "stopped", "stopped_at": now_iso()})
             logging.info(
@@ -958,6 +1102,7 @@ class FaceLockAgent:
             self.stop_event.set()
             return
 
+        self.publish_live_heartbeat_if_due()
         self.refresh_control_state()
         if not self.protection_enabled:
             now = time.monotonic()
@@ -1056,6 +1201,51 @@ class FaceLockAgent:
     def input_listeners_alive(self) -> bool:
         listeners = [self.mouse_listener, self.keyboard_listener]
         return all(listener is not None and listener.is_alive() for listener in listeners)
+
+    def wait_for_input_listeners_ready(self) -> None:
+        listeners = [self.mouse_listener, self.keyboard_listener]
+        if any(listener is None for listener in listeners):
+            raise RuntimeError("input listener was not created")
+        results: Queue[BaseException | None] = Queue()
+
+        def wait_for_ready(listener: Any) -> None:
+            try:
+                listener.wait()
+            except BaseException as exc:
+                results.put(exc)
+            else:
+                results.put(None)
+
+        for listener in listeners:
+            threading.Thread(
+                target=wait_for_ready,
+                args=(listener,),
+                name="face-lock-listener-readiness",
+                daemon=True,
+            ).start()
+
+        deadline = time.monotonic() + max(
+            0.0,
+            float(self.config.get("listener_ready_timeout_seconds", 5)),
+        )
+        for _listener in listeners:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("input listener readiness timed out")
+            try:
+                error = results.get(timeout=remaining)
+            except Empty as exc:
+                raise RuntimeError("input listener readiness timed out") from exc
+            if error is not None:
+                raise RuntimeError(f"input listener failed: {error}") from error
+
+    def stop_input_listeners(self) -> None:
+        for listener in (self.mouse_listener, self.keyboard_listener):
+            if listener is not None:
+                try:
+                    listener.stop()
+                except Exception:
+                    logging.exception("input listener stop failed")
 
     def system_idle_seconds(self) -> float | None:
         if not bool(self.config.get("system_idle_poll_enabled", True)):

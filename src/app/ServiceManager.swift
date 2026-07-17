@@ -16,6 +16,30 @@ struct ServiceStatus: Equatable {
     let accessibilityReady: Bool
     let installedProgram: String?
     let expectedProgram: String
+    let heartbeatTimestamp: String?
+    let heartbeatSequence: UInt64?
+
+    init(
+        state: ServiceState,
+        pid: Int32?,
+        cameraReady: Bool,
+        inputMonitoringReady: Bool,
+        accessibilityReady: Bool,
+        installedProgram: String?,
+        expectedProgram: String,
+        heartbeatTimestamp: String? = nil,
+        heartbeatSequence: UInt64? = nil
+    ) {
+        self.state = state
+        self.pid = pid
+        self.cameraReady = cameraReady
+        self.inputMonitoringReady = inputMonitoringReady
+        self.accessibilityReady = accessibilityReady
+        self.installedProgram = installedProgram
+        self.expectedProgram = expectedProgram
+        self.heartbeatTimestamp = heartbeatTimestamp
+        self.heartbeatSequence = heartbeatSequence
+    }
 
     var isHealthy: Bool {
         state == .healthy
@@ -187,6 +211,8 @@ final class ServiceManager: ServiceManaging {
     private let commandTimeout: TimeInterval
     private let healthPollAttempts: Int
     private let healthPollIntervalNanoseconds: UInt64
+    private let heartbeatMaxAge: TimeInterval
+    private let now: () -> Date
     private let launchctlURL = URL(fileURLWithPath: "/bin/launchctl")
 
     init(
@@ -199,7 +225,9 @@ final class ServiceManager: ServiceManaging {
         userID: uid_t = getuid(),
         commandTimeout: TimeInterval = 5,
         healthPollAttempts: Int = 12,
-        healthPollIntervalNanoseconds: UInt64 = 250_000_000
+        healthPollIntervalNanoseconds: UInt64 = 250_000_000,
+        heartbeatMaxAge: TimeInterval = 15,
+        now: @escaping () -> Date = Date.init
     ) {
         self.appURL = appURL.standardizedFileURL
         self.supportURL = supportURL.standardizedFileURL
@@ -220,6 +248,8 @@ final class ServiceManager: ServiceManaging {
         self.commandTimeout = commandTimeout
         self.healthPollAttempts = max(3, healthPollAttempts)
         self.healthPollIntervalNanoseconds = healthPollIntervalNanoseconds
+        self.heartbeatMaxAge = max(0, heartbeatMaxAge)
+        self.now = now
     }
 
     func install(appURL: URL, supportURL: URL) async throws {
@@ -230,7 +260,7 @@ final class ServiceManager: ServiceManaging {
         let previousData = fileSystem.fileExists(at: destinationURL)
             ? try fileSystem.readData(at: destinationURL)
             : nil
-        let previousWasLoaded = await jobIsLoaded()
+        let previousWasLoaded = try await jobIsLoaded()
 
         do {
             try fileSystem.createDirectory(at: launchAgentsURL)
@@ -326,6 +356,14 @@ final class ServiceManager: ServiceManaging {
         let cameraReady = state?.cameraReady == true
         let inputMonitoringReady = state?.inputMonitoringReady == true
         let accessibilityReady = state?.accessibilityReady == true
+        let heartbeatTimestamp = state?.heartbeatTimestamp
+        let heartbeatSequence = state?.heartbeatSequence
+        let heartbeatFresh = heartbeatTimestamp.flatMap {
+            ISO8601DateFormatter().date(from: $0)
+        }.map {
+            let age = now().timeIntervalSince($0)
+            return age >= 0 && age <= heartbeatMaxAge
+        } == true
         let runningState = state.map {
             !["missing", "stopped", "input_listener_error"].contains($0.status)
         } == true
@@ -333,6 +371,8 @@ final class ServiceManager: ServiceManaging {
             && cameraReady
             && inputMonitoringReady
             && accessibilityReady
+            && heartbeatSequence != nil
+            && heartbeatFresh
             && runningState
         return ServiceStatus(
             state: healthy ? .healthy : .unhealthy,
@@ -341,7 +381,9 @@ final class ServiceManager: ServiceManaging {
             inputMonitoringReady: inputMonitoringReady,
             accessibilityReady: accessibilityReady,
             installedProgram: installedProgram,
-            expectedProgram: expectedProgram
+            expectedProgram: expectedProgram,
+            heartbeatTimestamp: heartbeatTimestamp,
+            heartbeatSequence: heartbeatSequence
         )
     }
 
@@ -423,7 +465,9 @@ final class ServiceManager: ServiceManaging {
             inputMonitoringReady: state?.inputMonitoringReady == true,
             accessibilityReady: state?.accessibilityReady == true,
             installedProgram: installedProgram,
-            expectedProgram: agentProgramURL(appURL: appURL).path
+            expectedProgram: agentProgramURL(appURL: appURL).path,
+            heartbeatTimestamp: state?.heartbeatTimestamp,
+            heartbeatSequence: state?.heartbeatSequence
         )
     }
 
@@ -443,21 +487,38 @@ final class ServiceManager: ServiceManaging {
 
     private func requireStableHealth() async throws {
         var stablePID: Int32?
+        var stableHeartbeatSequence: UInt64?
         var consecutiveHealthyPolls = 0
         for attempt in 0..<healthPollAttempts {
             let current = await status()
-            if current.isHealthy, let pid = current.pid, pid > 0 {
+            if current.isHealthy,
+               let pid = current.pid,
+               pid > 0,
+               let sequence = current.heartbeatSequence {
                 if stablePID == pid {
-                    consecutiveHealthyPolls += 1
+                    if let previousSequence = stableHeartbeatSequence,
+                       sequence > previousSequence {
+                        consecutiveHealthyPolls += 1
+                        stableHeartbeatSequence = sequence
+                    } else if let previousSequence = stableHeartbeatSequence,
+                              sequence < previousSequence {
+                        consecutiveHealthyPolls = 1
+                        stableHeartbeatSequence = sequence
+                    } else {
+                        // A faster status poll may observe the same live heartbeat.
+                        // Keep waiting without treating it as progression.
+                    }
                 } else {
                     stablePID = pid
                     consecutiveHealthyPolls = 1
+                    stableHeartbeatSequence = sequence
                 }
                 if consecutiveHealthyPolls == 3 {
                     return
                 }
             } else {
                 stablePID = nil
+                stableHeartbeatSequence = nil
                 consecutiveHealthyPolls = 0
             }
             if attempt + 1 < healthPollAttempts,
@@ -506,10 +567,8 @@ final class ServiceManager: ServiceManaging {
         )
     }
 
-    private func jobIsLoaded() async -> Bool {
-        guard let result = try? await runLaunchctl(["print", serviceTarget]) else {
-            return false
-        }
+    private func jobIsLoaded() async throws -> Bool {
+        let result = try await runLaunchctl(["print", serviceTarget])
         return result.exitCode == 0
     }
 

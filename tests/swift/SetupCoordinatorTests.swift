@@ -70,13 +70,15 @@ private final class FakeRuntimeRunner: RuntimeCommandRunning {
 
 private final class FakeServiceHealthProvider: SetupServiceHealthProviding {
     var healthy: Bool
+    private(set) var checks = 0
 
     init(healthy: Bool) {
         self.healthy = healthy
     }
 
     func isServiceHealthy() async -> Bool {
-        healthy
+        checks += 1
+        return healthy
     }
 }
 
@@ -368,6 +370,8 @@ struct SetupCoordinatorTests {
         try await testVisibleAppGrantsCannotOverrideUnhealthyAgentPermissions()
         try await testSourceModePreservesExistingServiceHealthBoundary()
         try await testEnableProtectionRefusesWhenAnyGateIsFalse()
+        try await testEnableProtectionRechecksReleaseServiceAfterDiagnosis()
+        try await testEnableProtectionRechecksSourceServiceProvider()
         print("Setup coordinator tests passed")
     }
 
@@ -500,7 +504,7 @@ struct SetupCoordinatorTests {
         await coordinator.refreshPermissions()
 
         do {
-            try coordinator.enableProtection()
+            try await coordinator.enableProtection()
             throw TestFailure.assertion("protection enabled with a required gate false")
         } catch is SetupCoordinatorError {
             // Expected.
@@ -513,6 +517,105 @@ struct SetupCoordinatorTests {
         try require(
             coordinator.currentError?.contains("尚未完成") == true,
             "readiness refusal did not publish an actionable error"
+        )
+    }
+
+    private static func testEnableProtectionRechecksReleaseServiceAfterDiagnosis() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try Data("owner".utf8).write(
+            to: fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        )
+        _ = try fixture.localStore.writeControl(enabled: false)
+        let runner = FakeRuntimeRunner()
+        runner.events[.diagnose] = [event("diagnosis_complete")]
+        runner.events[.verifyOwner] = [
+            event("owner_verification_complete", decision: "owner"),
+        ]
+        let serviceManager = FakeServiceManager(state: .healthy)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: serviceManager
+        )
+        await coordinator.refreshPermissions()
+        await coordinator.runDiagnosis()
+        await coordinator.verifyOwnerWithoutLocking()
+        try require(
+            coordinator.readiness.canEnableProtection,
+            "fixture did not reach ready state before service death"
+        )
+        serviceManager.currentStatus = ServiceStatus(
+            state: .unhealthy,
+            pid: 42,
+            cameraReady: false,
+            inputMonitoringReady: false,
+            accessibilityReady: false,
+            installedProgram: nil,
+            expectedProgram: "/expected/MacFaceLockAgent"
+        )
+
+        do {
+            try await coordinator.enableProtection()
+            throw TestFailure.assertion(
+                "protection enabled after the diagnosed release service died"
+            )
+        } catch is SetupCoordinatorError {
+            // Expected.
+        }
+
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "release service death still wrote protection enabled"
+        )
+        try require(
+            coordinator.checks[.serviceHealth] == false,
+            "release service death did not refresh readiness"
+        )
+    }
+
+    private static func testEnableProtectionRechecksSourceServiceProvider() async throws {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        try Data("owner".utf8).write(
+            to: fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        )
+        _ = try fixture.localStore.writeControl(enabled: false)
+        let runner = FakeRuntimeRunner()
+        runner.events[.diagnose] = [event("diagnosis_complete")]
+        runner.events[.verifyOwner] = [
+            event("owner_verification_complete", decision: "owner"),
+        ]
+        let provider = FakeServiceHealthProvider(healthy: true)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: provider
+        )
+        await coordinator.refreshPermissions()
+        await coordinator.runDiagnosis()
+        await coordinator.verifyOwnerWithoutLocking()
+        provider.healthy = false
+
+        do {
+            try await coordinator.enableProtection()
+            throw TestFailure.assertion(
+                "source protection enabled after its service provider became unhealthy"
+            )
+        } catch is SetupCoordinatorError {
+            // Expected.
+        }
+
+        try require(provider.checks >= 2, "source enable did not live-refresh service health")
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "source service death still wrote protection enabled"
         )
     }
 
