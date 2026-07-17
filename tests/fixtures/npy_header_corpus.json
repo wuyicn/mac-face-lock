@@ -1,0 +1,58 @@
+[
+  {
+    "name": "v1 canonical shape",
+    "version": 1,
+    "header": "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 9216), }",
+    "header_length": 128,
+    "payload_rows": 2,
+    "expected": true
+  },
+  {
+    "name": "v2 canonical shape",
+    "version": 2,
+    "header": "{'shape': (20, 9216), 'fortran_order': False, 'descr': '<f4', }",
+    "header_length": 128,
+    "payload_rows": 20,
+    "expected": true
+  },
+  {
+    "name": "v1 10000 byte header",
+    "version": 1,
+    "header": "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 9216), }",
+    "header_length": 10000,
+    "payload_rows": 2,
+    "expected": true
+  },
+  {
+    "name": "v1 10001 byte header",
+    "version": 1,
+    "header": "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 9216), }",
+    "header_length": 10001,
+    "payload_rows": 2,
+    "expected": false
+  },
+  {
+    "name": "v2 10000 byte header",
+    "version": 2,
+    "header": "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 9216), }",
+    "header_length": 10000,
+    "payload_rows": 2,
+    "expected": true
+  },
+  {
+    "name": "v2 10001 byte header",
+    "version": 2,
+    "header": "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 9216), }",
+    "header_length": 10001,
+    "payload_rows": 2,
+    "expected": false
+  },
+  {
+    "name": "leading-zero row count",
+    "version": 1,
+    "header": "{'descr': '<f4', 'fortran_order': False, 'shape': (0002, 9216), }",
+    "header_length": 128,
+    "payload_rows": 2,
+    "expected": false
+  }
+]

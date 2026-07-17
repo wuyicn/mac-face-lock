@@ -14,6 +14,7 @@ protocol OwnerProfileInspecting: AnyObject {
 
 final class NumpyOwnerProfileInspector: OwnerProfileInspecting {
     private let maximumBytes = 67_108_864
+    private let maximumHeaderBytes = 10_000
     private let expectedColumns = 9_216
 
     func inspect(_ url: URL) -> OwnerProfileInspection {
@@ -47,7 +48,8 @@ final class NumpyOwnerProfileInspector: OwnerProfileInspecting {
             return OwnerProfileInspection(isValid: false, fingerprint: nil)
         }
         let payloadStartResult = headerStart.addingReportingOverflow(headerLength)
-        guard headerLength > 0, !payloadStartResult.overflow,
+        guard headerLength > 0, headerLength <= maximumHeaderBytes,
+              !payloadStartResult.overflow,
               payloadStartResult.partialValue <= data.count else {
             return OwnerProfileInspection(isValid: false, fingerprint: nil)
         }
@@ -257,7 +259,23 @@ private struct NumpyHeaderParser {
     }
 
     private mutating func parseUnsignedInteger() -> Int? {
-        let start = index
+        guard index < bytes.count else {
+            return nil
+        }
+        if bytes[index] == 0x30 {
+            guard advance() else {
+                return nil
+            }
+            guard index == bytes.count
+                    || bytes[index] < 0x30
+                    || bytes[index] > 0x39 else {
+                return nil
+            }
+            return 0
+        }
+        guard bytes[index] >= 0x31, bytes[index] <= 0x39 else {
+            return nil
+        }
         var value = 0
         while index < bytes.count, bytes[index] >= 0x30, bytes[index] <= 0x39 {
             let multiplied = value.multipliedReportingOverflow(by: 10)
@@ -275,7 +293,7 @@ private struct NumpyHeaderParser {
                 return nil
             }
         }
-        return index > start ? value : nil
+        return value
     }
 
     private mutating func consumeLiteral(_ literal: String) -> Bool {
@@ -341,6 +359,86 @@ private struct RuntimeReadinessWaiter {
     let continuation: CheckedContinuation<Bool, Never>
 }
 
+private final class EnrollmentRuntimeStartGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var opened = false
+    private var cancelled = false
+    private var waiter: CheckedContinuation<Bool, Never>?
+    private var childTask: Task<RuntimeResult, Error>?
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func waitUntilOpened() async -> Bool {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if cancelled {
+                    lock.unlock()
+                    continuation.resume(returning: false)
+                } else if opened {
+                    lock.unlock()
+                    continuation.resume(returning: true)
+                } else {
+                    waiter = continuation
+                    lock.unlock()
+                }
+            }
+        } onCancel: {
+            cancel()
+        }
+    }
+
+    func open() {
+        let continuation: CheckedContinuation<Bool, Never>?
+        let shouldStart: Bool
+        lock.lock()
+        if cancelled {
+            shouldStart = false
+        } else {
+            opened = true
+            shouldStart = true
+        }
+        continuation = waiter
+        waiter = nil
+        lock.unlock()
+        continuation?.resume(returning: shouldStart)
+    }
+
+    func bind(_ task: Task<RuntimeResult, Error>) {
+        let shouldCancel: Bool
+        lock.lock()
+        childTask = task
+        shouldCancel = cancelled
+        lock.unlock()
+        if shouldCancel {
+            task.cancel()
+        }
+    }
+
+    func unbind() {
+        lock.lock()
+        childTask = nil
+        lock.unlock()
+    }
+
+    func cancel() {
+        let continuation: CheckedContinuation<Bool, Never>?
+        let task: Task<RuntimeResult, Error>?
+        lock.lock()
+        cancelled = true
+        continuation = waiter
+        waiter = nil
+        task = childTask
+        lock.unlock()
+        task?.cancel()
+        continuation?.resume(returning: false)
+    }
+}
+
 private final class UnavailableSetupServiceHealthProvider: SetupServiceHealthProviding {
     func isServiceHealthy() async -> Bool {
         false
@@ -377,7 +475,9 @@ final class SetupCoordinator: ObservableObject {
     private var ownerTestPassed: Bool
     private var serviceHealthy = false
     private var enrollmentTask: Task<RuntimeResult, Error>?
+    private var enrollmentTaskGeneration: UUID?
     private var enrollmentGeneration: UUID?
+    private var enrollmentStartGate: EnrollmentRuntimeStartGate?
     private var enrollmentPermitWaiterID: UUID?
     private var profileRevision: UInt64 = 0
     private var currentOwnerFingerprint: String?
@@ -583,20 +683,54 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func startEnrollment() async {
+        let generation = UUID()
+        let startGate = EnrollmentRuntimeStartGate()
+        await withTaskCancellationHandler {
+            await startEnrollment(
+                generation: generation,
+                startGate: startGate
+            )
+        } onCancel: { [weak self] in
+            startGate.cancel()
+            Task { @MainActor [weak self] in
+                self?.cancelEnrollment(generation: generation)
+            }
+        }
+    }
+
+    private func startEnrollment(
+        generation: UUID,
+        startGate: EnrollmentRuntimeStartGate
+    ) async {
         guard enrollmentLifecycle == .idle, enrollmentTask == nil else {
             return
         }
         enrollmentLifecycle = .running
+        enrollmentGeneration = generation
+        enrollmentStartGate = startGate
         let acquiredPermit = await acquireRuntimeReadinessPermit { [weak self] id in
             self?.enrollmentPermitWaiterID = id
         }
         enrollmentPermitWaiterID = nil
         guard acquiredPermit else {
+            if enrollmentGeneration == generation {
+                enrollmentGeneration = nil
+            }
+            if enrollmentStartGate === startGate {
+                enrollmentStartGate = nil
+            }
             enrollmentLifecycle = .idle
             return
         }
-        guard !Task.isCancelled, enrollmentLifecycle == .running else {
+        guard !Task.isCancelled, !startGate.isCancelled,
+              enrollmentLifecycle == .running else {
             releaseRuntimeReadinessPermit()
+            if enrollmentGeneration == generation {
+                enrollmentGeneration = nil
+            }
+            if enrollmentStartGate === startGate {
+                enrollmentStartGate = nil
+            }
             enrollmentLifecycle = .idle
             return
         }
@@ -605,28 +739,50 @@ final class SetupCoordinator: ObservableObject {
         progress = 0
         ownerTestPassed = false
         updateReadiness()
-        let generation = UUID()
-        enrollmentGeneration = generation
 
-        guard !Task.isCancelled, enrollmentLifecycle == .running else {
+        guard !Task.isCancelled, !startGate.isCancelled,
+              enrollmentLifecycle == .running else {
             enrollmentGeneration = nil
+            enrollmentStartGate = nil
             progress = nil
             releaseRuntimeReadinessPermit()
             enrollmentLifecycle = .idle
             return
         }
-        let task = Task { [runtimeRunner] in
-            try await runtimeRunner.run(command: .enroll) { [weak self] event in
+        let task = Task { [runtimeRunner, startGate] in
+            guard await startGate.waitUntilOpened() else {
+                throw CancellationError()
+            }
+            try Task.checkCancellation()
+            guard !startGate.isCancelled else {
+                throw CancellationError()
+            }
+            return try await runtimeRunner.run(command: .enroll) { [weak self] event in
                 Task { @MainActor [weak self] in
                     self?.applyEnrollment(event, generation: generation)
                 }
             }
         }
         enrollmentTask = task
+        enrollmentTaskGeneration = generation
+        startGate.bind(task)
+        if Task.isCancelled || startGate.isCancelled {
+            startGate.cancel()
+            task.cancel()
+        } else {
+            startGate.open()
+        }
         defer {
-            enrollmentTask = nil
+            startGate.unbind()
+            if enrollmentTaskGeneration == generation {
+                enrollmentTask = nil
+                enrollmentTaskGeneration = nil
+            }
             if enrollmentGeneration == generation {
                 enrollmentGeneration = nil
+            }
+            if enrollmentStartGate === startGate {
+                enrollmentStartGate = nil
             }
             enrollmentLifecycle = .idle
             releaseRuntimeReadinessPermit()
@@ -668,15 +824,31 @@ final class SetupCoordinator: ObservableObject {
         guard enrollmentLifecycle == .running else {
             return
         }
+        guard let generation = enrollmentGeneration
+                ?? enrollmentTaskGeneration else {
+            return
+        }
+        cancelEnrollment(generation: generation)
+    }
+
+    private func cancelEnrollment(generation: UUID) {
+        guard enrollmentGeneration == generation
+                || enrollmentTaskGeneration == generation else {
+            return
+        }
         enrollmentLifecycle = .cancelling
-        enrollmentGeneration = nil
+        if enrollmentGeneration == generation {
+            enrollmentGeneration = nil
+        }
         progress = nil
+        enrollmentStartGate?.cancel()
         if let waiterID = enrollmentPermitWaiterID {
             enrollmentPermitWaiterID = nil
             cancelRuntimeReadinessWaiter(id: waiterID)
         }
-        let task = enrollmentTask
-        task?.cancel()
+        if enrollmentTaskGeneration == generation {
+            enrollmentTask?.cancel()
+        }
     }
 
     func runDiagnosis() async {

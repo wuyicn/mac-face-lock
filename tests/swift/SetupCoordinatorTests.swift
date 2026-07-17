@@ -512,6 +512,72 @@ private final class EnrollmentQueueCancellationRunner: RuntimeCommandRunning {
     }
 }
 
+private final class EnrollmentChildStartWindowRunner: RuntimeCommandRunning {
+    private var firstEnrollmentContinuation: CheckedContinuation<Void, Never>?
+    private(set) var firstEnrollmentEntered = false
+    private(set) var enrollmentEntries = 0
+    private(set) var cameraStarts = 0
+
+    func run(
+        command: RuntimeCommand,
+        onEvent: @escaping (RuntimeEvent) -> Void
+    ) async throws -> RuntimeResult {
+        guard command == .enroll else {
+            return RuntimeResult(
+                exitCode: 0,
+                events: [],
+                stderr: "",
+                stderrTruncated: false
+            )
+        }
+        enrollmentEntries += 1
+        if enrollmentEntries == 1 {
+            firstEnrollmentEntered = true
+            await withCheckedContinuation { continuation in
+                firstEnrollmentContinuation = continuation
+            }
+            try Task.checkCancellation()
+        }
+        cameraStarts += 1
+        let terminal = RuntimeEvent(
+            schemaVersion: 1,
+            event: "enrollment_complete",
+            status: "success",
+            message: "complete"
+        )
+        onEvent(terminal)
+        return RuntimeResult(
+            exitCode: 0,
+            events: [terminal],
+            stderr: "",
+            stderrTruncated: false
+        )
+    }
+
+    func releaseFirstEnrollmentStartWindow() {
+        firstEnrollmentContinuation?.resume()
+        firstEnrollmentContinuation = nil
+    }
+}
+
+private struct NumpyHeaderCorpusCase: Decodable {
+    let name: String
+    let version: Int
+    let header: String
+    let headerLength: Int
+    let payloadRows: Int
+    let expected: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case version
+        case header
+        case headerLength = "header_length"
+        case payloadRows = "payload_rows"
+        case expected
+    }
+}
+
 private struct CoordinatorFixture {
     let root: URL
     let localStore: LocalJSONStore
@@ -574,8 +640,10 @@ struct SetupCoordinatorTests {
         try await testFreshPreparationPassiveRefreshRunsNoRuntimeCommand()
         try await testRuntimeDiagnosticsAreSerialized()
         try testStrictStaticOwnerProfileInspection()
+        try testSharedNumpyHeaderCorpusMatchesSwiftInspector()
         try testAdversarialOwnerProfilesAreRejectedWithoutCoordinatorCrash()
         try await testQueuedEnrollmentCancellationNeverStartsRuntime()
+        try await testParentCancellationPropagatesToEnrollmentChildAtStart()
         try await testCameraOnlyDiagnosisKeepsValidOwnerProfile()
         try await testCompletedCameraRevocationRecoveryPreservesHistoryAndSkipsEnrollment()
         print("Setup coordinator tests passed")
@@ -1394,6 +1462,16 @@ struct SetupCoordinatorTests {
                 payloadBytes: 2 * 9_216 * 4
             ),
             numpyContainer(
+                header: "{'descr': '<f4', 'fortran_order': False, "
+                    + "'shape': (+2, 9216), }",
+                payloadBytes: 2 * 9_216 * 4
+            ),
+            numpyContainer(
+                header: "{'descr': '<f4', 'fortran_order': False, "
+                    + "'shape': (2_0, 9216), }",
+                payloadBytes: 20 * 9_216 * 4
+            ),
+            numpyContainer(
                 header: validHeader,
                 payloadBytes: 2 * 9_216 * 4 - 1
             ),
@@ -1427,6 +1505,52 @@ struct SetupCoordinatorTests {
                 serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
             )
         }
+    }
+
+    private static func testSharedNumpyHeaderCorpusMatchesSwiftInspector() throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let corpusURL = URL(fileURLWithPath: "tests/fixtures/npy_header_corpus.json")
+        let cases = try JSONDecoder().decode(
+            [NumpyHeaderCorpusCase].self,
+            from: Data(contentsOf: corpusURL)
+        )
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        let inspector = NumpyOwnerProfileInspector()
+
+        for testCase in cases {
+            try numpyCorpusData(testCase).write(to: ownerURL)
+            try require(
+                inspector.inspect(ownerURL).isValid == testCase.expected,
+                "Swift disagreed with pinned NumPy corpus case: \(testCase.name)"
+            )
+        }
+    }
+
+    private static func numpyCorpusData(_ testCase: NumpyHeaderCorpusCase) -> Data {
+        var header = Data(testCase.header.utf8)
+        let padding = testCase.headerLength - header.count - 1
+        header.append(Data(repeating: 0x20, count: padding))
+        header.append(0x0A)
+        var data = Data([0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59])
+        if testCase.version == 1 {
+            data.append(contentsOf: [0x01, 0x00])
+            let length = UInt16(header.count)
+            data.append(UInt8(length & 0x00FF))
+            data.append(UInt8((length >> 8) & 0x00FF))
+        } else {
+            data.append(contentsOf: [0x02, 0x00])
+            let length = UInt32(header.count)
+            data.append(UInt8(length & 0x000000FF))
+            data.append(UInt8((length >> 8) & 0x000000FF))
+            data.append(UInt8((length >> 16) & 0x000000FF))
+            data.append(UInt8((length >> 24) & 0x000000FF))
+        }
+        data.append(header)
+        data.append(
+            Data(repeating: 0, count: testCase.payloadRows * 9_216 * 4)
+        )
+        return data
     }
 
     private static func numpyContainer(
@@ -1501,7 +1625,7 @@ struct SetupCoordinatorTests {
             cancelledEnrollmentFinished = true
         }
         try await Task.sleep(nanoseconds: 30_000_000)
-        coordinator.cancelEnrollment()
+        cancelledEnrollment.cancel()
         try await Task.sleep(nanoseconds: 30_000_000)
         let finishedBeforePermitRelease = cancelledEnrollmentFinished
 
@@ -1522,6 +1646,47 @@ struct SetupCoordinatorTests {
         try require(
             runner.enrollmentCommands == 1,
             "permit queue leaked or normal enrollment could not retry after cancellation"
+        )
+    }
+
+    private static func testParentCancellationPropagatesToEnrollmentChildAtStart()
+        async throws {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let runner = EnrollmentChildStartWindowRunner()
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+        let cancelledEnrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        for _ in 0..<80 where !runner.firstEnrollmentEntered {
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        try require(
+            runner.firstEnrollmentEntered,
+            "enrollment child did not enter the pre-camera start window"
+        )
+
+        cancelledEnrollment.cancel()
+        runner.releaseFirstEnrollmentStartWindow()
+        await cancelledEnrollment.value
+
+        try require(
+            runner.cameraStarts == 0,
+            "parent cancellation did not stop the enrollment child before camera start"
+        )
+
+        await coordinator.startEnrollment()
+        try require(
+            runner.enrollmentEntries == 2 && runner.cameraStarts == 1,
+            "normal enrollment deadlocked after parent cancellation"
         )
     }
 
