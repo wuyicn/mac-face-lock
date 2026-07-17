@@ -29,12 +29,17 @@ RUNTIME_PATHS = RuntimePaths.for_source(PROJECT_DIR)
 CONFIG_PATH = RUNTIME_PATHS.config_path
 LOG_PATH = RUNTIME_PATHS.logs_dir / "agent.log"
 PID_PATH = RUNTIME_PATHS.logs_dir / "agent.pid"
+CAMERA_PERMISSION_REQUEST_TIMEOUT_SECONDS = 5.0
+LISTENER_READY_TIMEOUT_SECONDS = 5.0
+HEARTBEAT_INTERVAL_SECONDS = 1.0
 
 
 def probe_agent_permissions(
     *,
     request: bool = False,
-    camera_request_timeout_seconds: float = 5.0,
+    camera_request_timeout_seconds: float = (
+        CAMERA_PERMISSION_REQUEST_TIMEOUT_SECONDS
+    ),
 ) -> dict[str, bool]:
     """Read or request this Agent process's TCC readiness without camera capture."""
 
@@ -345,7 +350,12 @@ class FaceLockAgent:
             return
         heartbeat_interval = max(
             0.1,
-            float(self.config.get("heartbeat_interval_seconds", 1)),
+            float(
+                self.config.get(
+                    "heartbeat_interval_seconds",
+                    HEARTBEAT_INTERVAL_SECONDS,
+                )
+            ),
         )
         if now - self.last_heartbeat_at >= heartbeat_interval:
             self.persist_state(self.current_live_state())
@@ -1013,7 +1023,10 @@ class FaceLockAgent:
         self.permission_readiness = probe_agent_permissions(
             request=True,
             camera_request_timeout_seconds=float(
-                self.config.get("camera_permission_request_timeout_seconds", 5)
+                self.config.get(
+                    "camera_permission_request_timeout_seconds",
+                    CAMERA_PERMISSION_REQUEST_TIMEOUT_SECONDS,
+                )
             ),
         )
         initial_state = {
@@ -1226,7 +1239,12 @@ class FaceLockAgent:
 
         deadline = time.monotonic() + max(
             0.0,
-            float(self.config.get("listener_ready_timeout_seconds", 5)),
+            float(
+                self.config.get(
+                    "listener_ready_timeout_seconds",
+                    LISTENER_READY_TIMEOUT_SECONDS,
+                )
+            ),
         )
         for _listener in listeners:
             remaining = deadline - time.monotonic()

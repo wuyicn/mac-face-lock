@@ -7,7 +7,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent import FaceLockAgent, probe_agent_permissions
+from agent import (
+    CAMERA_PERMISSION_REQUEST_TIMEOUT_SECONDS,
+    HEARTBEAT_INTERVAL_SECONDS,
+    LISTENER_READY_TIMEOUT_SECONDS,
+    FaceLockAgent,
+    probe_agent_permissions,
+)
 from control_store import read_control, write_control
 from face_verifier import VerifyResult
 from runtime_paths import RuntimePaths
@@ -67,6 +73,16 @@ class InlineActivityWriter:
 
 
 class AgentControlTests(unittest.TestCase):
+    def test_default_startup_bounds_fit_five_minute_service_window(self) -> None:
+        permission_and_heartbeat_budget = (
+            CAMERA_PERMISSION_REQUEST_TIMEOUT_SECONDS
+            + LISTENER_READY_TIMEOUT_SECONDS
+            + (3 * HEARTBEAT_INTERVAL_SECONDS)
+        )
+
+        self.assertEqual(HEARTBEAT_INTERVAL_SECONDS, 1.0)
+        self.assertLess(permission_and_heartbeat_budget, 300.0)
+
     def test_agent_permission_probe_checks_authorization_without_opening_camera(
         self,
     ) -> None:

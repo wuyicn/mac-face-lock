@@ -87,6 +87,7 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
     var printPIDs: [Int32]
     var bootoutExitCode: Int32 = 0
     var printError: Error?
+    var unloadedPrintExitCode: Int32 = 113
 
     init(loaded: Bool = false, printPIDs: [Int32] = []) {
         self.loaded = loaded
@@ -105,7 +106,11 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
                 throw printError
             }
             guard loaded else {
-                return ServiceCommandResult(exitCode: 113, stdout: "", stderr: "not found")
+                return ServiceCommandResult(
+                    exitCode: unloadedPrintExitCode,
+                    stdout: "",
+                    stderr: "print failed"
+                )
             }
             let pid = printPIDs.isEmpty ? 0 : printPIDs.removeFirst()
             return ServiceCommandResult(
@@ -254,6 +259,7 @@ private struct ServiceFixture {
 @main
 struct ServiceManagerTests {
     static func main() async throws {
+        try testProductionHealthWindowCoversPermissionAndHeartbeatStartup()
         try await testInstallRendersOnlyApplicationAndSupportPaths()
         try await testFailedStableHealthRestoresPreviousPlistAndJob()
         try await testUninstallPreservesApplicationData()
@@ -263,8 +269,26 @@ struct ServiceManagerTests {
         try await testStableInstallRequiresAdvancingHeartbeat()
         try await testStableInstallWaitsThroughDuplicateHeartbeatPolls()
         try await testPriorJobPrintTimeoutAbortsBeforeAnyMutation()
+        try await testPriorJobUnexpectedPrintFailureAbortsBeforeAnyMutation()
         try await testMovedApplicationNeedsRepair()
         print("Service manager tests passed")
+    }
+
+    private static func testProductionHealthWindowCoversPermissionAndHeartbeatStartup() throws {
+        let agentStartupBudgetSeconds = 5.0 + 5.0 + (3.0 * 1.0)
+        try require(
+            ServiceManager.productionHealthPollIntervalNanoseconds == 1_000_000_000,
+            "production health polling cadence is not one second"
+        )
+        try require(
+            ServiceManager.productionStableHealthWindowSeconds >= 300,
+            "production stable-health window is shorter than five minutes"
+        )
+        try require(
+            ServiceManager.productionStableHealthWindowSeconds
+                > agentStartupBudgetSeconds,
+            "production stable-health window does not cover permission waits and heartbeats"
+        )
     }
 
     private static func testInstallRendersOnlyApplicationAndSupportPaths() async throws {
@@ -532,6 +556,46 @@ struct ServiceManagerTests {
                 ["print", "gui/501/com.wuyi.mac-face-lock-agent"],
             ],
             "prior-job print timeout continued into launchctl mutation"
+        )
+    }
+
+    private static func testPriorJobUnexpectedPrintFailureAbortsBeforeAnyMutation() async throws {
+        let fixture = try ServiceFixture()
+        let previousData = Data("previous plist".utf8)
+        fixture.fileSystem.seed(previousData, at: fixture.plistURL)
+        fixture.runner.unloadedPrintExitCode = 5
+
+        do {
+            try await fixture.manager().install(
+                appURL: fixture.appURL,
+                supportURL: fixture.supportURL
+            )
+            throw TestFailure.assertion(
+                "install treated unexpected launchctl print failure as absence"
+            )
+        } catch ServiceManagerError.commandFailed(
+            let command,
+            let exitCode,
+            _
+        ) {
+            try require(command.contains("launchctl print"), "wrong command failure surfaced")
+            try require(exitCode == 5, "unexpected print exit code was not preserved")
+        }
+
+        try require(
+            fixture.fileSystem.operations.isEmpty,
+            "unexpected print failure mutated files or directories"
+        )
+        let retainedData = try fixture.fileSystem.readData(at: fixture.plistURL)
+        try require(
+            retainedData == previousData,
+            "unexpected print failure changed the existing plist"
+        )
+        try require(
+            fixture.runner.calls.map(\.arguments) == [
+                ["print", "gui/501/com.wuyi.mac-face-lock-agent"],
+            ],
+            "unexpected print failure continued into launchctl mutation"
         )
     }
 

@@ -200,6 +200,11 @@ final class BoundedServiceCommandRunner: ServiceCommandRunning {
 
 final class ServiceManager: ServiceManaging {
     static let label = "com.wuyi.mac-face-lock-agent"
+    static let productionHealthPollAttempts = 301
+    static let productionHealthPollIntervalNanoseconds: UInt64 = 1_000_000_000
+    static let productionStableHealthWindowSeconds = TimeInterval(
+        productionHealthPollAttempts - 1
+    ) * TimeInterval(productionHealthPollIntervalNanoseconds) / 1_000_000_000
 
     private let appURL: URL
     private let supportURL: URL
@@ -224,8 +229,9 @@ final class ServiceManager: ServiceManaging {
         commandRunner: ServiceCommandRunning = BoundedServiceCommandRunner(),
         userID: uid_t = getuid(),
         commandTimeout: TimeInterval = 5,
-        healthPollAttempts: Int = 12,
-        healthPollIntervalNanoseconds: UInt64 = 250_000_000,
+        healthPollAttempts: Int = ServiceManager.productionHealthPollAttempts,
+        healthPollIntervalNanoseconds: UInt64 =
+            ServiceManager.productionHealthPollIntervalNanoseconds,
         heartbeatMaxAge: TimeInterval = 15,
         now: @escaping () -> Date = Date.init
     ) {
@@ -396,7 +402,7 @@ final class ServiceManager: ServiceManaging {
         let bootoutResult = try await runLaunchctl(["bootout", serviceTarget])
         if bootoutResult.exitCode != 0 {
             let printResult = try await runLaunchctl(["print", serviceTarget])
-            guard printResult.exitCode != 0 else {
+            guard try !jobIsLoaded(from: printResult) else {
                 throw ServiceManagerError.commandFailed(
                     command: "launchctl bootout \(serviceTarget)",
                     exitCode: bootoutResult.exitCode,
@@ -569,7 +575,21 @@ final class ServiceManager: ServiceManaging {
 
     private func jobIsLoaded() async throws -> Bool {
         let result = try await runLaunchctl(["print", serviceTarget])
-        return result.exitCode == 0
+        return try jobIsLoaded(from: result)
+    }
+
+    private func jobIsLoaded(from result: ServiceCommandResult) throws -> Bool {
+        if result.exitCode == 0 {
+            return true
+        }
+        if result.exitCode == 113 {
+            return false
+        }
+        throw ServiceManagerError.commandFailed(
+            command: "launchctl print \(serviceTarget)",
+            exitCode: result.exitCode,
+            stderr: result.stderr
+        )
     }
 
     private func runLaunchctl(_ arguments: [String]) async throws -> ServiceCommandResult {
