@@ -9,6 +9,7 @@ model is introduced.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from typing import Any
 import numpy as np
 
 from runtime_paths import RuntimePaths
+from template_store import replace_owner_template
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -33,11 +35,19 @@ class VerifyResult:
     reason: str
 
 
+class RuntimeDependencyError(RuntimeError):
+    pass
+
+
+class CameraUnavailableError(RuntimeError):
+    pass
+
+
 def _load_runtime_modules() -> Any:
     try:
         import cv2  # type: ignore
     except ImportError as exc:
-        raise RuntimeError(
+        raise RuntimeDependencyError(
             "Missing OpenCV dependency. Run scripts/bootstrap.sh first."
         ) from exc
     return cv2
@@ -65,6 +75,8 @@ def _normalize_templates(templates: np.ndarray) -> np.ndarray:
     matrix = templates.astype("float32")
     if matrix.ndim == 1:
         matrix = matrix.reshape(1, -1)
+    if not np.isfinite(matrix).all():
+        raise ValueError("Owner profile contains non-finite values")
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     if np.any(norms == 0):
         raise ValueError("Owner profile contains an empty face template")
@@ -183,7 +195,11 @@ def evidence_matches_owner(
     return score >= threshold, score
 
 
-def capture_owner_profile(config: dict[str, Any], output_path: Path = OWNER_FACE_PATH) -> Path:
+def capture_owner_profile(
+    config: dict[str, Any],
+    output_path: Path = OWNER_FACE_PATH,
+    progress: Callable[[int, int], None] | None = None,
+) -> Path:
     cv2 = _load_runtime_modules()
     camera_index = int(config.get("camera_index", 0))
     cascades = _face_cascades(cv2, config)
@@ -192,7 +208,7 @@ def capture_owner_profile(config: dict[str, Any], output_path: Path = OWNER_FACE
 
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera index {camera_index}")
+        raise CameraUnavailableError(f"Could not open camera index {camera_index}")
 
     encodings: list[np.ndarray] = []
     deadline = time.monotonic() + timeout_seconds
@@ -207,6 +223,8 @@ def capture_owner_profile(config: dict[str, Any], output_path: Path = OWNER_FACE
                 time.sleep(0.2)
                 continue
             encodings.append(template)
+            if progress is not None:
+                progress(len(encodings), samples_needed)
             time.sleep(0.25)
     finally:
         cap.release()
@@ -216,9 +234,8 @@ def capture_owner_profile(config: dict[str, Any], output_path: Path = OWNER_FACE
             f"Not enough clean owner samples. Captured {len(encodings)}/{samples_needed}."
         )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     owner_templates = _normalize_templates(np.stack(encodings))
-    np.save(output_path, owner_templates)
+    replace_owner_template(owner_templates, output_path)
     return output_path
 
 
@@ -235,7 +252,7 @@ def verify_current_user(config: dict[str, Any], owner_encoding: np.ndarray) -> V
 
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera index {camera_index}")
+        raise CameraUnavailableError(f"Could not open camera index {camera_index}")
 
     owner_hits = 0
     stranger_hits = 0

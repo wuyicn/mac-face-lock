@@ -1060,7 +1060,10 @@ def configure_logging(config: dict[str, Any], log_path: Path = LOG_PATH) -> None
     )
 
 
-def main(paths: RuntimePaths = RUNTIME_PATHS) -> int:
+def main(
+    paths: RuntimePaths = RUNTIME_PATHS,
+    on_started: Callable[[], None] | None = None,
+) -> int:
     paths.ensure_writable_directories()
     config = load_config(paths.config_path)
     log_path = paths.logs_dir / "agent.log"
@@ -1072,6 +1075,8 @@ def main(paths: RuntimePaths = RUNTIME_PATHS) -> int:
     signal.signal(signal.SIGTERM, agent.stop)
     signal.signal(signal.SIGINT, agent.stop)
     try:
+        if on_started is not None:
+            on_started()
         agent.run()
     finally:
         try:
