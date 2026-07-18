@@ -547,6 +547,8 @@ git commit -m "feat: add guided first-run setup"
 
 ### Task 9: Import Existing Source-Beta Data Safely
 
+> **Superseded on 2026-07-18:** The first open-source Beta does not ship automatic source-beta migration. The replacement implementation is `docs/superpowers/plans/2026-07-18-defer-source-beta-migration.md`. Existing source-beta data remains untouched and the release requires fresh enrollment.
+
 **Files:**
 - Create: `src/app/SourceDataMigrator.swift`
 - Create: `tests/swift/SourceDataMigratorTests.swift`
