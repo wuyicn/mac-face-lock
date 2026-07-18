@@ -2,7 +2,7 @@
 
 本项目的所有重要变更都记录在此文件中。
 
-格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)。Beta 标签使用 Git tag `v0.1.0-beta`，应用内营销版本为 `0.1.0`、build 为 `1`。
+格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)。当前 Beta 标签为 `v0.2.0-beta`，应用内营销版本为 `0.2.0`、build 为 `1`。
 
 ## [Unreleased]
 

@@ -290,6 +290,8 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
         self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["scope"], "final_non_code_payload")
         self.assertTrue(manifest["files"])
+        outer_plist = plistlib.loads((contents / "Info.plist").read_bytes())
+        self.assertEqual(outer_plist["CFBundleShortVersionString"], "0.2.0")
         licenses = contents / "Resources/licenses"
         for relative in REQUIRED_LICENSES:
             path = licenses / relative
@@ -330,7 +332,27 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         document = json.loads(manifest.read_text(encoding="utf-8"))
-        self.assertGreater(len(document["files"]), 50)
+        manifested_paths = {item["path"] for item in document["files"]}
+        required_manifest_paths = {
+            "Contents/Info.plist",
+            "Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/Info.plist",
+            "Contents/Resources/LICENSE",
+            "Contents/Resources/THIRD_PARTY_NOTICES.md",
+            "Contents/Resources/defaults/config.json",
+            "Contents/Resources/help/legacy-install-resolution.md",
+            "Contents/Resources/launchd/com.wuyi.mac-face-lock-release.plist",
+            "Contents/Resources/runtime/MacFaceLockRuntime/_internal/base_library.zip",
+            "Contents/Resources/runtime/MacFaceLockRuntime/_internal/cv2/data/"
+            "haarcascades/haarcascade_frontalface_default.xml",
+        }
+        required_manifest_paths.update(
+            f"Contents/Resources/licenses/{relative}"
+            for relative in REQUIRED_LICENSES
+        )
+        self.assertTrue(
+            required_manifest_paths.issubset(manifested_paths),
+            sorted(required_manifest_paths - manifested_paths),
+        )
         self.assertEqual(
             {item["reason"] for item in document["excluded_files"]},
             {"manifest_self", "code_signature", "mach_o_code"},

@@ -66,7 +66,7 @@ class UnifiedPackagingTests(unittest.TestCase):
         self.assertEqual(info["CFBundleDisplayName"], "Mac Face Lock")
         self.assertEqual(info["CFBundleIdentifier"], "com.wuyi.mac-face-lock.app")
         self.assertEqual(info["CFBundleVersion"], "1")
-        self.assertEqual(info["CFBundleShortVersionString"], "0.1.0")
+        self.assertEqual(info["CFBundleShortVersionString"], "0.2.0")
         self.assertEqual(info["CFBundleExecutable"], "MacFaceLock")
         self.assertEqual(info["CFBundlePackageType"], "APPL")
         self.assertEqual(info["LSMinimumSystemVersion"], "12.0")
@@ -211,7 +211,7 @@ class UnifiedPackagingTests(unittest.TestCase):
             info = plistlib.load(handle)
 
         self.assertEqual(info["CFBundleVersion"], "1")
-        self.assertEqual(info["CFBundleShortVersionString"], "0.1.0")
+        self.assertEqual(info["CFBundleShortVersionString"], "0.2.0")
 
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS build tools")
     def test_built_ui_matches_declared_minimum_system_version(self) -> None:
