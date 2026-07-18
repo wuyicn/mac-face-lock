@@ -368,6 +368,41 @@ class LegacyCleanupPolicyTests(unittest.TestCase):
         ):
             self.assertIn(token, model)
 
+    def test_final_purge_recovery_is_journal_bound_and_exact(self) -> None:
+        tree = (
+            PROJECT_DIR / "src/app/SecureFileTree.swift"
+        ).read_text(encoding="utf-8")
+        cleaner = (
+            PROJECT_DIR / "src/app/LegacyInstallCleaner.swift"
+        ).read_text(encoding="utf-8")
+        model = (
+            PROJECT_DIR / "docs/legacy-cleanup-security-model.md"
+        ).read_text(encoding="utf-8")
+
+        for token in (
+            "purgeRelativePath",
+            "validateTombstoneStates",
+            "validateMutuallyExclusivePurgeStates",
+            "afterFinalRename",
+            "removePersistedPurge",
+        ):
+            self.assertIn(token, tree)
+        for token in (
+            "maximumJournalPurgeEntries",
+            "hasExactPurgeShape",
+            "journalDerivedPaths",
+            "purgeRelativePath",
+        ):
+            self.assertIn(token, cleaner)
+        for token in (
+            "写入清理日志",
+            "0600",
+            "原路径、tombstone 路径和 purge 路径",
+            "大小与修改时间",
+            "不会扫描隐藏文件名",
+        ):
+            self.assertIn(token, model)
+
     def test_directory_enumeration_rejects_whitespace_subpaths_at_path(
         self,
     ) -> None:

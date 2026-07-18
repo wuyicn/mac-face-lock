@@ -527,6 +527,9 @@ struct LegacyInstallCleanerTests {
         try await testSourceDeletionFailurePreservesPlists()
         try await testFailureAfterSourceDeletionIsIncomplete()
         try await testRetryRecoversInterruptedSourceTombstone()
+        try await testRetryRecoversInterruptedFileAndDirectoryPurges()
+        try await testChangedPurgeReplacementSurvivesCleanerRetry()
+        try await testInvalidAndUnknownPurgeJournalSchemaIsBlocked()
         try await testInitialPlistReplacementBlocksDeletion()
         try await testInitialInPlacePlistMutationBlocksDeletion()
         try await testRetryPlistReplacementBlocksDeletion()
@@ -1192,6 +1195,175 @@ struct LegacyInstallCleanerTests {
         let result = await retryCleaner.retry()
         try require(result == .notFound, "tombstone recovery did not complete")
         try fixture.requireAllowlistedTargetsAbsent()
+    }
+
+    private static func testRetryRecoversInterruptedFileAndDirectoryPurges()
+        async throws
+    {
+        for (target, expectedKind) in [
+            ("config/config.json", "file"),
+            ("data", "directory"),
+        ] {
+            let fixture = try LegacyCleanerFixture(testEventHandler: { event in
+                if event == "afterSourcePurgeRename:\(target)" {
+                    throw TestFailure.assertion("simulated purge interruption")
+                }
+            })
+            defer { fixture.remove() }
+            try fixture.installKnownLegacyPairAndData()
+            let candidate = try fixture.confirmedCandidate()
+
+            guard case .cleanupIncomplete =
+                await fixture.cleaner.clean(candidate) else {
+                throw TestFailure.assertion(
+                    "\(target) purge interruption was not retryable"
+                )
+            }
+            let purge = try journalPurge(
+                fixture,
+                originalRelativePath: target
+            )
+            try require(
+                purge["kind"] as? String == expectedKind,
+                "\(target) purge recorded the wrong kind"
+            )
+            try require(
+                (purge["identity"] as? [String: Any])?.count == 2,
+                "\(target) purge did not record its exact identity"
+            )
+            guard let purgePath = purge["purge_relative_path"] as? String else {
+                throw TestFailure.assertion("\(target) purge path is missing")
+            }
+            try require(
+                FileManager.default.fileExists(
+                    atPath: fixture.legacyRoot.appendingPathComponent(
+                        purgePath
+                    ).path
+                ),
+                "\(target) durable purge was not present after interruption"
+            )
+
+            let retryCleaner = fixture.makeCleaner(userID: getuid())
+            let result = await retryCleaner.retry()
+            try require(
+                result == .notFound,
+                "fresh cleaner did not recover \(target) purge: \(result)"
+            )
+            try fixture.requireAllowlistedTargetsAbsent()
+        }
+    }
+
+    private static func testChangedPurgeReplacementSurvivesCleanerRetry()
+        async throws
+    {
+        let target = "config/config.json"
+        let fixture = try LegacyCleanerFixture(testEventHandler: { event in
+            if event == "afterSourcePurgeRename:\(target)" {
+                throw TestFailure.assertion("simulated purge interruption")
+            }
+        })
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        let candidate = try fixture.confirmedCandidate()
+        guard case .cleanupIncomplete =
+            await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion("purge replacement fixture did not stop")
+        }
+        let purge = try journalPurge(
+            fixture,
+            originalRelativePath: target
+        )
+        guard let purgePath = purge["purge_relative_path"] as? String else {
+            throw TestFailure.assertion("purge replacement path is missing")
+        }
+        let purgeURL = fixture.legacyRoot.appendingPathComponent(purgePath)
+        try FileManager.default.removeItem(at: purgeURL)
+        try Data("replacement-must-survive".utf8).write(to: purgeURL)
+
+        guard case .ambiguous =
+            await fixture.makeCleaner(userID: getuid()).retry() else {
+            throw TestFailure.assertion("changed purge replacement was accepted")
+        }
+        let replacement = try Data(contentsOf: purgeURL)
+        try require(
+            replacement == Data("replacement-must-survive".utf8),
+            "changed purge replacement was deleted or modified"
+        )
+    }
+
+    private static func testInvalidAndUnknownPurgeJournalSchemaIsBlocked()
+        async throws
+    {
+        for mutation in ["unknown_key", "invalid_path"] {
+            let target = "config/config.json"
+            let fixture = try LegacyCleanerFixture(testEventHandler: { event in
+                if event == "afterSourcePurgeRename:\(target)" {
+                    throw TestFailure.assertion("simulated purge interruption")
+                }
+            })
+            defer { fixture.remove() }
+            try fixture.installKnownLegacyPairAndData()
+            let candidate = try fixture.confirmedCandidate()
+            guard case .cleanupIncomplete =
+                await fixture.cleaner.clean(candidate) else {
+                throw TestFailure.assertion(
+                    "\(mutation) purge schema fixture did not stop"
+                )
+            }
+            var journal = try fixture.journalObject()
+            guard var tombstones = journal["tombstones"] as? [[String: Any]],
+                  var purges = tombstones[0]["purges"] as? [[String: Any]],
+                  !purges.isEmpty else {
+                throw TestFailure.assertion(
+                    "\(mutation) purge schema fixture is missing"
+                )
+            }
+            if mutation == "unknown_key" {
+                purges[0]["unknown"] = true
+            } else {
+                purges[0]["purge_relative_path"] =
+                    "unrelated/.mac-face-lock-purge-outside"
+            }
+            tombstones[0]["purges"] = purges
+            journal["tombstones"] = tombstones
+            try fixture.writeJournalObject(journal)
+            let callsBefore = fixture.commandRunner.calls.count
+
+            let retryCleaner = fixture.makeCleaner(userID: getuid())
+            guard case .ambiguous = await retryCleaner.retry() else {
+                throw TestFailure.assertion(
+                    "\(mutation) purge schema was accepted"
+                )
+            }
+            try require(
+                fixture.commandRunner.calls.count == callsBefore,
+                "\(mutation) purge schema ran service commands"
+            )
+        }
+    }
+
+    private static func journalPurge(
+        _ fixture: LegacyCleanerFixture,
+        originalRelativePath: String
+    ) throws -> [String: Any] {
+        let journal = try fixture.journalObject()
+        guard let tombstones = journal["tombstones"] as? [[String: Any]] else {
+            throw TestFailure.assertion("journal tombstones are missing")
+        }
+        for tombstone in tombstones {
+            guard let purges = tombstone["purges"] as? [[String: Any]] else {
+                continue
+            }
+            if let purge = purges.first(where: {
+                $0["original_relative_path"] as? String
+                    == originalRelativePath
+            }) {
+                return purge
+            }
+        }
+        throw TestFailure.assertion(
+            "journal purge is missing: \(originalRelativePath)"
+        )
     }
 
     private static func testInitialInPlacePlistMutationBlocksDeletion() async throws {

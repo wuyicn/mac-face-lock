@@ -81,6 +81,10 @@ struct SecureFileTreeTests {
         try testFinalTombstoneChildReplacementSurvives()
         try testFinalTombstoneRootReplacementSurvives()
         try testInterruptedTombstoneIsRecoveredSafely()
+        try testInterruptedFilePurgeIsRecoveredByFreshTree()
+        try testInterruptedDirectoryPurgeIsRecoveredByFreshTree()
+        try testChangedPurgeReplacementSurvivesRecovery()
+        try testRecoveryDoesNotSweepUnjournaledPurgeNames()
         try testInPlaceMutationBlocksRemoval()
         try testDescriptorBoundAtomicFileRoundTrip()
         try testDescriptorBoundWriteRejectsUnsafeNames()
@@ -520,6 +524,198 @@ struct SecureFileTreeTests {
                 ).path
             ),
             "safe retry did not remove the verified tombstone"
+        )
+    }
+
+    private static func testInterruptedFilePurgeIsRecoveredByFreshTree() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        try fixture.write("config/config.json", bytes: [1, 2, 3])
+        let tree = try makeTree(fixture)
+        let manifest = try tree.preflight(
+            relativeTargets: ["config/config.json"],
+            budget: .legacyCleanup
+        )
+        let tombstones = try tree.makeTombstones(
+            manifest: manifest,
+            relativeTargets: ["config/config.json"],
+            nonce: { "file-tombstone" },
+            purgeNonce: { "file-purge" }
+        )
+        guard let purge = tombstones.first?.purges.first else {
+            throw TestFailure.assertion("file purge was not journal-derived")
+        }
+
+        do {
+            try tree.remove(
+                manifest,
+                tombstones: tombstones,
+                afterFinalRename: { moved in
+                    guard moved == purge else {
+                        return
+                    }
+                    throw TestFailure.assertion("file purge interruption")
+                }
+            )
+            throw TestFailure.assertion("file purge interruption was ignored")
+        } catch TestFailure.assertion("file purge interruption") {
+            // Simulated crash after rename and parent fsync.
+        }
+        try require(
+            FileManager.default.fileExists(
+                atPath: fixture.root.appendingPathComponent(
+                    purge.purgeRelativePath
+                ).path
+            ),
+            "durable file purge path was not retained"
+        )
+
+        let freshTree = try makeTree(fixture)
+        try freshTree.recoverTombstones(
+            tombstones,
+            budget: .legacyCleanup
+        )
+        try require(
+            !FileManager.default.fileExists(
+                atPath: fixture.root.appendingPathComponent(
+                    purge.purgeRelativePath
+                ).path
+            ),
+            "fresh-tree retry did not delete the validated file purge"
+        )
+    }
+
+    private static func testInterruptedDirectoryPurgeIsRecoveredByFreshTree() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        try fixture.makeDirectory("logs")
+        let tree = try makeTree(fixture)
+        let manifest = try tree.preflight(
+            relativeTargets: ["logs"],
+            budget: .legacyCleanup
+        )
+        let tombstones = try tree.makeTombstones(
+            manifest: manifest,
+            relativeTargets: ["logs"],
+            nonce: { "directory-tombstone" },
+            purgeNonce: { "directory-purge" }
+        )
+        guard let purge = tombstones.first?.purges.first,
+              purge.kind == .directory else {
+            throw TestFailure.assertion("directory purge was not journal-derived")
+        }
+
+        do {
+            try tree.remove(
+                manifest,
+                tombstones: tombstones,
+                afterFinalRename: { moved in
+                    guard moved == purge else {
+                        return
+                    }
+                    throw TestFailure.assertion("directory purge interruption")
+                }
+            )
+            throw TestFailure.assertion("directory purge interruption was ignored")
+        } catch TestFailure.assertion("directory purge interruption") {
+            // Simulated crash after rename and parent fsync.
+        }
+
+        let freshTree = try makeTree(fixture)
+        try freshTree.recoverTombstones(
+            tombstones,
+            budget: .legacyCleanup
+        )
+        try require(
+            !FileManager.default.fileExists(
+                atPath: fixture.root.appendingPathComponent(
+                    purge.purgeRelativePath
+                ).path
+            ),
+            "fresh-tree retry did not delete the validated directory purge"
+        )
+    }
+
+    private static func testChangedPurgeReplacementSurvivesRecovery() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        try fixture.write("config/config.json", bytes: [1])
+        let tree = try makeTree(fixture)
+        let manifest = try tree.preflight(
+            relativeTargets: ["config/config.json"],
+            budget: .legacyCleanup
+        )
+        let tombstones = try tree.makeTombstones(
+            manifest: manifest,
+            relativeTargets: ["config/config.json"],
+            nonce: { "changed-tombstone" },
+            purgeNonce: { "changed-purge" }
+        )
+        guard let purge = tombstones.first?.purges.first else {
+            throw TestFailure.assertion("changed purge fixture is missing")
+        }
+        do {
+            try tree.remove(
+                manifest,
+                tombstones: tombstones,
+                afterFinalRename: { _ in
+                    throw TestFailure.assertion("changed purge interruption")
+                }
+            )
+        } catch TestFailure.assertion("changed purge interruption") {
+            // Expected.
+        }
+        let purgeURL = fixture.root.appendingPathComponent(
+            purge.purgeRelativePath
+        )
+        try FileManager.default.removeItem(at: purgeURL)
+        try Data([9]).write(to: purgeURL)
+
+        do {
+            try makeTree(fixture).recoverTombstones(
+                tombstones,
+                budget: .legacyCleanup
+            )
+            throw TestFailure.assertion("changed purge replacement was deleted")
+        } catch SecureFileTreeError.identityChanged {
+            let replacementData = try Data(contentsOf: purgeURL)
+            try require(
+                replacementData == Data([9]),
+                "changed purge replacement did not survive"
+            )
+        }
+    }
+
+    private static func testRecoveryDoesNotSweepUnjournaledPurgeNames() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        try fixture.write("data/state.json", bytes: [1])
+        let tree = try makeTree(fixture)
+        let manifest = try tree.preflight(
+            relativeTargets: ["data/state.json"],
+            budget: .legacyCleanup
+        )
+        let tombstones = try tree.makeTombstones(
+            manifest: manifest,
+            relativeTargets: ["data/state.json"],
+            nonce: { "bounded-tombstone" },
+            purgeNonce: { "bounded-purge" }
+        )
+        let unrelated = fixture.root.appendingPathComponent(
+            ".mac-face-lock-purge-unrelated"
+        )
+        try Data([7]).write(to: unrelated)
+
+        try tree.remove(manifest, tombstones: tombstones)
+        try makeTree(fixture).recoverTombstones(
+            tombstones,
+            budget: .legacyCleanup
+        )
+
+        let unrelatedData = try Data(contentsOf: unrelated)
+        try require(
+            unrelatedData == Data([7]),
+            "recovery swept an unjournaled hidden purge name"
         )
     }
 

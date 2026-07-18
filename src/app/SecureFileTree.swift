@@ -66,6 +66,16 @@ struct SecureTreeTombstone: Codable, Equatable, Sendable {
     let tombstoneRelativePath: String
     let identity: SecureFileIdentity
     let kind: SecureTreeEntry.Kind
+    let purges: [SecureTreePurge]
+}
+
+struct SecureTreePurge: Codable, Equatable, Sendable {
+    let originalRelativePath: String
+    let tombstoneRelativePath: String
+    let purgeRelativePath: String
+    let identity: SecureFileIdentity
+    let kind: SecureTreeEntry.Kind
+    let fileVersion: SecureRegularFileVersion?
 }
 
 enum SecureFileTreeError: Error, Equatable {
@@ -79,6 +89,13 @@ enum SecureFileTreeError: Error, Equatable {
     case byteBudgetExceeded
     case identityChanged(String)
     case systemCall(String, String, Int32)
+}
+
+private enum SecurePurgeState: Equatable {
+    case absent
+    case original
+    case tombstone
+    case purge
 }
 
 final class SecureFileTree {
@@ -628,7 +645,8 @@ final class SecureFileTree {
     func makeTombstones(
         manifest: SecureTreeManifest,
         relativeTargets: [String],
-        nonce: () -> String = { UUID().uuidString.lowercased() }
+        nonce: () -> String = { UUID().uuidString.lowercased() },
+        purgeNonce: () -> String = { UUID().uuidString.lowercased() }
     ) throws -> [SecureTreeTombstone] {
         guard manifest.rootIdentity == rootIdentity else {
             throw SecureFileTreeError.identityChanged(rootPath)
@@ -638,6 +656,7 @@ final class SecureFileTree {
                 ($0.relativePath, $0)
             }
         )
+        var allPurgePaths = Set<String>()
         return try relativeTargets.compactMap { target in
             _ = try validatedComponents(target)
             guard let entry = entries[target] else {
@@ -649,11 +668,41 @@ final class SecureFileTree {
             let tombstonePath = parent.isEmpty
                 ? privateName
                 : parent + "/" + privateName
+            let purges = try manifest.entriesDeepestFirst.compactMap {
+                manifestEntry -> SecureTreePurge? in
+                guard manifestEntry.relativePath == target
+                        || manifestEntry.relativePath.hasPrefix(target + "/") else {
+                    return nil
+                }
+                let suffix = String(
+                    manifestEntry.relativePath.dropFirst(target.count)
+                )
+                let movedPath = tombstonePath + suffix
+                let movedComponents = try validatedComponents(movedPath)
+                let movedParent = movedComponents.dropLast().joined(separator: "/")
+                let purgeName = ".mac-face-lock-purge-\(purgeNonce())"
+                _ = try validatedSingleComponent(purgeName)
+                let purgePath = movedParent.isEmpty
+                    ? purgeName
+                    : movedParent + "/" + purgeName
+                guard allPurgePaths.insert(purgePath).inserted else {
+                    throw SecureFileTreeError.invalidRelativePath(purgePath)
+                }
+                return SecureTreePurge(
+                    originalRelativePath: manifestEntry.relativePath,
+                    tombstoneRelativePath: movedPath,
+                    purgeRelativePath: purgePath,
+                    identity: manifestEntry.identity,
+                    kind: manifestEntry.kind,
+                    fileVersion: manifestEntry.fileVersion
+                )
+            }
             return SecureTreeTombstone(
                 originalRelativePath: target,
                 tombstoneRelativePath: tombstonePath,
                 identity: entry.identity,
-                kind: entry.kind
+                kind: entry.kind,
+                purges: purges
             )
         }
     }
@@ -664,7 +713,7 @@ final class SecureFileTree {
         beforeRename: ((SecureTreeTombstone) throws -> Void)? = nil,
         afterRename: ((SecureTreeTombstone) throws -> Void)? = nil,
         beforeFinalRemoval: ((SecureTreeEntry) throws -> Void)? = nil,
-        finalNonce: () -> String = { UUID().uuidString.lowercased() }
+        afterFinalRename: ((SecureTreePurge) throws -> Void)? = nil
     ) throws {
         guard manifest.rootIdentity == rootIdentity else {
             throw SecureFileTreeError.identityChanged(rootPath)
@@ -693,7 +742,7 @@ final class SecureFileTree {
                 manifest: manifest,
                 tombstone: tombstone,
                 beforeFinalRemoval: beforeFinalRemoval,
-                finalNonce: finalNonce
+                afterFinalRename: afterFinalRename
             )
         }
         try requireStableRoot()
@@ -705,53 +754,308 @@ final class SecureFileTree {
         beforeRename: ((SecureTreeTombstone) throws -> Void)? = nil,
         afterRename: ((SecureTreeTombstone) throws -> Void)? = nil,
         beforeFinalRemoval: ((SecureTreeEntry) throws -> Void)? = nil,
-        finalNonce: () -> String = { UUID().uuidString.lowercased() }
+        afterFinalRename: ((SecureTreePurge) throws -> Void)? = nil
     ) throws {
-        try requireStableRoot()
+        try validateTombstoneStates(tombstones, budget: budget)
         for tombstone in tombstones {
-            let originalManifest = try preflight(
-                relativeTargets: [tombstone.originalRelativePath],
-                budget: budget
-            )
-            if let original = originalManifest.entriesDeepestFirst.first(
-                where: { $0.relativePath == tombstone.originalRelativePath }
-            ) {
-                guard original.identity == tombstone.identity,
-                      original.kind == tombstone.kind else {
-                    throw SecureFileTreeError.identityChanged(
-                        tombstone.originalRelativePath
-                    )
-                }
+            let rootPurge = tombstone.purges.first {
+                $0.originalRelativePath == tombstone.originalRelativePath
+            }
+            guard let rootPurge else {
+                throw SecureFileTreeError.invalidRelativePath(
+                    tombstone.originalRelativePath
+                )
+            }
+            if try validatedPurgeEntryIfPresent(
+                rootPurge,
+                at: rootPurge.originalRelativePath,
+                allowRenameCtimeChange: false
+            ) != nil {
                 try moveToTombstone(
                     tombstone,
-                    entry: original,
+                    entry: secureEntry(
+                        from: rootPurge,
+                        relativePath: rootPurge.originalRelativePath
+                    ),
                     beforeRename: beforeRename,
                     afterRename: afterRename
                 )
             }
-
-            let movedManifest = try preflight(
-                relativeTargets: [tombstone.tombstoneRelativePath],
-                budget: budget
-            )
-            guard let movedRoot = movedManifest.entriesDeepestFirst.first(
-                where: { $0.relativePath == tombstone.tombstoneRelativePath }
-            ) else {
-                continue
+            try validateMutuallyExclusivePurgeStates(tombstone)
+            for purge in tombstone.purges.sorted(
+                by: purgeDeletionOrder
+            ) {
+                let state = try purgeState(purge)
+                switch state {
+                case .absent:
+                    continue
+                case .original:
+                    throw SecureFileTreeError.identityChanged(
+                        purge.originalRelativePath
+                    )
+                case .tombstone:
+                    try removeEntryAtPath(
+                        purge.tombstoneRelativePath,
+                        purge: purge,
+                        beforeFinalRemoval: beforeFinalRemoval,
+                        afterFinalRename: afterFinalRename
+                    )
+                case .purge:
+                    try removePersistedPurge(purge)
+                }
             }
-            guard movedRoot.identity == tombstone.identity,
-                  movedRoot.kind == tombstone.kind else {
-                throw SecureFileTreeError.identityChanged(
-                    tombstone.tombstoneRelativePath
-                )
-            }
-            try deleteManifestEntries(
-                movedManifest.entriesDeepestFirst,
-                beforeFinalRemoval: beforeFinalRemoval,
-                finalNonce: finalNonce
-            )
+            try validateMutuallyExclusivePurgeStates(tombstone)
         }
         try requireStableRoot()
+    }
+
+    func validateTombstoneStates(
+        _ tombstones: [SecureTreeTombstone],
+        budget: SecureTreeBudget
+    ) throws {
+        try requireStableRoot()
+        var purgeCount = 0
+        for tombstone in tombstones {
+            let (nextCount, overflow) = purgeCount.addingReportingOverflow(
+                tombstone.purges.count
+            )
+            guard !overflow, nextCount <= budget.maximumEntries else {
+                throw SecureFileTreeError.entryBudgetExceeded
+            }
+            purgeCount = nextCount
+            try validateTombstoneDefinition(tombstone)
+            try validateMutuallyExclusivePurgeStates(tombstone)
+        }
+        try requireStableRoot()
+    }
+
+    private func validateTombstoneDefinition(
+        _ tombstone: SecureTreeTombstone
+    ) throws {
+        let originalRoot = try validatedComponents(
+            tombstone.originalRelativePath
+        )
+        let movedRoot = try validatedComponents(
+            tombstone.tombstoneRelativePath
+        )
+        guard originalRoot.dropLast() == movedRoot.dropLast(),
+              movedRoot.last?.hasPrefix(".mac-face-lock-delete-") == true,
+              !tombstone.purges.isEmpty else {
+            throw SecureFileTreeError.invalidRelativePath(
+                tombstone.tombstoneRelativePath
+            )
+        }
+        var originals = Set<String>()
+        var movedPaths = Set<String>()
+        var purgePaths = Set<String>()
+        var rootRecord: SecureTreePurge?
+        for purge in tombstone.purges {
+            let original = try validatedComponents(
+                purge.originalRelativePath
+            )
+            let moved = try validatedComponents(
+                purge.tombstoneRelativePath
+            )
+            let final = try validatedComponents(
+                purge.purgeRelativePath
+            )
+            guard purge.originalRelativePath == tombstone.originalRelativePath
+                    || purge.originalRelativePath.hasPrefix(
+                        tombstone.originalRelativePath + "/"
+                    ),
+                  original.dropFirst(originalRoot.count)
+                    == moved.dropFirst(movedRoot.count),
+                  Array(moved.prefix(movedRoot.count)) == movedRoot,
+                  moved.dropLast() == final.dropLast(),
+                  final.last?.hasPrefix(".mac-face-lock-purge-") == true,
+                  final.last != ".mac-face-lock-purge-",
+                  originals.insert(purge.originalRelativePath).inserted,
+                  movedPaths.insert(purge.tombstoneRelativePath).inserted,
+                  purgePaths.insert(purge.purgeRelativePath).inserted,
+                  (purge.kind == .file) == (purge.fileVersion != nil)
+            else {
+                throw SecureFileTreeError.invalidRelativePath(
+                    purge.purgeRelativePath
+                )
+            }
+            if purge.originalRelativePath == tombstone.originalRelativePath {
+                rootRecord = purge
+            }
+        }
+        guard let rootRecord,
+              rootRecord.tombstoneRelativePath
+                == tombstone.tombstoneRelativePath,
+              rootRecord.identity == tombstone.identity,
+              rootRecord.kind == tombstone.kind else {
+            throw SecureFileTreeError.invalidRelativePath(
+                tombstone.originalRelativePath
+            )
+        }
+    }
+
+    private func secureEntry(
+        from purge: SecureTreePurge,
+        relativePath: String
+    ) -> SecureTreeEntry {
+        SecureTreeEntry(
+            relativePath: relativePath,
+            identity: purge.identity,
+            kind: purge.kind,
+            fileVersion: purge.fileVersion
+        )
+    }
+
+    private func validatedPurgeEntryIfPresent(
+        _ purge: SecureTreePurge,
+        at relativePath: String,
+        allowRenameCtimeChange: Bool
+    ) throws -> SecureTreeEntry? {
+        let components = try validatedComponents(relativePath)
+        let (parentFD, name) = try openParent(
+            components,
+            path: relativePath,
+            missingIsAllowed: true
+        )
+        guard parentFD >= 0 else {
+            return nil
+        }
+        defer { Darwin.close(parentFD) }
+        var current = stat()
+        guard fstatat(parentFD, name, &current, AT_SYMLINK_NOFOLLOW) == 0 else {
+            if errno == ENOENT {
+                return nil
+            }
+            throw SecureFileTreeError.systemCall(
+                "fstatat",
+                relativePath,
+                errno
+            )
+        }
+        let entry = secureEntry(from: purge, relativePath: relativePath)
+        if allowRenameCtimeChange {
+            try validateMovedEntryStat(current, entry: entry)
+        } else {
+            try validateEntryStat(current, entry: entry)
+        }
+        return entry
+    }
+
+    private func purgeState(
+        _ purge: SecureTreePurge
+    ) throws -> SecurePurgeState {
+        let original = try validatedPurgeEntryIfPresent(
+            purge,
+            at: purge.originalRelativePath,
+            allowRenameCtimeChange: false
+        ) != nil
+        let tombstone = try validatedPurgeEntryIfPresent(
+            purge,
+            at: purge.tombstoneRelativePath,
+            allowRenameCtimeChange: true
+        ) != nil
+        let final = try validatedPurgeEntryIfPresent(
+            purge,
+            at: purge.purgeRelativePath,
+            allowRenameCtimeChange: true
+        ) != nil
+        let presentCount = [original, tombstone, final].filter { $0 }.count
+        guard presentCount <= 1 else {
+            throw SecureFileTreeError.identityChanged(
+                purge.originalRelativePath
+            )
+        }
+        if original { return .original }
+        if tombstone { return .tombstone }
+        if final { return .purge }
+        return .absent
+    }
+
+    private func validateMutuallyExclusivePurgeStates(
+        _ tombstone: SecureTreeTombstone
+    ) throws {
+        for purge in tombstone.purges {
+            _ = try purgeState(purge)
+        }
+    }
+
+    private func purgeDeletionOrder(
+        _ left: SecureTreePurge,
+        _ right: SecureTreePurge
+    ) -> Bool {
+        let leftDepth = left.tombstoneRelativePath.split(separator: "/").count
+        let rightDepth = right.tombstoneRelativePath.split(separator: "/").count
+        if leftDepth != rightDepth {
+            return leftDepth > rightDepth
+        }
+        return left.tombstoneRelativePath < right.tombstoneRelativePath
+    }
+
+    private func removeEntryAtPath(
+        _ relativePath: String,
+        purge: SecureTreePurge,
+        beforeFinalRemoval: ((SecureTreeEntry) throws -> Void)?,
+        afterFinalRename: ((SecureTreePurge) throws -> Void)?
+    ) throws {
+        let components = try validatedComponents(relativePath)
+        let (parentFD, name) = try openParent(
+            components,
+            path: relativePath,
+            missingIsAllowed: true
+        )
+        guard parentFD >= 0 else {
+            return
+        }
+        defer { Darwin.close(parentFD) }
+        try removeEntry(
+            parentFD: parentFD,
+            name: name,
+            entry: secureEntry(from: purge, relativePath: relativePath),
+            allowRenameCtimeChange: true,
+            beforeFinalRemoval: beforeFinalRemoval,
+            purge: purge,
+            afterFinalRename: afterFinalRename
+        )
+    }
+
+    private func removePersistedPurge(
+        _ purge: SecureTreePurge
+    ) throws {
+        guard try purgeState(purge) == .purge else {
+            throw SecureFileTreeError.identityChanged(
+                purge.purgeRelativePath
+            )
+        }
+        let components = try validatedComponents(purge.purgeRelativePath)
+        let (parentFD, name) = try openParent(
+            components,
+            path: purge.purgeRelativePath,
+            missingIsAllowed: false
+        )
+        defer { Darwin.close(parentFD) }
+        _ = try validatedPurgeEntryIfPresent(
+            purge,
+            at: purge.purgeRelativePath,
+            allowRenameCtimeChange: true
+        )
+        var flags = purge.kind == .directory ? AT_REMOVEDIR : 0
+        flags |= AT_NODELETEBUSY
+        if purge.kind == .file {
+            flags |= AT_UNIQUE
+        }
+        guard unlinkat(parentFD, name, flags) == 0 else {
+            throw SecureFileTreeError.systemCall(
+                "unlinkat",
+                purge.purgeRelativePath,
+                errno
+            )
+        }
+        guard fsync(parentFD) == 0 else {
+            throw SecureFileTreeError.systemCall(
+                "fsync",
+                purge.purgeRelativePath,
+                errno
+            )
+        }
     }
 
     private func moveToTombstone(
@@ -844,7 +1148,7 @@ final class SecureFileTree {
         manifest: SecureTreeManifest,
         tombstone: SecureTreeTombstone,
         beforeFinalRemoval: ((SecureTreeEntry) throws -> Void)?,
-        finalNonce: () -> String
+        afterFinalRename: ((SecureTreePurge) throws -> Void)?
     ) throws {
         let movedEntries = manifest.entriesDeepestFirst.compactMap { entry
             -> SecureTreeEntry? in
@@ -866,7 +1170,8 @@ final class SecureFileTree {
                 movedEntries,
                 renamedRootPath: tombstone.tombstoneRelativePath,
                 beforeFinalRemoval: beforeFinalRemoval,
-                finalNonce: finalNonce
+                purges: tombstone.purges,
+                afterFinalRename: afterFinalRename
             )
         } catch SecureFileTreeError.identityChanged(let path) {
             guard path == tombstone.tombstoneRelativePath
@@ -888,9 +1193,20 @@ final class SecureFileTree {
         _ entries: [SecureTreeEntry],
         renamedRootPath: String? = nil,
         beforeFinalRemoval: ((SecureTreeEntry) throws -> Void)? = nil,
-        finalNonce: () -> String = { UUID().uuidString.lowercased() }
+        purges: [SecureTreePurge],
+        afterFinalRename: ((SecureTreePurge) throws -> Void)? = nil
     ) throws {
+        let purgeByPath = Dictionary(
+            uniqueKeysWithValues: purges.map {
+                ($0.tombstoneRelativePath, $0)
+            }
+        )
         for entry in entries {
+            guard let purge = purgeByPath[entry.relativePath] else {
+                throw SecureFileTreeError.invalidRelativePath(
+                    entry.relativePath
+                )
+            }
             let components = try validatedComponents(entry.relativePath)
             let (parentFD, name) = try openParent(
                 components,
@@ -908,7 +1224,8 @@ final class SecureFileTree {
                 allowRenameCtimeChange:
                     entry.relativePath == renamedRootPath,
                 beforeFinalRemoval: beforeFinalRemoval,
-                finalNonce: finalNonce
+                purge: purge,
+                afterFinalRename: afterFinalRename
             )
         }
     }
@@ -1469,7 +1786,8 @@ final class SecureFileTree {
         entry: SecureTreeEntry,
         allowRenameCtimeChange: Bool = false,
         beforeFinalRemoval: ((SecureTreeEntry) throws -> Void)? = nil,
-        finalNonce: () -> String = { UUID().uuidString.lowercased() }
+        purge: SecureTreePurge,
+        afterFinalRename: ((SecureTreePurge) throws -> Void)? = nil
     ) throws {
         var current = stat()
         guard fstatat(parentFD, name, &current, AT_SYMLINK_NOFOLLOW) == 0 else {
@@ -1506,8 +1824,26 @@ final class SecureFileTree {
         // This closes the auditable public-name check/delete window. The final
         // unlink remains pathname-based, so the security model also relies on
         // this private name not being disclosed to a concurrent same-UID actor.
-        let purgeName = ".mac-face-lock-purge-\(finalNonce())"
-        _ = try validatedSingleComponent(purgeName)
+        guard purge.tombstoneRelativePath == entry.relativePath,
+              purge.identity == entry.identity,
+              purge.kind == entry.kind,
+              purge.fileVersion == entry.fileVersion else {
+            throw SecureFileTreeError.invalidRelativePath(
+                purge.purgeRelativePath
+            )
+        }
+        let entryComponents = try validatedComponents(entry.relativePath)
+        let purgeComponents = try validatedComponents(
+            purge.purgeRelativePath
+        )
+        guard entryComponents.dropLast() == purgeComponents.dropLast(),
+              let purgeName = purgeComponents.last,
+              purgeName.hasPrefix(".mac-face-lock-purge-"),
+              purgeName != ".mac-face-lock-purge-" else {
+            throw SecureFileTreeError.invalidRelativePath(
+                purge.purgeRelativePath
+            )
+        }
         guard renameatx_np(
             parentFD,
             name,
@@ -1536,6 +1872,7 @@ final class SecureFileTree {
                 savedErrno
             )
         }
+        try afterFinalRename?(purge)
 
         do {
             var quarantined = stat()

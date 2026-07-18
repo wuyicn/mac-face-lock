@@ -72,6 +72,7 @@ private enum LegacyIdentity {
     static let agentPlist = "com.wuyi.mac-face-lock-agent.plist"
     static let statusPlist = "com.wuyi.mac-face-lock-status.plist"
     static let maximumPlistBytes = 1_048_576
+    static let maximumJournalPurgeEntries = 50_000
 
     static let targets = [
         "config/config.json",
@@ -133,7 +134,7 @@ private func readSecureData(
 }
 
 private final class LegacyCleanupJournalStore {
-    private static let maximumBytes = 64 * 1_024
+    private static let maximumBytes = 32 * 1_024 * 1_024
     private static let completionData = Data(
         #"{"schema_version":1,"completed":true}"#.utf8
     )
@@ -371,12 +372,14 @@ private final class LegacyCleanupJournalStore {
               tombstones.count <= LegacyIdentity.targets.count else {
             return false
         }
+        var purgeCount = 0
         return tombstones.allSatisfy { tombstone in
             guard Set(tombstone.keys) == [
                 "original_relative_path",
                 "tombstone_relative_path",
                 "identity",
                 "kind",
+                "purges",
             ],
             let identity = tombstone["identity"] as? [String: Any],
             Set(identity.keys) == ["device", "inode"],
@@ -387,13 +390,98 @@ private final class LegacyCleanupJournalStore {
             let moved = tombstone["tombstone_relative_path"] as? String,
             moved.contains(".mac-face-lock-delete-"),
             let kind = tombstone["kind"] as? String,
-            ["file", "directory"].contains(kind)
+            ["file", "directory"].contains(kind),
+            let purges = tombstone["purges"] as? [[String: Any]],
+            !purges.isEmpty
             else {
                 return false
             }
+            let (nextCount, overflow) = purgeCount.addingReportingOverflow(
+                purges.count
+            )
+            guard !overflow,
+                  nextCount <= LegacyIdentity.maximumJournalPurgeEntries,
+                  hasExactPurgeShape(
+                    purges,
+                    originalRoot: original,
+                    tombstoneRoot: moved
+                  ) else {
+                return false
+            }
+            purgeCount = nextCount
             let originalParent = (original as NSString).deletingLastPathComponent
             let movedParent = (moved as NSString).deletingLastPathComponent
             return originalParent == movedParent
+        }
+    }
+
+    private func hasExactPurgeShape(
+        _ purges: [[String: Any]],
+        originalRoot: String,
+        tombstoneRoot: String
+    ) -> Bool {
+        var originalPaths = Set<String>()
+        var tombstonePaths = Set<String>()
+        var purgePaths = Set<String>()
+        return purges.allSatisfy { purge in
+            let keys = Set(purge.keys)
+            guard keys == [
+                "original_relative_path",
+                "tombstone_relative_path",
+                "purge_relative_path",
+                "identity",
+                "kind",
+            ] || keys == [
+                "original_relative_path",
+                "tombstone_relative_path",
+                "purge_relative_path",
+                "identity",
+                "kind",
+                "file_version",
+            ],
+            let original = purge["original_relative_path"] as? String,
+            original == originalRoot || original.hasPrefix(originalRoot + "/"),
+            let tombstone = purge["tombstone_relative_path"] as? String,
+            tombstone == tombstoneRoot
+                || tombstone.hasPrefix(tombstoneRoot + "/"),
+            let final = purge["purge_relative_path"] as? String,
+            (final as NSString).lastPathComponent.hasPrefix(
+                ".mac-face-lock-purge-"
+            ),
+            (final as NSString).lastPathComponent
+                != ".mac-face-lock-purge-",
+            (tombstone as NSString).deletingLastPathComponent
+                == (final as NSString).deletingLastPathComponent,
+            let identity = purge["identity"] as? [String: Any],
+            Set(identity.keys) == ["device", "inode"],
+            isExactUnsignedInteger(identity["device"]),
+            isExactUnsignedInteger(identity["inode"]),
+            let kind = purge["kind"] as? String,
+            ["file", "directory"].contains(kind),
+            originalPaths.insert(original).inserted,
+            tombstonePaths.insert(tombstone).inserted,
+            purgePaths.insert(final).inserted else {
+                return false
+            }
+            if kind == "directory" {
+                return purge["file_version"] == nil
+            }
+            guard let version = purge["file_version"] as? [String: Any],
+                  Set(version.keys) == [
+                    "logical_size",
+                    "modification_seconds",
+                    "modification_nanoseconds",
+                    "change_seconds",
+                    "change_nanoseconds",
+                  ],
+                  isExactUnsignedInteger(version["logical_size"]),
+                  isExactSignedInteger(version["modification_seconds"]),
+                  isExactSignedInteger(version["modification_nanoseconds"]),
+                  isExactSignedInteger(version["change_seconds"]),
+                  isExactSignedInteger(version["change_nanoseconds"]) else {
+                return false
+            }
+            return true
         }
     }
 
@@ -408,6 +496,10 @@ private final class LegacyCleanupJournalStore {
         let encoding = String(cString: number.objCType)
         return ["c", "C", "s", "S", "i", "I", "l", "L", "q", "Q"]
             .contains(encoding)
+    }
+
+    private func isExactSignedInteger(_ value: Any?) -> Bool {
+        isExactUnsignedInteger(value)
     }
 }
 
@@ -665,12 +757,21 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
                     try self.testEventHandler?(
                         "afterSourceTombstoneRename"
                     )
+                },
+                afterFinalRename: { purge in
+                    try self.testEventHandler?(
+                        "afterSourcePurgeRename:"
+                            + purge.originalRelativePath
+                    )
                 }
             )
             try journalStore.advance(to: .sourceTargetsRemoved)
             try removeLegacyPlists(candidate)
             try journalStore.advance(to: .plistsRemoved)
-            try await verifyEverythingAbsent(candidate)
+            try await verifyEverythingAbsent(
+                candidate,
+                tombstones: tombstones
+            )
             try journalStore.finishWithoutLegacyPath()
             return .notFound
         } catch {
@@ -736,6 +837,12 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
                     try self.testEventHandler?(
                         "afterSourceTombstoneRename"
                     )
+                },
+                afterFinalRename: { purge in
+                    try self.testEventHandler?(
+                        "afterSourcePurgeRename:"
+                            + purge.originalRelativePath
+                    )
                 }
             )
             if journal.phase == .confirmed || journal.phase == .servicesStopped {
@@ -757,7 +864,8 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
                     fileURLWithPath: journal.rootPath,
                     isDirectory: true
                 ),
-                rootIdentity: journal.rootIdentity
+                rootIdentity: journal.rootIdentity,
+                tombstones: journal.tombstones ?? []
             )
             try journalStore.finishWithoutLegacyPath()
             return .notFound
@@ -780,24 +888,10 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             rootURL: rootURL,
             rootIdentity: journal.rootIdentity
         )
-        let tombstoneTargets = journal.tombstones?.map(
-            \.tombstoneRelativePath
-        ) ?? []
-        let manifest = try tree.preflight(
-            relativeTargets: LegacyIdentity.targets + tombstoneTargets,
+        try tree.validateTombstoneStates(
+            journal.tombstones ?? [],
             budget: .legacyCleanup
         )
-        for tombstone in journal.tombstones ?? [] {
-            let entries = manifest.entriesDeepestFirst.filter {
-                $0.relativePath == tombstone.originalRelativePath
-                    || $0.relativePath == tombstone.tombstoneRelativePath
-            }
-            guard entries.count <= 1,
-                  entries.first?.identity == tombstone.identity || entries.isEmpty
-            else {
-                throw LegacyCleanupError.verificationFailed("tombstone")
-            }
-        }
         try validateRemainingLegacyPlists(rootURL: rootURL)
     }
 
@@ -891,26 +985,36 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
     }
 
     private func verifyEverythingAbsent(
-        _ candidate: LegacyCleanupCandidate
+        _ candidate: LegacyCleanupCandidate,
+        tombstones: [SecureTreeTombstone]
     ) async throws {
         try await verifyEverythingAbsent(
             rootURL: candidate.rootURL,
-            rootIdentity: candidate.rootIdentity
+            rootIdentity: candidate.rootIdentity,
+            tombstones: tombstones
         )
     }
 
     private func verifyEverythingAbsent(
         rootURL: URL,
-        rootIdentity: SecureFileIdentity
+        rootIdentity: SecureFileIdentity,
+        tombstones: [SecureTreeTombstone]
     ) async throws {
         try await verifyUnloaded(LegacyIdentity.statusLabel)
         try await verifyUnloaded(LegacyIdentity.agentLabel)
 
+        let journalDerivedPaths = tombstones.flatMap { tombstone in
+            [tombstone.originalRelativePath, tombstone.tombstoneRelativePath]
+                + tombstone.purges.map(\.purgeRelativePath)
+        }
+        let completionTargets = Array(
+            Set(LegacyIdentity.targets + journalDerivedPaths)
+        ).sorted()
         let sourceManifest = try sourceTree(
             rootURL: rootURL,
             rootIdentity: rootIdentity
         ).preflight(
-            relativeTargets: LegacyIdentity.targets,
+            relativeTargets: completionTargets,
             budget: .legacyCleanup
         )
         guard sourceManifest.entriesDeepestFirst.isEmpty else {
