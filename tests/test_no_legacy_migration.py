@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -60,6 +61,49 @@ SWIFT_SENSITIVE_ANCHOR_BUDGETS = {
         f'Text("{NOTICE}")',
     ),
 }
+DIRECTORY_ENUMERATION_CAPABILITIES = {
+    "contentsOfDirectory": re.compile(r"\bcontentsOfDirectory\s*\("),
+    "enumerator(": re.compile(r"\benumerator\s*\("),
+    "subpathsOfDirectory": re.compile(r"\bsubpathsOfDirectory\s*\("),
+}
+FILE_READ_CAPABILITIES = {
+    "Data(contentsOf:)": (
+        re.compile(r"\bData\s*\(\s*contentsOf\s*:"),
+        frozenset(
+            {
+                "src/app/LocalJSONStore.swift",
+                "src/app/ServiceManager.swift",
+                "src/app/SetupCoordinator.swift",
+            }
+        ),
+    ),
+    "String(contentsOf:)": (
+        re.compile(r"\bString\s*\(\s*contentsOf\s*:"),
+        frozenset(),
+    ),
+    "FileHandle(forReadingFrom:)": (
+        re.compile(r"\bFileHandle\s*\(\s*forReadingFrom\s*:"),
+        frozenset({"src/app/LocalJSONStore.swift"}),
+    ),
+    "contents(atPath:)": (
+        re.compile(r"\bcontents\s*\(\s*atPath\s*:"),
+        frozenset(),
+    ),
+    "Darwin/POSIX open": (
+        re.compile(
+            r"(?:\b(?:Darwin|Glibc)\s*\.\s*open|(?<![\w.])open)"
+            r"\s*\(\s*[^,\n]+,\s*(?:O_[A-Z0-9_| ]+|[0-9]+)"
+        ),
+        frozenset(),
+    ),
+    "Darwin/POSIX read": (
+        re.compile(
+            r"(?:\b(?:Darwin|Glibc)\s*\.\s*read|(?<![\w.])read)"
+            r"\s*\(\s*[^,\n]+,\s*[^,\n]+,\s*[^)\n]+\)"
+        ),
+        frozenset(),
+    ),
+}
 
 
 def normalize_swift_policy_text(text: str) -> str:
@@ -94,6 +138,21 @@ def collect_policy_violations(sources: dict[str, str]) -> list[str]:
         )
         if is_swift:
             normalized_swift_sources[source_name] = searchable_content
+            for capability, expression in DIRECTORY_ENUMERATION_CAPABILITIES.items():
+                if expression.search(content):
+                    violations.append(
+                        f"{source_name}: directory-enumeration capability "
+                        f"'{capability}' is forbidden"
+                    )
+            for capability, policy in FILE_READ_CAPABILITIES.items():
+                expression, allowed_sources = policy
+                if expression.search(content) and source_name not in allowed_sources:
+                    allowed_label = ", ".join(sorted(allowed_sources)) or "no files"
+                    violations.append(
+                        f"{source_name}: direct file-read capability "
+                        f"'{capability}' is not allowed; allowed only in "
+                        f"{allowed_label}"
+                    )
         for forbidden in MIGRATION_FORBIDDEN:
             searchable_forbidden = (
                 normalize_swift_policy_text(forbidden) if is_swift else forbidden
@@ -140,6 +199,26 @@ def collect_policy_violations(sources: dict[str, str]) -> list[str]:
 
 
 class LegacyMigrationDeferralTests(unittest.TestCase):
+    def test_file_read_capability_rejects_chained_launchagents_helper(self) -> None:
+        sources = load_policy_sources()
+        sources["src/app/LegacyProbe.swift"] = """
+let legacyPlist = home
+    .appendingPathComponent("Library")
+    .appendingPathComponent("LaunchAgents")
+    .appendingPathComponent("com.wuyi.mac-face-lock-status.plist")
+let legacyData = try Data(contentsOf: legacyPlist)
+"""
+
+        violations = collect_policy_violations(sources)
+
+        self.assertIn(
+            "src/app/LegacyProbe.swift: direct file-read capability "
+            "'Data(contentsOf:)' is not allowed; allowed only in "
+            "src/app/LocalJSONStore.swift, src/app/ServiceManager.swift, "
+            "src/app/SetupCoordinator.swift",
+            violations,
+        )
+
     def test_normalized_detector_rejects_split_launch_agents_anchor(self) -> None:
         sources = load_policy_sources()
         sources["src/app/LegacyProbe.swift"] = (

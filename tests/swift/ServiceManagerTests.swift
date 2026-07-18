@@ -20,6 +20,7 @@ private func require(_ condition: @autoclosure () -> Bool, _ message: String) th
 private final class MemoryServiceFileSystem: ServiceFileSystem {
     private(set) var files: [String: Data] = [:]
     private(set) var operations: [String] = []
+    private(set) var readPaths: [String] = []
     private var readSequences: [String: [Data]] = [:]
 
     func seed(_ data: Data, at url: URL) {
@@ -36,6 +37,7 @@ private final class MemoryServiceFileSystem: ServiceFileSystem {
 
     func readData(at url: URL) throws -> Data {
         let path = url.standardizedFileURL.path
+        readPaths.append(path)
         if var sequence = readSequences[path], !sequence.isEmpty {
             let data = sequence.removeFirst()
             readSequences[path] = sequence
@@ -287,6 +289,7 @@ private struct ServiceFixture {
 struct ServiceManagerTests {
     static func main() async throws {
         try testProductionHealthWindowCoversPermissionAndHeartbeatStartup()
+        try await testReleaseHealthReadsOnlyCurrentManagedFiles()
         try await testInstallRendersOnlyApplicationAndSupportPaths()
         try await testFailedStableHealthRestoresPreviousPlistAndJob()
         try await testUninstallPreservesApplicationData()
@@ -316,6 +319,49 @@ struct ServiceManagerTests {
             ServiceManager.productionStableHealthWindowSeconds
                 > agentStartupBudgetSeconds,
             "production stable-health window does not cover permission waits and heartbeats"
+        )
+    }
+
+    private static func testReleaseHealthReadsOnlyCurrentManagedFiles() async throws {
+        let fixture = try ServiceFixture(printPIDs: [42, 42, 42, 42])
+        try fixture.seedHealthyStateSequence(sequences: [1, 2, 3, 4])
+        let manager = fixture.manager()
+
+        try await manager.install(
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        let status = await manager.status()
+
+        try require(status.isHealthy, "current release Agent did not report healthy")
+        let actualReadPaths = Set(fixture.fileSystem.readPaths)
+        let expectedReadPaths: Set<String> = [
+            fixture.templateURL.standardizedFileURL.path,
+            fixture.plistURL.standardizedFileURL.path,
+            fixture.stateURL.standardizedFileURL.path,
+        ]
+        try require(
+            actualReadPaths == expectedReadPaths,
+            "release health read outside current managed files: "
+                + actualReadPaths.sorted().joined(separator: ", ")
+        )
+
+        let legacyStatusPlist = fixture.launchAgentsURL.appendingPathComponent(
+            "com.wuyi.mac-face-lock-status.plist"
+        ).standardizedFileURL.path
+        try require(
+            !fixture.fileSystem.readPaths.contains(legacyStatusPlist),
+            "release health read the legacy status LaunchAgent plist"
+        )
+        let launchAgentsPrefix = fixture.launchAgentsURL.standardizedFileURL.path + "/"
+        let launchAgentReadPaths = Set(
+            fixture.fileSystem.readPaths.filter {
+                $0.hasPrefix(launchAgentsPrefix)
+            }
+        )
+        try require(
+            launchAgentReadPaths == [fixture.plistURL.standardizedFileURL.path],
+            "release health read an extra LaunchAgents file"
         )
     }
 
