@@ -296,6 +296,33 @@ private struct LegacyCleanerFixture {
         try data.write(to: journalURL)
     }
 
+    func writeValidJournal(rootURL: URL) throws {
+        var rootStat = stat()
+        guard lstat(rootURL.path, &rootStat) == 0 else {
+            throw TestFailure.assertion("could not stat journal root")
+        }
+        try writeJournalObject([
+            "schema_version": 1,
+            "root_path": rootURL.path,
+            "root_identity": [
+                "device": NSNumber(value: UInt64(rootStat.st_dev)),
+                "inode": NSNumber(value: UInt64(rootStat.st_ino)),
+            ],
+            "relative_targets": [
+                "config/config.json",
+                "data",
+                "logs",
+                "dist/Mac Face Lock Agent.app",
+                "dist/Mac Face Lock.app",
+                "dist/Mac Face Lock Status.app",
+            ],
+            "phase": "confirmed",
+        ])
+        guard chmod(journalURL.path, 0o600) == 0 else {
+            throw TestFailure.assertion("could not set journal mode")
+        }
+    }
+
     func makeCleaner(userID: uid_t) -> LegacyInstallCleaner {
         LegacyInstallCleaner(
             homeURL: home,
@@ -478,6 +505,7 @@ struct LegacyInstallCleanerTests {
         try await testUnconfirmedCandidateCannotCreateJournal()
         try await testNonLoadedServicesAreAccepted()
         try await testRejectsNonAbsentPrintFailures()
+        try await testRejectsAbsentStderrWithNonemptyStdout()
         try await testFinalVerificationRejectsNonAbsentPrintFailure()
         try await testCommandFailureBlocksDeletion()
         try await testLoadedServiceBlocksDeletion()
@@ -488,6 +516,7 @@ struct LegacyInstallCleanerTests {
         try await testRetryPlistReplacementBlocksDeletion()
         try await testRetryIsIdempotentWithAbsentTargets()
         try await testRetryCompletesWithoutLaunchAgentsDirectory()
+        try await testRetryRejectsReleaseSupportOverlap()
         try await testRetryRejectsInvalidJournalMetadata()
         try await testRetryRejectsTamperedJournalFields()
         try await testRetryRejectsChangedRootIdentity()
@@ -776,6 +805,39 @@ struct LegacyInstallCleanerTests {
         try require(
             journal["phase"] as? String == "plistsRemoved",
             "final print failure did not retain retry phase"
+        )
+    }
+
+    private static func testRejectsAbsentStderrWithNonemptyStdout() async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        fixture.commandRunner.resultProvider = { _, arguments in
+            let absent = absentServiceResult(arguments: arguments)
+            guard arguments.first == "print" else {
+                return absent
+            }
+            return ServiceCommandResult(
+                exitCode: absent.exitCode,
+                stdout: "unexpected output",
+                stderr: absent.stderr
+            )
+        }
+        let candidate = try fixture.confirmedCandidate()
+
+        guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion(
+                "missing-service stderr with nonempty stdout was accepted"
+            )
+        }
+        try require(
+            fixture.fileExists("data/face-template.bin"),
+            "nonempty print stdout deleted source data"
+        )
+        try require(
+            FileManager.default.fileExists(atPath: fixture.agentURL.path)
+                && FileManager.default.fileExists(atPath: fixture.statusURL.path),
+            "nonempty print stdout deleted a plist"
         )
     }
 
@@ -1116,6 +1178,44 @@ struct LegacyInstallCleanerTests {
                 throw TestFailure.assertion("could not reset oversized journal mode")
             }
             return fixture.cleaner
+        }
+    }
+
+    private static func testRetryRejectsReleaseSupportOverlap() async throws {
+        for (relativeSupport, label) in [
+            ("", "equal root"),
+            ("data/release-support", "target descendant"),
+        ] {
+            let fixture = try LegacyCleanerFixture(
+                supportRelativeToLegacyRoot: relativeSupport
+            )
+            defer { fixture.remove() }
+            try fixture.write("data/preserve.bin", "preserve")
+            try FileManager.default.removeItem(at: fixture.launchAgentsURL)
+            try fixture.writeValidJournal(rootURL: fixture.legacyRoot)
+
+            let result = await fixture.cleaner.retry()
+
+            switch result {
+            case .ambiguous, .cleanupIncomplete:
+                break
+            case .notFound, .confirmed:
+                throw TestFailure.assertion(
+                    "\(label) support overlap was not safely refused: \(result)"
+                )
+            }
+            try require(
+                fixture.commandRunner.calls.isEmpty,
+                "\(label) support overlap ran launchctl"
+            )
+            try require(
+                fixture.fileExists("data/preserve.bin"),
+                "\(label) support overlap deleted an allowlisted target"
+            )
+            try require(
+                FileManager.default.fileExists(atPath: fixture.journalURL.path),
+                "\(label) support overlap deleted its journal"
+            )
         }
     }
 

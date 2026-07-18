@@ -514,6 +514,7 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             fileURLWithPath: journal.rootPath,
             isDirectory: true
         )
+        try validateNoReleaseSupportOverlap(rootURL: rootURL)
         let tree = try sourceTree(
             rootURL: rootURL,
             rootIdentity: journal.rootIdentity
@@ -528,7 +529,7 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
     private func preflightAllTargetsWithoutMutation(
         _ candidate: LegacyCleanupCandidate
     ) throws {
-        try validateNoReleaseSupportOverlap(candidate)
+        try validateNoReleaseSupportOverlap(rootURL: candidate.rootURL)
         guard inspect() == .confirmed(candidate) else {
             throw LegacyCleanupError.verificationFailed("candidate")
         }
@@ -541,10 +542,10 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
     }
 
     private func validateNoReleaseSupportOverlap(
-        _ candidate: LegacyCleanupCandidate
+        rootURL: URL
     ) throws {
         for target in LegacyIdentity.targets {
-            let targetURL = candidate.rootURL.appendingPathComponent(
+            let targetURL = rootURL.appendingPathComponent(
                 target
             ).standardizedFileURL
             guard
@@ -838,7 +839,7 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
         service: String,
         label: String
     ) -> Bool {
-        guard result.exitCode == 113 else {
+        guard result.exitCode == 113, result.stdout.isEmpty else {
             return false
         }
         let lines = result.stderr
