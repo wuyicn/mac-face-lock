@@ -77,6 +77,7 @@ struct SecureFileTreeTests {
         try testEnforcesEntryAndByteBudgets()
         try testReadLimitIsEnforced()
         try testIdentityReplacementBlocksRemoval()
+        try testRootPathReplacementBlocksRemoval()
         try testRootIdentityMismatchBlocksRemoval()
         print("Secure file tree tests passed")
     }
@@ -406,6 +407,48 @@ struct SecureFileTreeTests {
                     atPath: fixture.root.appendingPathComponent("data/state.json").path
                 ),
                 "replacement was removed after identity mismatch"
+            )
+        }
+    }
+
+    private static func testRootPathReplacementBlocksRemoval() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        try fixture.write("data/state.json", bytes: [1])
+        let tree = try makeTree(fixture)
+        let manifest = try tree.preflight(
+            relativeTargets: ["data"],
+            budget: .legacyCleanup
+        )
+        let displacedRoot = fixture.home.appendingPathComponent(
+            "displaced-legacy",
+            isDirectory: true
+        )
+        try FileManager.default.moveItem(at: fixture.root, to: displacedRoot)
+        try FileManager.default.createDirectory(
+            at: fixture.root,
+            withIntermediateDirectories: false
+        )
+        try fixture.write("data/replacement.json", bytes: [2])
+
+        do {
+            try tree.remove(manifest)
+            throw TestFailure.assertion("root path replacement was accepted")
+        } catch SecureFileTreeError.identityChanged(let path) {
+            try require(path == fixture.root.path, "root replacement error named \(path)")
+            try require(
+                FileManager.default.fileExists(
+                    atPath: displacedRoot.appendingPathComponent("data/state.json").path
+                ),
+                "displaced original tree was mutated after root replacement"
+            )
+            try require(
+                FileManager.default.fileExists(
+                    atPath: fixture.root.appendingPathComponent(
+                        "data/replacement.json"
+                    ).path
+                ),
+                "replacement root was mutated after root replacement"
             )
         }
     }

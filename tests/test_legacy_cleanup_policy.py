@@ -110,7 +110,9 @@ FILE_READ_CAPABILITIES = {
         frozenset({SECURE_FILE_TREE_SOURCE}),
     ),
     "Darwin/POSIX openat": (
-        re.compile(r"(?<![\w.])openat\s*\("),
+        re.compile(
+            r"(?:\b(?:Darwin|Glibc)\s*\.\s*openat|(?<![\w.])openat)\s*\("
+        ),
         frozenset({SECURE_FILE_TREE_SOURCE}),
     ),
     "Darwin/POSIX read": (
@@ -121,19 +123,28 @@ FILE_READ_CAPABILITIES = {
         frozenset({SECURE_FILE_TREE_SOURCE}),
     ),
     "Darwin/POSIX fstatat": (
-        re.compile(r"(?<![\w.])fstatat\s*\("),
+        re.compile(
+            r"(?:\b(?:Darwin|Glibc)\s*\.\s*fstatat|(?<![\w.])fstatat)\s*\("
+        ),
         frozenset({SECURE_FILE_TREE_SOURCE}),
     ),
     "Darwin/POSIX fdopendir": (
-        re.compile(r"(?<![\w.])fdopendir\s*\("),
+        re.compile(
+            r"(?:\b(?:Darwin|Glibc)\s*\.\s*fdopendir|(?<![\w.])fdopendir)"
+            r"\s*\("
+        ),
         frozenset({SECURE_FILE_TREE_SOURCE}),
     ),
     "Darwin/POSIX readdir": (
-        re.compile(r"(?<![\w.])readdir\s*\("),
+        re.compile(
+            r"(?:\b(?:Darwin|Glibc)\s*\.\s*readdir|(?<![\w.])readdir)\s*\("
+        ),
         frozenset({SECURE_FILE_TREE_SOURCE}),
     ),
     "Darwin/POSIX unlinkat": (
-        re.compile(r"(?<![\w.])unlinkat\s*\("),
+        re.compile(
+            r"(?:\b(?:Darwin|Glibc)\s*\.\s*unlinkat|(?<![\w.])unlinkat)\s*\("
+        ),
         frozenset({SECURE_FILE_TREE_SOURCE}),
     ),
 }
@@ -303,6 +314,36 @@ _ = read(descriptor, &buffer, buffer.count)
             "src/app/SecureFileTree.swift",
             violations,
         )
+
+    def test_qualified_posix_tree_primitives_are_allowed_only_in_secure_file_tree(
+        self,
+    ) -> None:
+        probes = {
+            "Darwin/POSIX openat": "openat(parent, name, O_RDONLY)",
+            "Darwin/POSIX fstatat": (
+                "fstatat(parent, name, &metadata, AT_SYMLINK_NOFOLLOW)"
+            ),
+            "Darwin/POSIX fdopendir": "fdopendir(descriptor)",
+            "Darwin/POSIX readdir": "readdir(directory)",
+            "Darwin/POSIX unlinkat": "unlinkat(parent, name, 0)",
+        }
+
+        for capability, call in probes.items():
+            for namespace in ("Darwin", "Glibc"):
+                with self.subTest(capability=capability, namespace=namespace):
+                    sources = load_policy_sources()
+                    sources["src/app/LegacyProbe.swift"] = (
+                        f"_ = {namespace}.{call}"
+                    )
+
+                    violations = collect_policy_violations(sources)
+
+                    self.assertIn(
+                        "src/app/LegacyProbe.swift: direct file-read capability "
+                        f"'{capability}' is not allowed; allowed only in "
+                        "src/app/SecureFileTree.swift",
+                        violations,
+                    )
 
     def test_normalized_detector_rejects_split_launch_agents_anchor(self) -> None:
         sources = load_policy_sources()

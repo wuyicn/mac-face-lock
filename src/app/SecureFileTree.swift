@@ -48,7 +48,9 @@ enum SecureFileTreeError: Error, Equatable {
 final class SecureFileTree {
     let rootIdentity: SecureFileIdentity
 
+    private let ancestorFD: Int32
     private let rootFD: Int32
+    private let rootComponents: [String]
     private let rootPath: String
     private let requiredOwner: uid_t
 
@@ -79,7 +81,12 @@ final class SecureFileTree {
         guard ancestorFD >= 0 else {
             throw SecureFileTreeError.systemCall("open", ancestorPath, errno)
         }
-        defer { Darwin.close(ancestorFD) }
+        var keepAncestorFD = false
+        defer {
+            if !keepAncestorFD {
+                Darwin.close(ancestorFD)
+            }
+        }
 
         var ancestorStat = stat()
         guard fstat(ancestorFD, &ancestorStat) == 0 else {
@@ -164,14 +171,18 @@ final class SecureFileTree {
         guard let resolvedIdentity else {
             throw SecureFileTreeError.invalidRoot(rootPath)
         }
+        self.ancestorFD = ancestorFD
         self.rootFD = currentFD
+        self.rootComponents = components
         self.rootPath = rootPath
         self.requiredOwner = requiredOwner
         self.rootIdentity = resolvedIdentity
+        keepAncestorFD = true
         keepCurrentFD = true
     }
 
     deinit {
+        Darwin.close(ancestorFD)
         Darwin.close(rootFD)
     }
 
@@ -578,11 +589,77 @@ final class SecureFileTree {
         guard fstat(rootFD, &current) == 0 else {
             throw SecureFileTreeError.systemCall("fstat", rootPath, errno)
         }
-        let currentIdentity = SecureFileIdentity(
+        let openedIdentity = SecureFileIdentity(
             device: UInt64(current.st_dev),
             inode: UInt64(current.st_ino)
         )
-        guard currentIdentity == rootIdentity else {
+        guard openedIdentity == rootIdentity else {
+            throw SecureFileTreeError.identityChanged(rootPath)
+        }
+
+        var currentFD = dup(ancestorFD)
+        guard currentFD >= 0 else {
+            throw SecureFileTreeError.systemCall("dup", rootPath, errno)
+        }
+        defer { Darwin.close(currentFD) }
+
+        var currentPath: [String] = []
+        for component in rootComponents {
+            currentPath.append(component)
+            let relativePath = currentPath.joined(separator: "/")
+            var entryStat = stat()
+            guard fstatat(currentFD, component, &entryStat, AT_SYMLINK_NOFOLLOW) == 0 else {
+                if errno == ENOENT {
+                    throw SecureFileTreeError.identityChanged(rootPath)
+                }
+                throw SecureFileTreeError.systemCall("fstatat", relativePath, errno)
+            }
+            let (identity, kind) = try Self.checkedIdentity(
+                entryStat,
+                path: relativePath,
+                requiredOwner: requiredOwner
+            )
+            guard kind == .directory else {
+                throw SecureFileTreeError.identityChanged(rootPath)
+            }
+            let nextFD = openat(
+                currentFD,
+                component,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+            guard nextFD >= 0 else {
+                if errno == ELOOP || errno == ENOENT {
+                    throw SecureFileTreeError.identityChanged(rootPath)
+                }
+                throw SecureFileTreeError.systemCall("openat", relativePath, errno)
+            }
+            var resolvedStat = stat()
+            guard fstat(nextFD, &resolvedStat) == 0 else {
+                let savedErrno = errno
+                Darwin.close(nextFD)
+                throw SecureFileTreeError.systemCall("fstat", relativePath, savedErrno)
+            }
+            let resolvedIdentity = SecureFileIdentity(
+                device: UInt64(resolvedStat.st_dev),
+                inode: UInt64(resolvedStat.st_ino)
+            )
+            guard resolvedIdentity == identity else {
+                Darwin.close(nextFD)
+                throw SecureFileTreeError.identityChanged(rootPath)
+            }
+            Darwin.close(currentFD)
+            currentFD = nextFD
+        }
+
+        var reboundStat = stat()
+        guard fstat(currentFD, &reboundStat) == 0 else {
+            throw SecureFileTreeError.systemCall("fstat", rootPath, errno)
+        }
+        let reboundIdentity = SecureFileIdentity(
+            device: UInt64(reboundStat.st_dev),
+            inode: UInt64(reboundStat.st_ino)
+        )
+        guard reboundIdentity == rootIdentity else {
             throw SecureFileTreeError.identityChanged(rootPath)
         }
     }
