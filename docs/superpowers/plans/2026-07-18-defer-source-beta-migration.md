@@ -367,7 +367,7 @@ After both commits, run:
 
 ```bash
 BASE_COMMIT="$(cat .superpowers/sdd/defer-migration-base.txt)"
-/Users/wuyi-macs/.codex/plugins/cache/openai-curated-remote/superpowers/6.1.1/skills/subagent-driven-development/scripts/review-package "$BASE_COMMIT" HEAD
+"$HOME/.codex/plugins/cache/openai-curated-remote/superpowers/6.1.1/skills/subagent-driven-development/scripts/review-package" "$BASE_COMMIT" HEAD
 ```
 
 The reviewer must verify:
