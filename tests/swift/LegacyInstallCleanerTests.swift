@@ -18,16 +18,40 @@ private func require(_ condition: @autoclosure () -> Bool, _ message: String) th
     }
 }
 
+private enum TestCommandError: Error {
+    case injected
+}
+
+private struct RecordedServiceCommand {
+    let executableURL: URL
+    let arguments: [String]
+    let timeout: TimeInterval
+}
+
 private final class RecordingServiceCommandRunner: ServiceCommandRunning {
-    private(set) var calls: [(URL, [String], TimeInterval)] = []
+    private(set) var calls: [RecordedServiceCommand] = []
+    var resultProvider: ((Int, [String]) throws -> ServiceCommandResult)?
 
     func run(
         executableURL: URL,
         arguments: [String],
         timeout: TimeInterval
     ) async throws -> ServiceCommandResult {
-        calls.append((executableURL, arguments, timeout))
-        return ServiceCommandResult(exitCode: 0, stdout: "", stderr: "")
+        calls.append(
+            RecordedServiceCommand(
+                executableURL: executableURL,
+                arguments: arguments,
+                timeout: timeout
+            )
+        )
+        if let resultProvider {
+            return try resultProvider(calls.count, arguments)
+        }
+        return ServiceCommandResult(
+            exitCode: arguments.first == "print" ? 1 : 0,
+            stdout: "",
+            stderr: ""
+        )
     }
 }
 
@@ -107,8 +131,133 @@ private struct LegacyCleanerFixture {
         launchAgentsURL.appendingPathComponent(Self.statusName)
     }
 
+    var journalURL: URL {
+        supportURL.appendingPathComponent("legacy-cleanup-v1.json")
+    }
+
     func remove() {
         try? FileManager.default.removeItem(at: container)
+    }
+
+    func installKnownLegacyPairAndData() throws {
+        try writeCurrentAgentPlist()
+        try writeUnifiedStatusPlist()
+        try write("config/config.json", #"{"enabled":true}"#)
+        try write("data/face-template.bin", "legacy-face-data")
+        try write("logs/agent.out.log", "legacy-log")
+        try write(
+            "dist/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent",
+            "legacy-agent"
+        )
+        try write(
+            "dist/Mac Face Lock.app/Contents/MacOS/MacFaceLock",
+            "legacy-app"
+        )
+        try write(
+            "dist/Mac Face Lock Status.app/Contents/MacOS/MacFaceLockStatus",
+            "legacy-status"
+        )
+    }
+
+    func confirmedCandidate() throws -> LegacyCleanupCandidate {
+        guard case .confirmed(let candidate) = cleaner.inspect() else {
+            throw TestFailure.assertion("fixture did not produce a confirmed candidate")
+        }
+        return candidate
+    }
+
+    func write(_ relativePath: String, _ contents: String) throws {
+        let url = legacyRoot.appendingPathComponent(relativePath)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data(contents.utf8).write(to: url)
+    }
+
+    func writeSupport(_ relativePath: String, _ contents: String) throws {
+        let url = supportURL.appendingPathComponent(relativePath)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data(contents.utf8).write(to: url)
+    }
+
+    func requireAllowlistedTargetsAbsent() throws {
+        for target in [
+            "config/config.json",
+            "data",
+            "logs",
+            "dist/Mac Face Lock Agent.app",
+            "dist/Mac Face Lock.app",
+            "dist/Mac Face Lock Status.app",
+        ] {
+            try require(
+                !FileManager.default.fileExists(
+                    atPath: legacyRoot.appendingPathComponent(target).path
+                ),
+                "allowlisted target remains: \(target)"
+            )
+        }
+        try require(
+            !FileManager.default.fileExists(atPath: agentURL.path),
+            "legacy Agent plist remains"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: statusURL.path),
+            "legacy Status plist remains"
+        )
+    }
+
+    func requirePreserved(_ relativePath: String) throws {
+        try require(
+            FileManager.default.fileExists(
+                atPath: legacyRoot.appendingPathComponent(relativePath).path
+            ),
+            "sentinel was removed: \(relativePath)"
+        )
+    }
+
+    func requireSupportPreserved(_ relativePath: String) throws {
+        try require(
+            FileManager.default.fileExists(
+                atPath: supportURL.appendingPathComponent(relativePath).path
+            ),
+            "release Application Support data was removed: \(relativePath)"
+        )
+    }
+
+    func fileExists(_ relativePath: String) -> Bool {
+        FileManager.default.fileExists(
+            atPath: legacyRoot.appendingPathComponent(relativePath).path
+        )
+    }
+
+    func journalObject() throws -> [String: Any] {
+        guard
+            let object = try JSONSerialization.jsonObject(
+                with: Data(contentsOf: journalURL)
+            ) as? [String: Any]
+        else {
+            throw TestFailure.assertion("journal is not a JSON object")
+        }
+        return object
+    }
+
+    func writeJournalObject(_ object: [String: Any]) throws {
+        let data = try JSONSerialization.data(withJSONObject: object)
+        try data.write(to: journalURL)
+    }
+
+    func makeCleaner(userID: uid_t) -> LegacyInstallCleaner {
+        LegacyInstallCleaner(
+            homeURL: home,
+            appURL: appURL,
+            supportURL: supportURL,
+            commandRunner: commandRunner,
+            userID: userID
+        )
     }
 
     func writeCurrentAgentPlist(root: URL? = nil) throws {
@@ -275,7 +424,21 @@ private struct LegacyCleanerFixture {
 
 @main
 struct LegacyInstallCleanerTests {
-    static func main() throws {
+    static func main() async throws {
+        try testInspectHasNoExecutionSideEffects()
+        try await testFullPreflightFailureHasNoMutation()
+        try await testUnconfirmedCandidateCannotCreateJournal()
+        try await testNonLoadedServicesAreAccepted()
+        try await testCommandFailureBlocksDeletion()
+        try await testLoadedServiceBlocksDeletion()
+        try await testSourceDeletionFailurePreservesPlists()
+        try await testFailureAfterSourceDeletionIsIncomplete()
+        try await testRetryIsIdempotentWithAbsentTargets()
+        try await testRetryRejectsInvalidJournalMetadata()
+        try await testRetryRejectsTamperedJournalFields()
+        try await testRetryRejectsChangedRootIdentity()
+        try await testCompletedRetryIsANoOp()
+        try await testSuccessfulCleanupDeletesOnlyAllowlist()
         try testRejectsCurrentAppInsideCandidateRoot()
         try testRecognizesInstalledCurrentPair()
         try testRecognizesInstalledHistoricalPair()
@@ -295,6 +458,547 @@ struct LegacyInstallCleanerTests {
         try testHardLinkPlistIsAmbiguous()
         try testOversizedPlistIsAmbiguous()
         print("Legacy install cleaner tests passed")
+    }
+
+    private static func testInspectHasNoExecutionSideEffects() throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+
+        guard case .confirmed = fixture.cleaner.inspect() else {
+            throw TestFailure.assertion("known legacy pair was not confirmed")
+        }
+        try require(
+            fixture.commandRunner.calls.isEmpty,
+            "inspect unexpectedly ran launchctl"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: fixture.journalURL.path),
+            "inspect unexpectedly wrote a journal"
+        )
+        try fixture.requirePreserved("data/face-template.bin")
+        try fixture.requirePreserved("logs/agent.out.log")
+    }
+
+    private static func testFullPreflightFailureHasNoMutation() async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        let external = fixture.container.appendingPathComponent("external-data")
+        try Data("preserve".utf8).write(to: external)
+        try FileManager.default.createSymbolicLink(
+            at: fixture.legacyRoot.appendingPathComponent("data/unsafe-link"),
+            withDestinationURL: external
+        )
+        let candidate = try fixture.confirmedCandidate()
+
+        guard case .ambiguous = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion("unsafe preflight did not block cleanup")
+        }
+        try require(
+            fixture.commandRunner.calls.isEmpty,
+            "preflight failure unexpectedly ran launchctl"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: fixture.journalURL.path),
+            "preflight failure unexpectedly created a journal"
+        )
+        try require(
+            fixture.fileExists("data/face-template.bin"),
+            "preflight failure deleted legacy data"
+        )
+        try require(
+            FileManager.default.fileExists(atPath: fixture.agentURL.path)
+                && FileManager.default.fileExists(atPath: fixture.statusURL.path),
+            "preflight failure deleted a plist"
+        )
+    }
+
+    private static func testUnconfirmedCandidateCannotCreateJournal() async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        let candidate = try fixture.confirmedCandidate()
+        let forged = LegacyCleanupCandidate(
+            rootURL: candidate.rootURL,
+            rootIdentity: SecureFileIdentity(
+                device: candidate.rootIdentity.device,
+                inode: candidate.rootIdentity.inode &+ 1
+            ),
+            agentPlistIdentity: candidate.agentPlistIdentity,
+            statusPlistIdentity: candidate.statusPlistIdentity
+        )
+
+        guard case .ambiguous = await fixture.cleaner.clean(forged) else {
+            throw TestFailure.assertion("unconfirmed candidate was accepted")
+        }
+        try require(
+            !FileManager.default.fileExists(atPath: fixture.journalURL.path),
+            "unconfirmed candidate created a journal"
+        )
+        try require(
+            fixture.commandRunner.calls.isEmpty,
+            "unconfirmed candidate ran launchctl"
+        )
+        try require(
+            fixture.fileExists("data/face-template.bin"),
+            "unconfirmed candidate deleted data"
+        )
+    }
+
+    private static func testNonLoadedServicesAreAccepted() async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        fixture.commandRunner.resultProvider = { _, arguments in
+            ServiceCommandResult(
+                exitCode: arguments.first == "bootout" ? 3 : 113,
+                stdout: "",
+                stderr: "service not found"
+            )
+        }
+        let candidate = try fixture.confirmedCandidate()
+
+        let result = await fixture.cleaner.clean(candidate)
+        try require(
+            result == .notFound,
+            "already-unloaded jobs blocked cleanup"
+        )
+        try fixture.requireAllowlistedTargetsAbsent()
+    }
+
+    private static func testCommandFailureBlocksDeletion() async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        fixture.commandRunner.resultProvider = { callIndex, arguments in
+            if callIndex == 1 {
+                throw TestCommandError.injected
+            }
+            return ServiceCommandResult(
+                exitCode: arguments.first == "print" ? 1 : 0,
+                stdout: "",
+                stderr: ""
+            )
+        }
+        let candidate = try fixture.confirmedCandidate()
+
+        guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion("command failure was not retryable")
+        }
+        try require(
+            FileManager.default.fileExists(atPath: fixture.journalURL.path),
+            "command failure did not preserve the journal"
+        )
+        var journalStat = stat()
+        try require(
+            lstat(fixture.journalURL.path, &journalStat) == 0
+                && journalStat.st_uid == getuid()
+                && journalStat.st_mode & 0o777 == 0o600,
+            "incomplete journal was not current-user-owned mode 0600"
+        )
+        let journal = try fixture.journalObject()
+        try require(
+            journal["schema_version"] as? Int == 1
+                && journal["root_path"] as? String == fixture.legacyRoot.path
+                && journal["phase"] as? String == "confirmed",
+            "incomplete journal did not record the confirmed phase"
+        )
+        try require(
+            fixture.fileExists("data/face-template.bin"),
+            "command failure deleted source data"
+        )
+        try require(
+            FileManager.default.fileExists(atPath: fixture.agentURL.path)
+                && FileManager.default.fileExists(atPath: fixture.statusURL.path),
+            "command failure deleted legacy plists"
+        )
+    }
+
+    private static func testLoadedServiceBlocksDeletion() async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        fixture.commandRunner.resultProvider = { callIndex, arguments in
+            ServiceCommandResult(
+                exitCode: callIndex == 2 ? 0 : (
+                    arguments.first == "print" ? 1 : 5
+                ),
+                stdout: "",
+                stderr: ""
+            )
+        }
+        let candidate = try fixture.confirmedCandidate()
+
+        guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion("loaded service did not block cleanup")
+        }
+        try require(
+            fixture.fileExists("data/face-template.bin"),
+            "loaded service allowed source deletion"
+        )
+        try require(
+            FileManager.default.fileExists(atPath: fixture.agentURL.path)
+                && FileManager.default.fileExists(atPath: fixture.statusURL.path),
+            "loaded service allowed plist deletion"
+        )
+    }
+
+    private static func testSourceDeletionFailurePreservesPlists() async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        let configDirectory = fixture.legacyRoot.appendingPathComponent("config")
+        guard chmod(configDirectory.path, 0o500) == 0 else {
+            throw TestFailure.assertion("could not protect config fixture")
+        }
+        defer { _ = chmod(configDirectory.path, 0o700) }
+        let candidate = try fixture.confirmedCandidate()
+
+        guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion("source deletion failure was not retryable")
+        }
+        try require(
+            fixture.fileExists("config/config.json"),
+            "protected source target was unexpectedly removed"
+        )
+        try require(
+            FileManager.default.fileExists(atPath: fixture.statusURL.path)
+                && FileManager.default.fileExists(atPath: fixture.agentURL.path),
+            "plists were removed before source-target removal completed"
+        )
+        let journal = try fixture.journalObject()
+        try require(
+            journal["phase"] as? String == "servicesStopped",
+            "source deletion failure recorded the wrong phase"
+        )
+    }
+
+    private static func testFailureAfterSourceDeletionIsIncomplete() async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        fixture.commandRunner.resultProvider = { callIndex, arguments in
+            ServiceCommandResult(
+                exitCode: callIndex == 5 ? 0 : (
+                    arguments.first == "print" ? 1 : 0
+                ),
+                stdout: "",
+                stderr: ""
+            )
+        }
+        let candidate = try fixture.confirmedCandidate()
+
+        guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion(
+                "post-deletion verification failure was not retryable"
+            )
+        }
+        try fixture.requireAllowlistedTargetsAbsent()
+        let journal = try fixture.journalObject()
+        try require(
+            journal["phase"] as? String == "plistsRemoved",
+            "post-deletion failure did not preserve the last durable phase"
+        )
+        try require(
+            journal["root_path"] as? String == fixture.legacyRoot.path,
+            "incomplete journal lost the root needed for retry"
+        )
+    }
+
+    private static func testRetryIsIdempotentWithAbsentTargets() async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        let configDirectory = fixture.legacyRoot.appendingPathComponent("config")
+        guard chmod(configDirectory.path, 0o500) == 0 else {
+            throw TestFailure.assertion("could not protect retry fixture")
+        }
+        let candidate = try fixture.confirmedCandidate()
+        guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion("retry fixture did not stop mid-cleanup")
+        }
+        guard chmod(configDirectory.path, 0o700) == 0 else {
+            throw TestFailure.assertion("could not restore retry fixture permissions")
+        }
+        let alreadyAbsent = "data"
+        try FileManager.default.removeItem(
+            at: fixture.legacyRoot.appendingPathComponent(alreadyAbsent)
+        )
+        try FileManager.default.removeItem(at: fixture.statusURL)
+        try require(
+            !fixture.fileExists(alreadyAbsent),
+            "retry fixture did not contain an already-absent target"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: fixture.statusURL.path),
+            "retry fixture did not contain an already-absent plist"
+        )
+
+        let result = await fixture.cleaner.retry()
+
+        try require(result == .notFound, "valid retry did not finish: \(result)")
+        try fixture.requireAllowlistedTargetsAbsent()
+        let completion = try fixture.journalObject()
+        try require(
+            completion.count == 2
+                && completion["schema_version"] as? Int == 1
+                && completion["completed"] as? Bool == true,
+            "retry did not replace the journal with a completion marker"
+        )
+    }
+
+    private static func testRetryRejectsInvalidJournalMetadata() async throws {
+        try await assertInvalidJournalBlocked("mode") { fixture in
+            guard chmod(fixture.journalURL.path, 0o644) == 0 else {
+                throw TestFailure.assertion("could not alter journal mode")
+            }
+            return fixture.cleaner
+        }
+        try await assertInvalidJournalBlocked("owner") { fixture in
+            fixture.makeCleaner(userID: getuid() &+ 1)
+        }
+        try await assertInvalidJournalBlocked("hard link") { fixture in
+            let sibling = fixture.supportURL.appendingPathComponent(
+                "legacy-cleanup-linked.json"
+            )
+            guard link(fixture.journalURL.path, sibling.path) == 0 else {
+                throw TestFailure.assertion("could not hard-link journal fixture")
+            }
+            return fixture.cleaner
+        }
+        try await assertInvalidJournalBlocked("oversized") { fixture in
+            try Data(repeating: 0x20, count: 64 * 1_024 + 1).write(
+                to: fixture.journalURL
+            )
+            guard chmod(fixture.journalURL.path, 0o600) == 0 else {
+                throw TestFailure.assertion("could not reset oversized journal mode")
+            }
+            return fixture.cleaner
+        }
+    }
+
+    private static func testRetryRejectsTamperedJournalFields() async throws {
+        try await assertInvalidJournalBlocked("schema") { fixture in
+            var journal = try fixture.journalObject()
+            journal["schema_version"] = 2
+            try fixture.writeJournalObject(journal)
+            return fixture.cleaner
+        }
+        try await assertInvalidJournalBlocked("root path") { fixture in
+            var journal = try fixture.journalObject()
+            journal["root_path"] = fixture.outsideRoot.path
+            try fixture.writeJournalObject(journal)
+            return fixture.cleaner
+        }
+        try await assertInvalidJournalBlocked("root identity") { fixture in
+            var journal = try fixture.journalObject()
+            guard var identity = journal["root_identity"] as? [String: Any] else {
+                throw TestFailure.assertion("journal root identity is missing")
+            }
+            let inode = identity["inode"] as? NSNumber
+            identity["inode"] = NSNumber(value: (inode?.uint64Value ?? 0) &+ 1)
+            journal["root_identity"] = identity
+            try fixture.writeJournalObject(journal)
+            return fixture.cleaner
+        }
+        try await assertInvalidJournalBlocked("target allowlist") { fixture in
+            var journal = try fixture.journalObject()
+            journal["relative_targets"] = [
+                "config/config.json",
+                "data",
+                "logs",
+                "dist/Mac Face Lock Agent.app",
+                "dist/Mac Face Lock.app",
+                "dist/Mac Face Lock Status.app",
+                "README.md",
+            ]
+            try fixture.writeJournalObject(journal)
+            return fixture.cleaner
+        }
+    }
+
+    private static func testRetryRejectsChangedRootIdentity() async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try await prepareConfirmedJournal(fixture)
+        let originalRoot = fixture.home.appendingPathComponent(
+            "legacy-source-original",
+            isDirectory: true
+        )
+        try FileManager.default.moveItem(
+            at: fixture.legacyRoot,
+            to: originalRoot
+        )
+        try FileManager.default.createDirectory(
+            at: fixture.legacyRoot,
+            withIntermediateDirectories: true
+        )
+        try fixture.write("data/replacement-sentinel", "preserve")
+        let callsBeforeRetry = fixture.commandRunner.calls.count
+
+        guard case .ambiguous = await fixture.cleaner.retry() else {
+            throw TestFailure.assertion("changed root identity was accepted")
+        }
+        try require(
+            fixture.commandRunner.calls.count == callsBeforeRetry,
+            "changed root identity ran launchctl"
+        )
+        try require(
+            fixture.fileExists("data/replacement-sentinel"),
+            "changed root identity allowed deletion"
+        )
+        try require(
+            FileManager.default.fileExists(atPath: fixture.agentURL.path)
+                && FileManager.default.fileExists(atPath: fixture.statusURL.path),
+            "changed root identity allowed plist deletion"
+        )
+    }
+
+    private static func testCompletedRetryIsANoOp() async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        let candidate = try fixture.confirmedCandidate()
+        let cleanResult = await fixture.cleaner.clean(candidate)
+        try require(
+            cleanResult == .notFound,
+            "completion retry fixture did not clean"
+        )
+        let callsBeforeRetry = fixture.commandRunner.calls.count
+
+        let retryResult = await fixture.cleaner.retry()
+        try require(
+            retryResult == .notFound,
+            "completed marker was not idempotent"
+        )
+        try require(
+            fixture.commandRunner.calls.count == callsBeforeRetry,
+            "completed retry unexpectedly ran launchctl"
+        )
+    }
+
+    private static func prepareConfirmedJournal(
+        _ fixture: LegacyCleanerFixture
+    ) async throws {
+        try fixture.installKnownLegacyPairAndData()
+        fixture.commandRunner.resultProvider = { callIndex, arguments in
+            if callIndex == 1 {
+                throw TestCommandError.injected
+            }
+            return ServiceCommandResult(
+                exitCode: arguments.first == "print" ? 1 : 0,
+                stdout: "",
+                stderr: ""
+            )
+        }
+        let candidate = try fixture.confirmedCandidate()
+        guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion("could not create an incomplete journal")
+        }
+        fixture.commandRunner.resultProvider = nil
+    }
+
+    private static func assertInvalidJournalBlocked(
+        _ label: String,
+        mutate: (LegacyCleanerFixture) throws -> LegacyInstallCleaner
+    ) async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try await prepareConfirmedJournal(fixture)
+        let retryCleaner = try mutate(fixture)
+        let callsBeforeRetry = fixture.commandRunner.calls.count
+
+        guard case .ambiguous = await retryCleaner.retry() else {
+            throw TestFailure.assertion("\(label) journal was accepted")
+        }
+        try require(
+            fixture.commandRunner.calls.count == callsBeforeRetry,
+            "\(label) journal ran launchctl"
+        )
+        try require(
+            fixture.fileExists("data/face-template.bin"),
+            "\(label) journal allowed source deletion"
+        )
+        try require(
+            FileManager.default.fileExists(atPath: fixture.agentURL.path)
+                && FileManager.default.fileExists(atPath: fixture.statusURL.path),
+            "\(label) journal allowed plist deletion"
+        )
+    }
+
+    private static func testSuccessfulCleanupDeletesOnlyAllowlist() async throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        try fixture.write("README.md", "preserve")
+        try fixture.write(".git/HEAD", "ref: refs/heads/main")
+        try fixture.write(".worktrees/sentinel", "preserve")
+        try fixture.write(".venv/bin/python", "preserve")
+        try fixture.write("scripts/install.sh", "preserve")
+        try fixture.write("dist/Other Tool.app/sentinel", "preserve")
+        try fixture.writeSupport("onboarding/state.json", "preserve")
+        let candidate = try fixture.confirmedCandidate()
+
+        let result = await fixture.cleaner.clean(candidate)
+
+        try require(result == .notFound, "cleanup did not finish: \(result)")
+        let bootouts = fixture.commandRunner.calls
+            .filter { $0.arguments.first == "bootout" }
+            .map(\.arguments)
+        let domain = "gui/\(getuid())"
+        try require(
+            bootouts == [
+                ["bootout", "\(domain)/com.wuyi.mac-face-lock-status"],
+                ["bootout", "\(domain)/com.wuyi.mac-face-lock-agent"],
+            ],
+            "services stopped in the wrong order: \(bootouts)"
+        )
+        try fixture.requireAllowlistedTargetsAbsent()
+        try fixture.requirePreserved("README.md")
+        try fixture.requirePreserved(".git/HEAD")
+        try fixture.requirePreserved(".worktrees/sentinel")
+        try fixture.requirePreserved(".venv/bin/python")
+        try fixture.requirePreserved("scripts/install.sh")
+        try fixture.requirePreserved("dist/Other Tool.app/sentinel")
+        try fixture.requireSupportPreserved("onboarding/state.json")
+
+        var journalStat = stat()
+        try require(
+            lstat(fixture.journalURL.path, &journalStat) == 0,
+            "completion marker is missing"
+        )
+        try require(
+            journalStat.st_mode & 0o777 == 0o600,
+            "journal mode was not exactly 0600"
+        )
+        try require(
+            journalStat.st_uid == getuid(),
+            "journal owner was not the current user"
+        )
+        let object = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: fixture.journalURL)
+        ) as? [String: Any]
+        try require(
+            object?.count == 2
+                && object?["schema_version"] as? Int == 1
+                && object?["completed"] as? Bool == true,
+            "completion marker retained legacy details: \(String(describing: object))"
+        )
+        let completionData = try Data(contentsOf: fixture.journalURL)
+        try require(
+            completionData == Data(#"{"schema_version":1,"completed":true}"#.utf8),
+            "completion marker bytes did not match the fixed schema"
+        )
+        let completionText = try String(
+            contentsOf: fixture.journalURL,
+            encoding: .utf8
+        )
+        try require(
+            !completionText.contains(fixture.legacyRoot.path)
+                && !completionText.contains("relative_targets"),
+            "completion marker retained the old path or target list"
+        )
     }
 
     private static func testRejectsCurrentAppInsideCandidateRoot() throws {
