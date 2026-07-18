@@ -39,6 +39,7 @@ struct SetupStateTests {
         try testSourceMissingOnboardingPreservesEnabledFallback()
         try testCompletedReleaseOnboardingPreservesControl()
         try testCompletedRoutingKeepsRecoveryAvailableWhenLiveHealthIsLost()
+        try testLegacyCleanupAttentionOverridesCompletedRouting()
         print("Setup state tests passed")
     }
 
@@ -254,23 +255,37 @@ struct SetupStateTests {
         try require(
             RootDestination.resolve(
                 hasCompletedOnboarding: true,
-                isLiveReady: false
+                isLiveReady: false,
+                requiresLegacyCleanupAttention: false
             ) == .mainRecovery,
             "completed install lost the settings recovery surface when health was false"
         )
         try require(
             RootDestination.resolve(
                 hasCompletedOnboarding: true,
-                isLiveReady: true
+                isLiveReady: true,
+                requiresLegacyCleanupAttention: false
             ) == .mainReady,
             "healthy completed install did not resolve to the ready main state"
         )
         try require(
             RootDestination.resolve(
                 hasCompletedOnboarding: false,
-                isLiveReady: true
+                isLiveReady: true,
+                requiresLegacyCleanupAttention: false
             ) == .onboarding,
             "incomplete install bypassed onboarding because health happened to be true"
+        )
+    }
+
+    private static func testLegacyCleanupAttentionOverridesCompletedRouting() throws {
+        try require(
+            RootDestination.resolve(
+                hasCompletedOnboarding: true,
+                isLiveReady: true,
+                requiresLegacyCleanupAttention: true
+            ) == .onboarding,
+            "legacy cleanup did not override a completed record"
         )
     }
 

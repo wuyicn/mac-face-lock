@@ -14,6 +14,16 @@ enum EnrollmentLifecycle: Equatable {
     case cancelling
 }
 
+enum LegacyCleanupState: Equatable {
+    case unchecked
+    case notRequired
+    case confirmationRequired
+    case cleaning
+    case ambiguous(String)
+    case cleanupIncomplete(String)
+    case completed
+}
+
 enum RootDestination: Equatable {
     case onboarding
     case mainReady
@@ -21,8 +31,12 @@ enum RootDestination: Equatable {
 
     static func resolve(
         hasCompletedOnboarding: Bool,
-        isLiveReady: Bool
+        isLiveReady: Bool,
+        requiresLegacyCleanupAttention: Bool
     ) -> RootDestination {
+        if requiresLegacyCleanupAttention {
+            return .onboarding
+        }
         guard hasCompletedOnboarding else {
             return .onboarding
         }

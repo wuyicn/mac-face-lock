@@ -37,7 +37,9 @@ struct RootView: View {
         Group {
             if RootDestination.resolve(
                 hasCompletedOnboarding: setupCoordinator.hasCompletedOnboarding,
-                isLiveReady: setupCoordinator.isLiveReady
+                isLiveReady: setupCoordinator.isLiveReady,
+                requiresLegacyCleanupAttention:
+                    setupCoordinator.requiresLegacyCleanupAttention
             ) != .onboarding {
                 mainInterface
             } else {

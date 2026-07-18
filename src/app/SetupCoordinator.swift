@@ -457,6 +457,7 @@ final class SetupCoordinator: ObservableObject {
     @Published private(set) var serviceStatus: ServiceStatus?
     @Published private(set) var enrollmentLifecycle: EnrollmentLifecycle
     @Published private(set) var recoveryStep: SetupStep?
+    @Published private(set) var legacyCleanupState: LegacyCleanupState
 
     private let environment: AppEnvironment
     private let permissionCenter: PermissionCenter
@@ -464,6 +465,7 @@ final class SetupCoordinator: ObservableObject {
     private let localStore: LocalJSONStore
     private let runtimeRunner: RuntimeCommandRunning
     private let serviceManager: ServiceManaging?
+    private let legacyInstallCleaner: LegacyInstallCleaning?
     private let serviceHealthProvider: SetupServiceHealthProviding
     private let applicationURL: URL
     private let fileManager: FileManager
@@ -484,6 +486,7 @@ final class SetupCoordinator: ObservableObject {
     private var runtimeValidationRequired: Bool
     private var runtimeReadinessBusy = false
     private var runtimeReadinessWaiters: [RuntimeReadinessWaiter] = []
+    private var confirmedLegacyCandidate: LegacyCleanupCandidate?
 
     init(
         environment: AppEnvironment,
@@ -492,6 +495,7 @@ final class SetupCoordinator: ObservableObject {
         localStore: LocalJSONStore,
         runtimeRunner: RuntimeCommandRunning? = nil,
         serviceManager: ServiceManaging? = nil,
+        legacyInstallCleaner: LegacyInstallCleaning? = nil,
         serviceHealthProvider: SetupServiceHealthProviding? = nil,
         applicationURL: URL? = nil,
         fileManager: FileManager = .default,
@@ -527,8 +531,16 @@ final class SetupCoordinator: ObservableObject {
                 appURL: resolvedApplicationURL,
                 supportURL: environment.supportURL
             )
+            self.legacyInstallCleaner = legacyInstallCleaner
+                ?? LegacyInstallCleaner(
+                    appURL: resolvedApplicationURL,
+                    supportURL: environment.supportURL
+                )
+            self.legacyCleanupState = .unchecked
         } else {
             self.serviceManager = serviceManager
+            self.legacyInstallCleaner = nil
+            self.legacyCleanupState = .notRequired
         }
         self.serviceHealthProvider =
             serviceHealthProvider ?? UnavailableSetupServiceHealthProvider()
@@ -573,6 +585,61 @@ final class SetupCoordinator: ObservableObject {
 
     var isLiveReady: Bool {
         readiness.canEnableProtection
+    }
+
+    var requiresLegacyCleanupAttention: Bool {
+        environment.mode == .release && !legacyCleanupAllowsServiceAccess
+    }
+
+    func inspectLegacyInstall() async {
+        guard environment.mode == .release,
+              legacyCleanupState != .cleaning,
+              let legacyInstallCleaner else {
+            return
+        }
+        applyLegacyInspection(legacyInstallCleaner.inspect())
+    }
+
+    @discardableResult
+    func confirmLegacyCleanup() async -> Bool {
+        guard case .confirmationRequired = legacyCleanupState,
+              let candidate = confirmedLegacyCandidate,
+              let legacyInstallCleaner else {
+            currentError = "没有可确认的旧版清理任务。"
+            return false
+        }
+        legacyCleanupState = .cleaning
+        let result = await legacyInstallCleaner.clean(candidate)
+        if result == .notFound {
+            confirmedLegacyCandidate = nil
+            return completeLegacyCleanupAndResetSetup()
+        }
+        applyLegacyInspection(result)
+        return legacyCleanupAllowsServiceAccess
+    }
+
+    @discardableResult
+    func retryLegacyCleanup() async -> Bool {
+        guard case .cleanupIncomplete = legacyCleanupState,
+              let legacyInstallCleaner else {
+            currentError = "没有可重试的旧版清理任务。"
+            return false
+        }
+        legacyCleanupState = .cleaning
+        let result = await legacyInstallCleaner.retry()
+        if result == .notFound {
+            confirmedLegacyCandidate = nil
+            return completeLegacyCleanupAndResetSetup()
+        }
+        applyLegacyInspection(result)
+        return legacyCleanupAllowsServiceAccess
+    }
+
+    func cancelLegacyCleanup() {
+        guard case .confirmationRequired = legacyCleanupState else {
+            return
+        }
+        currentError = "已取消旧版清理；完成清理前不会启用发行版保护。"
     }
 
     func refreshLiveReadiness() async {
@@ -622,6 +689,12 @@ final class SetupCoordinator: ObservableObject {
     @discardableResult
     func prepareForSetup() async -> Bool {
         currentError = nil
+        if legacyCleanupState == .unchecked {
+            await inspectLegacyInstall()
+        }
+        guard guardLegacyCleanupGate() else {
+            return false
+        }
         let issues = preparationIssues()
         guard issues.isEmpty else {
             currentError = issues.joined(separator: " ")
@@ -1063,6 +1136,9 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func restartService() async {
+        guard guardLegacyCleanupGate() else {
+            return
+        }
         guard let serviceManager else {
             currentError = "当前安装没有可管理的后台服务。"
             return
@@ -1080,6 +1156,9 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func reinstallService() async {
+        guard guardLegacyCleanupGate() else {
+            return
+        }
         guard let serviceManager else {
             currentError = "当前安装没有可管理的后台服务。"
             return
@@ -1508,6 +1587,73 @@ final class SetupCoordinator: ObservableObject {
         checks = evaluated.checks
     }
 
+    private var legacyCleanupAllowsServiceAccess: Bool {
+        environment.mode == .source
+            || legacyCleanupState == .notRequired
+            || legacyCleanupState == .completed
+    }
+
+    private func guardLegacyCleanupGate() -> Bool {
+        guard legacyCleanupAllowsServiceAccess else {
+            serviceHealthy = false
+            serviceStatus = nil
+            _ = try? localStore.writeControl(enabled: false)
+            currentError = "请先完成旧版清理，再继续设置后台保护。"
+            updateReadiness()
+            return false
+        }
+        return true
+    }
+
+    private func applyLegacyInspection(_ inspection: LegacyCleanupInspection) {
+        switch inspection {
+        case .confirmed(let candidate):
+            confirmedLegacyCandidate = candidate
+            legacyCleanupState = .confirmationRequired
+        case .notFound:
+            confirmedLegacyCandidate = nil
+            legacyCleanupState = .notRequired
+        case .ambiguous(let message):
+            confirmedLegacyCandidate = nil
+            legacyCleanupState = .ambiguous(message)
+        case .cleanupIncomplete(let message):
+            confirmedLegacyCandidate = nil
+            legacyCleanupState = .cleanupIncomplete(message)
+        }
+    }
+
+    private func completeLegacyCleanupAndResetSetup() -> Bool {
+        let freshRecord = OnboardingRecord(
+            currentStep: .preparation,
+            completedSteps: [],
+            completedAt: nil,
+            appVersion: appVersion,
+            ownerProfileFingerprint: nil,
+            requiresOwnerReverification: true
+        )
+        do {
+            try setupStore.save(freshRecord)
+        } catch {
+            legacyCleanupState = .cleanupIncomplete(
+                "旧版清理已完成，但无法重置首次设置状态。"
+            )
+            currentError = "无法重置首次设置状态，请重试清理。"
+            return false
+        }
+        currentStep = .preparation
+        hasCompletedOnboarding = false
+        recoveryStep = nil
+        diagnosisPassed = false
+        ownerTestPassed = false
+        serviceHealthy = false
+        serviceStatus = nil
+        runtimeValidationRequired = true
+        legacyCleanupState = .completed
+        currentError = nil
+        updateReadiness()
+        return true
+    }
+
     private var agentPermissionStates: [SetupPermission: PermissionState] {
         if environment.mode == .source {
             return permissionStates
@@ -1529,6 +1675,9 @@ final class SetupCoordinator: ObservableObject {
     }
 
     private func refreshServiceHealthForEnable() async {
+        guard guardLegacyCleanupGate() else {
+            return
+        }
         if environment.mode == .release {
             guard let serviceManager else {
                 serviceHealthy = false
@@ -1555,6 +1704,9 @@ final class SetupCoordinator: ObservableObject {
 
     private func installAndRefreshReleaseService() async {
         serviceHealthy = false
+        guard guardLegacyCleanupGate() else {
+            return
+        }
         guard diagnosisPassed, let serviceManager else {
             return
         }

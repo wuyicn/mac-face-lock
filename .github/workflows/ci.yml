@@ -93,7 +93,8 @@ jobs:
             src/app/Models.swift src/app/SetupModels.swift \
             src/app/LocalJSONStore.swift src/app/SetupStore.swift \
             src/app/PermissionCenter.swift src/app/RuntimeCommandRunner.swift \
-            src/app/ServiceManager.swift src/app/SetupCoordinator.swift \
+            src/app/ServiceManager.swift src/app/SecureFileTree.swift \
+            src/app/LegacyInstallCleaner.swift src/app/SetupCoordinator.swift \
             tests/swift/SetupCoordinatorTests.swift \
             -framework AppKit -framework AVFoundation \
             -framework ApplicationServices -framework CoreGraphics \
