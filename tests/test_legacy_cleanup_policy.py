@@ -33,33 +33,87 @@ MIGRATION_FORBIDDEN = (
     "source-data-migration",
 )
 SWIFT_SENSITIVE_ANCHOR_BUDGETS = {
-    "Library/LaunchAgents": (
-        "src/app/ServiceManager.swift",
-        1,
-        """
-        launchAgentsURL
-            ?? FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(
-                    "Library/LaunchAgents",
-                    isDirectory: true
-                )
-        """,
-    ),
-    "ProgramArguments": (
-        "src/app/ServiceManager.swift",
-        1,
-        'let arguments = dictionary["ProgramArguments"] as? [String]',
-    ),
-    ".venv": (
-        "src/app/AppEnvironment.swift",
-        1,
-        'runtimeExecutableURL: root.appendingPathComponent(".venv/bin/python")',
-    ),
-    NOTICE: (
-        "src/app/OnboardingView.swift",
-        1,
-        f'Text("{NOTICE}")',
-    ),
+    "Library/LaunchAgents": {
+        "src/app/ServiceManager.swift": (
+            1,
+            """
+            launchAgentsURL
+                ?? FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent(
+                        "Library/LaunchAgents",
+                        isDirectory: true
+                    )
+            """,
+            1,
+        ),
+        "src/app/LegacyInstallCleaner.swift": (
+            1,
+            """
+            homeURL.appendingPathComponent(
+                "Library/LaunchAgents",
+                isDirectory: true
+            )
+            """,
+            1,
+        ),
+    },
+    "ProgramArguments": {
+        "src/app/ServiceManager.swift": (
+            1,
+            'let arguments = dictionary["ProgramArguments"] as? [String]',
+            1,
+        ),
+        "src/app/LegacyInstallCleaner.swift": (
+            6,
+            'dictionary["ProgramArguments"] as? [String]',
+            3,
+        ),
+    },
+    ".venv": {
+        "src/app/AppEnvironment.swift": (
+            1,
+            'runtimeExecutableURL: root.appendingPathComponent(".venv/bin/python")',
+            1,
+        ),
+        "src/app/LegacyInstallCleaner.swift": (
+            1,
+            """
+            candidateRoot
+                .appendingPathComponent(".venv/lib", isDirectory: true).path
+                + "/python"
+            """,
+            1,
+        ),
+    },
+    "readRegularFile": {
+        "src/app/SecureFileTree.swift": (
+            1,
+            """
+            func readRegularFile(
+                _ relativePath: String,
+                maximumBytes: Int
+            ) throws -> Data
+            """,
+            1,
+        ),
+        "src/app/LegacyInstallCleaner.swift": (
+            1,
+            """
+            tree.readRegularFile(
+                name,
+                maximumBytes: LegacyIdentity.maximumPlistBytes
+            )
+            """,
+            1,
+        ),
+    },
+    NOTICE: {
+        "src/app/OnboardingView.swift": (
+            1,
+            f'Text("{NOTICE}")',
+            1,
+        ),
+    },
 }
 SECURE_FILE_TREE_SOURCE = "src/app/SecureFileTree.swift"
 DIRECTORY_ENUMERATION_CAPABILITIES = {
@@ -217,37 +271,39 @@ def collect_policy_violations(sources: dict[str, str]) -> list[str]:
                     f"'{forbidden}'"
                 )
 
-    for anchor, budget in SWIFT_SENSITIVE_ANCHOR_BUDGETS.items():
-        expected_source, expected_count, expected_context = budget
+    for anchor, source_budgets in SWIFT_SENSITIVE_ANCHOR_BUDGETS.items():
         normalized_anchor = normalize_swift_policy_text(anchor)
-        expected_content = normalized_swift_sources.get(expected_source, "")
-        actual_count = expected_content.count(normalized_anchor)
-        if actual_count != expected_count:
-            violations.append(
-                f"{expected_source}: normalized sensitive anchor '{anchor}' "
-                f"expected exactly {expected_count} occurrence, found {actual_count}"
-            )
+        for expected_source, budget in sorted(source_budgets.items()):
+            expected_count, expected_context, expected_context_count = budget
+            expected_content = normalized_swift_sources.get(expected_source, "")
+            actual_count = expected_content.count(normalized_anchor)
+            if actual_count != expected_count:
+                violations.append(
+                    f"{expected_source}: normalized sensitive anchor '{anchor}' "
+                    f"expected exactly {expected_count} occurrence, found "
+                    f"{actual_count}"
+                )
 
-        normalized_context = normalize_swift_policy_text(expected_context)
-        context_count = expected_content.count(normalized_context)
-        if context_count != expected_count:
-            violations.append(
-                f"{expected_source}: normalized context budget for sensitive "
-                f"anchor '{anchor}' expected exactly {expected_count} occurrence, "
-                f"found {context_count}"
-            )
+            normalized_context = normalize_swift_policy_text(expected_context)
+            context_count = expected_content.count(normalized_context)
+            if context_count != expected_context_count:
+                violations.append(
+                    f"{expected_source}: normalized context budget for sensitive "
+                    f"anchor '{anchor}' expected exactly {expected_context_count} "
+                    f"occurrence, found {context_count}"
+                )
 
         for source_name, normalized_content in sorted(
             normalized_swift_sources.items()
         ):
-            if source_name == expected_source:
+            if source_name in source_budgets:
                 continue
             unexpected_count = normalized_content.count(normalized_anchor)
             if unexpected_count:
+                allowed_label = ", ".join(sorted(source_budgets))
                 violations.append(
                     f"{source_name}: normalized sensitive anchor '{anchor}' "
-                    f"is not allowed; expected exactly {expected_count} occurrence "
-                    f"in {expected_source}"
+                    f"is not allowed; allowed only in {allowed_label}"
                 )
     return violations
 
@@ -355,8 +411,8 @@ _ = read(descriptor, &buffer, buffer.count)
 
         self.assertIn(
             "src/app/LegacyProbe.swift: normalized sensitive anchor "
-            "'Library/LaunchAgents' is not allowed; expected exactly "
-            "1 occurrence in src/app/ServiceManager.swift",
+            "'Library/LaunchAgents' is not allowed; allowed only in "
+            "src/app/LegacyInstallCleaner.swift, src/app/ServiceManager.swift",
             violations,
         )
 
@@ -387,21 +443,34 @@ private func readLegacyPlistStatus() {
 
     def test_sensitive_anchor_detector_rejects_new_swift_helper(self) -> None:
         probes = {
-            "Library/LaunchAgents": "src/app/ServiceManager.swift",
-            "ProgramArguments": "src/app/ServiceManager.swift",
-            ".venv": "src/app/AppEnvironment.swift",
+            "Library/LaunchAgents": (
+                "src/app/LegacyInstallCleaner.swift, "
+                "src/app/ServiceManager.swift"
+            ),
+            "ProgramArguments": (
+                "src/app/LegacyInstallCleaner.swift, "
+                "src/app/ServiceManager.swift"
+            ),
+            ".venv": (
+                "src/app/AppEnvironment.swift, "
+                "src/app/LegacyInstallCleaner.swift"
+            ),
+            "readRegularFile": (
+                "src/app/LegacyInstallCleaner.swift, "
+                "src/app/SecureFileTree.swift"
+            ),
             NOTICE: "src/app/OnboardingView.swift",
         }
 
-        for anchor, allowed_source in probes.items():
+        for anchor, allowed_sources in probes.items():
             with self.subTest(anchor=anchor):
                 sources = load_policy_sources()
                 sources["src/app/LegacyProbe.swift"] = f'let probe = "{anchor}"'
                 violations = collect_policy_violations(sources)
                 self.assertIn(
                     "src/app/LegacyProbe.swift: normalized sensitive anchor "
-                    f"'{anchor}' is not allowed; expected exactly 1 occurrence "
-                    f"in {allowed_source}",
+                    f"'{anchor}' is not allowed; allowed only in "
+                    f"{allowed_sources}",
                     violations,
                 )
 

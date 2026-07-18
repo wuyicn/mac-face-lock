@@ -124,6 +124,14 @@ jobs:
             src/app/SecureFileTree.swift tests/swift/SecureFileTreeTests.swift \
             -o "$RUNNER_TEMP/mac-face-lock-secure-tree-tests"
           "$RUNNER_TEMP/mac-face-lock-secure-tree-tests"
+      - name: Run Swift legacy-install-cleaner tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/Models.swift src/app/ServiceManager.swift \
+            src/app/SecureFileTree.swift src/app/LegacyInstallCleaner.swift \
+            tests/swift/LegacyInstallCleanerTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-legacy-cleaner-tests"
+          "$RUNNER_TEMP/mac-face-lock-legacy-cleaner-tests"
       - name: Typecheck the unified Swift application
         run: |
           xcrun swiftc -parse-as-library -typecheck \
