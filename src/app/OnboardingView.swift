@@ -340,6 +340,26 @@ struct OnboardingView: View {
                 Text("正脸 · 左转约 30° · 右转约 30° · 轻微低头 · 轻微抬头")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                if let pose = setupCoordinator.enrollmentPose {
+                    Label(
+                        "当前动作：\(enrollmentPoseLabel(pose))",
+                        systemImage: "person.crop.rectangle"
+                    )
+                    .font(.callout.weight(.semibold))
+                }
+                if setupCoordinator.enrollmentQuality == "rejected",
+                   let reason = setupCoordinator.enrollmentRejectionReason {
+                    Label(
+                        enrollmentRejectionLabel(reason),
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(Color(nsColor: .systemOrange))
+                } else if setupCoordinator.enrollmentQuality == "accepted" {
+                    Label("当前样本质量合格", systemImage: "checkmark.circle.fill")
+                        .font(.callout)
+                        .foregroundStyle(Color(nsColor: .systemGreen))
+                }
             }
 
             if let progress = setupCoordinator.progress {
@@ -620,6 +640,29 @@ struct OnboardingView: View {
             Task {
                 await setupCoordinator.refreshPermissions()
             }
+        }
+    }
+
+    private func enrollmentPoseLabel(_ pose: String) -> String {
+        switch pose {
+        case "front": return "正脸"
+        case "left": return "左转约 30°"
+        case "right": return "右转约 30°"
+        case "up": return "轻微抬头"
+        case "down": return "轻微低头"
+        default: return "按照画面提示调整"
+        }
+    }
+
+    private func enrollmentRejectionLabel(_ reason: String) -> String {
+        switch reason {
+        case "no_face": return "未检测到脸，请正对摄像头"
+        case "multiple_faces": return "画面中有多张脸，请只保留本人"
+        case "too_dark": return "光线不足，请移到更明亮的位置"
+        case "face_too_small": return "距离太远，请靠近摄像头"
+        case "face_too_large": return "距离太近，请稍微后退"
+        case "pose_mismatch": return "姿势与当前提示不符，请只重试当前动作"
+        default: return "当前样本质量不足，请只重试当前动作"
         }
     }
 

@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from face_verifier import capture_owner_profile
+from enrollment_state_machine import EnrollmentProgressEvent
 from runtime_paths import RuntimePaths
 from state_store import write_state
 
@@ -19,7 +20,7 @@ CONFIG_PATH = RUNTIME_PATHS.config_path
 
 def enroll_owner(
     paths: RuntimePaths,
-    progress: Callable[[int, int], None] | None = None,
+    progress: Callable[[EnrollmentProgressEvent], None] | None = None,
 ) -> Path:
     paths.ensure_writable_directories()
     config = json.loads(paths.config_path.read_text(encoding="utf-8"))

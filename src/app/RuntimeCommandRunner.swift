@@ -53,6 +53,11 @@ struct RuntimeEvent: Decodable, Equatable {
     let failedChecks: [String]?
     let decision: String?
     let failureKind: String?
+    let pose: String?
+    let quality: String?
+    let reason: String?
+    let acceptedPoseCount: Int?
+    let requiredPoseCount: Int?
 
     init(
         schemaVersion: Int,
@@ -64,7 +69,12 @@ struct RuntimeEvent: Decodable, Equatable {
         check: String? = nil,
         failedChecks: [String]? = nil,
         decision: String? = nil,
-        failureKind: String? = nil
+        failureKind: String? = nil,
+        pose: String? = nil,
+        quality: String? = nil,
+        reason: String? = nil,
+        acceptedPoseCount: Int? = nil,
+        requiredPoseCount: Int? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.event = event
@@ -76,6 +86,11 @@ struct RuntimeEvent: Decodable, Equatable {
         self.failedChecks = failedChecks
         self.decision = decision
         self.failureKind = failureKind
+        self.pose = pose
+        self.quality = quality
+        self.reason = reason
+        self.acceptedPoseCount = acceptedPoseCount
+        self.requiredPoseCount = requiredPoseCount
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -89,6 +104,11 @@ struct RuntimeEvent: Decodable, Equatable {
         case failedChecks = "failed_checks"
         case decision
         case failureKind = "failure_kind"
+        case pose
+        case quality
+        case reason
+        case acceptedPoseCount = "accepted_pose_count"
+        case requiredPoseCount = "required_pose_count"
     }
 }
 

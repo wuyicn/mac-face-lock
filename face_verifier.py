@@ -16,6 +16,13 @@ from typing import Any
 
 import numpy as np
 
+from enrollment_state_machine import (
+    EnrollmentPose,
+    EnrollmentProgressEvent,
+    EnrollmentQualityReason,
+    EnrollmentStateMachine,
+    FrameAssessment,
+)
 from runtime_paths import RuntimePaths
 from template_store import replace_owner_template
 
@@ -207,45 +214,154 @@ def evidence_matches_owner(
 def capture_owner_profile(
     config: dict[str, Any],
     output_path: Path = OWNER_FACE_PATH,
-    progress: Callable[[int, int], None] | None = None,
+    progress: Callable[[EnrollmentProgressEvent], None] | None = None,
+    assess_frame: Callable[[np.ndarray, EnrollmentPose], FrameAssessment] | None = None,
 ) -> Path:
     cv2 = _load_runtime_modules()
     camera_index = int(config.get("camera_index", 0))
     cascades = _face_cascades(cv2, config)
-    samples_needed = int(config.get("enroll_samples", 8))
-    timeout_seconds = float(config.get("enroll_timeout_seconds", 20))
+    samples_per_pose = int(config.get("enroll_samples_per_pose", 2))
+    timeout_seconds = float(config.get("enroll_timeout_seconds", 60))
+    machine = EnrollmentStateMachine(samples_per_pose=samples_per_pose)
+    classifier = assess_frame or (
+        lambda frame, expected_pose: _assess_enrollment_frame(
+            cv2,
+            cascades,
+            frame,
+            expected_pose,
+            config,
+        )
+    )
 
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
         raise CameraUnavailableError(f"Could not open camera index {camera_index}")
 
-    encodings: list[np.ndarray] = []
     deadline = time.monotonic() + timeout_seconds
     try:
-        while time.monotonic() < deadline and len(encodings) < samples_needed:
+        while time.monotonic() < deadline and not machine.is_complete:
             ok, frame = cap.read()
-            if not ok:
+            if not ok or frame is None:
                 time.sleep(0.2)
                 continue
-            template = _extract_face_template(cv2, cascades, frame)
-            if template is None:
-                time.sleep(0.2)
-                continue
-            encodings.append(template)
+            event = machine.consume(classifier(frame, machine.current_pose))
             if progress is not None:
-                progress(len(encodings), samples_needed)
-            time.sleep(0.25)
+                progress(event)
+            time.sleep(0.2 if event.quality == "rejected" else 0.35)
     finally:
         cap.release()
 
-    if len(encodings) < max(2, min(samples_needed, 3)):
+    if not machine.is_complete:
         raise RuntimeError(
-            f"Not enough clean owner samples. Captured {len(encodings)}/{samples_needed}."
+            "Enrollment timed out before every configured pose was completed."
         )
 
-    owner_templates = _normalize_templates(np.stack(encodings))
+    owner_templates = _normalize_templates(np.stack(machine.templates))
     replace_owner_template(owner_templates, output_path)
     return output_path
+
+
+def _assess_enrollment_frame(
+    cv2: Any,
+    cascades: list[tuple[str, Any, bool]],
+    frame: np.ndarray,
+    expected_pose: EnrollmentPose,
+    config: dict[str, Any],
+) -> FrameAssessment:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if float(np.mean(gray)) < float(config.get("enroll_min_brightness", 45.0)):
+        return FrameAssessment.rejected(EnrollmentQualityReason.TOO_DARK)
+
+    observations: list[tuple[str, tuple[int, int, int, int]]] = []
+    width = gray.shape[1]
+    for label, cascade, use_mirror in cascades:
+        source = cv2.flip(gray, 1) if use_mirror else gray
+        for x, y, w, h in cascade.detectMultiScale(
+            source,
+            scaleFactor=1.08,
+            minNeighbors=4,
+            minSize=(70, 70),
+        ):
+            if use_mirror:
+                x = width - x - w
+            observations.append((label, (int(x), int(y), int(w), int(h))))
+
+    boxes = _merge_face_boxes([box for _, box in observations])
+    if not boxes:
+        return FrameAssessment.rejected(EnrollmentQualityReason.NO_FACE)
+    if len(boxes) != 1:
+        return FrameAssessment.rejected(EnrollmentQualityReason.MULTIPLE_FACES)
+
+    box = boxes[0]
+    frame_area = int(gray.shape[0] * gray.shape[1])
+    ratio = _box_area(box) / max(frame_area, 1)
+    if ratio < float(config.get("enroll_min_face_ratio", 0.08)):
+        return FrameAssessment.rejected(EnrollmentQualityReason.FACE_TOO_SMALL)
+    if ratio > float(config.get("enroll_max_face_ratio", 0.55)):
+        return FrameAssessment.rejected(EnrollmentQualityReason.FACE_TOO_LARGE)
+
+    matching_labels = [
+        label
+        for label, observed in observations
+        if _box_iou(box, observed) >= 0.35
+    ]
+    pose = _classify_enrollment_pose(
+        cv2,
+        gray,
+        box,
+        matching_labels,
+        config,
+    )
+    if pose != expected_pose:
+        return FrameAssessment(
+            pose=pose,
+            template=None,
+            reason=EnrollmentQualityReason.POSE_MISMATCH,
+        )
+
+    x, y, w, h = box
+    face = cv2.resize(gray[y : y + h, x : x + w], FACE_SIZE)
+    face = cv2.equalizeHist(face)
+    vector = face.astype("float32").reshape(-1)
+    norm = np.linalg.norm(vector)
+    if norm == 0:
+        return FrameAssessment.rejected(EnrollmentQualityReason.NO_FACE)
+    return FrameAssessment.accepted(pose=pose, template=vector / norm)
+
+
+def _classify_enrollment_pose(
+    cv2: Any,
+    gray: np.ndarray,
+    box: tuple[int, int, int, int],
+    labels: list[str],
+    config: dict[str, Any],
+) -> EnrollmentPose:
+    if "profile" in labels and "frontal" not in labels:
+        return EnrollmentPose.LEFT
+    if "profile_mirror" in labels and "frontal" not in labels:
+        return EnrollmentPose.RIGHT
+
+    x, y, w, h = box
+    face = gray[y : y + h, x : x + w]
+    eye_path = Path(cv2.data.haarcascades) / "haarcascade_eye.xml"
+    eye_cascade = cv2.CascadeClassifier(str(eye_path))
+    if not eye_cascade.empty():
+        eyes = eye_cascade.detectMultiScale(
+            face,
+            scaleFactor=1.08,
+            minNeighbors=4,
+            minSize=(12, 12),
+        )
+        if len(eyes) >= 2:
+            eye_ratio = float(
+                np.mean([eye_y + eye_h / 2 for _, eye_y, _, eye_h in eyes[:2]])
+                / max(h, 1)
+            )
+            if eye_ratio >= float(config.get("enroll_up_eye_ratio", 0.43)):
+                return EnrollmentPose.UP
+            if eye_ratio <= float(config.get("enroll_down_eye_ratio", 0.30)):
+                return EnrollmentPose.DOWN
+    return EnrollmentPose.FRONT
 
 
 def verify_current_user(config: dict[str, Any], owner_encoding: np.ndarray) -> VerifyResult:

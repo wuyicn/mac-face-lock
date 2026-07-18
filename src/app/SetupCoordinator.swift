@@ -456,6 +456,9 @@ final class SetupCoordinator: ObservableObject {
     @Published private(set) var hasCompletedOnboarding: Bool
     @Published private(set) var serviceStatus: ServiceStatus?
     @Published private(set) var enrollmentLifecycle: EnrollmentLifecycle
+    @Published private(set) var enrollmentPose: String?
+    @Published private(set) var enrollmentQuality: String?
+    @Published private(set) var enrollmentRejectionReason: String?
     @Published private(set) var recoveryStep: SetupStep?
     @Published private(set) var legacyCleanupState: LegacyCleanupState
 
@@ -555,6 +558,9 @@ final class SetupCoordinator: ObservableObject {
         self.hasCompletedOnboarding = storedRecord.isComplete
         self.serviceStatus = nil
         self.enrollmentLifecycle = .idle
+        self.enrollmentPose = nil
+        self.enrollmentQuality = nil
+        self.enrollmentRejectionReason = nil
         self.recoveryStep = storedRecord.isComplete && !durableOwnerEvidence
             ? (initialInspection.isValid ? .safetyTest : .enrollment)
             : nil
@@ -835,6 +841,9 @@ final class SetupCoordinator: ObservableObject {
         profileRevision &+= 1
         currentError = nil
         progress = 0
+        enrollmentPose = "front"
+        enrollmentQuality = nil
+        enrollmentRejectionReason = nil
         ownerTestPassed = false
         updateReadiness()
 
@@ -1479,6 +1488,8 @@ final class SetupCoordinator: ObservableObject {
         }
         if event.event == "enrollment_complete", event.status == "success" {
             progress = 1
+            enrollmentQuality = "accepted"
+            enrollmentRejectionReason = nil
             return
         }
         guard event.event == "enrollment_progress",
@@ -1488,6 +1499,9 @@ final class SetupCoordinator: ObservableObject {
             return
         }
         progress = min(max(Double(captured) / Double(required), 0), 1)
+        enrollmentPose = event.pose
+        enrollmentQuality = event.quality
+        enrollmentRejectionReason = event.reason
     }
 
     @discardableResult

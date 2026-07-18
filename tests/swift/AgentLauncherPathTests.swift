@@ -23,6 +23,8 @@ struct AgentLauncherPathTests {
         try testMissingProjectArgument()
         try testMissingVirtualEnvironment()
         try testValidTemporaryProject()
+        try testValidReleaseInvocation()
+        try testReleaseInvocationRejectsMalformedArguments()
         try testCStringAllocationFailure()
         print("Agent launcher path tests passed")
     }
@@ -73,6 +75,70 @@ struct AgentLauncherPathTests {
 
         try expectEqual(launch.python, python.path, "python path")
         try expectEqual(launch.agent, agent.path, "agent path")
+    }
+
+    private static func testValidReleaseInvocation() throws {
+        let root = try temporaryProject()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let resources = root.appendingPathComponent(
+            "Mac Face Lock.app/Contents/Resources",
+            isDirectory: true
+        )
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let runtime = resources.appendingPathComponent(
+            "runtime/MacFaceLockRuntime/MacFaceLockRuntime"
+        )
+        try FileManager.default.createDirectory(
+            at: runtime.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: support,
+            withIntermediateDirectories: true
+        )
+        try "#!/bin/sh\n".write(to: runtime, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: runtime.path
+        )
+
+        let launch = try resolveAgentLaunch(arguments: [
+            "MacFaceLockAgent",
+            "--resources-dir",
+            resources.path,
+            "--support-dir",
+            support.path,
+            "agent",
+        ])
+
+        try expectEqual(launch.python, runtime.path, "release runtime path")
+        try expectEqual(launch.agent, "agent", "release terminal verb")
+    }
+
+    private static func testReleaseInvocationRejectsMalformedArguments() throws {
+        let invalidArguments = [
+            ["MacFaceLockAgent", "--resources-dir", "/tmp/resources", "agent"],
+            [
+                "MacFaceLockAgent", "--support-dir", "/tmp/support",
+                "--resources-dir", "/tmp/resources", "agent",
+            ],
+            [
+                "MacFaceLockAgent", "--resources-dir", "/tmp/resources",
+                "--support-dir", "/tmp/support", "agent", "extra",
+            ],
+        ]
+        for arguments in invalidArguments {
+            do {
+                _ = try resolveAgentLaunch(arguments: arguments)
+                throw TestFailure.assertion(
+                    "malformed release arguments were accepted: \(arguments)"
+                )
+            } catch AgentLaunchError.missingProjectArgument {
+                continue
+            } catch AgentLaunchError.invalidReleaseInvocation {
+                continue
+            }
+        }
     }
 
     private static func testCStringAllocationFailure() throws {

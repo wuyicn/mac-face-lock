@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Sequence
 
+from enrollment_state_machine import EnrollmentProgressEvent
 from agent import main as run_agent
 from camera_diagnostic import run_diagnostics
 from enroll_owner import enroll_owner
@@ -74,13 +75,30 @@ def _run_enroll_command(paths: RuntimePaths) -> int:
         template_path=str(paths.owner_face_path),
     )
 
-    def progress(captured_samples: int, required_samples: int) -> None:
+    def progress(
+        event_or_captured: EnrollmentProgressEvent | int,
+        required_samples: int | None = None,
+    ) -> None:
+        if isinstance(event_or_captured, EnrollmentProgressEvent):
+            fields = {
+                "pose": event_or_captured.pose,
+                "quality": event_or_captured.quality,
+                "reason": event_or_captured.reason,
+                "accepted_pose_count": event_or_captured.accepted_pose_count,
+                "required_pose_count": event_or_captured.required_pose_count,
+                "captured_samples": event_or_captured.accepted_sample_count,
+                "required_samples": event_or_captured.required_sample_count,
+            }
+        else:
+            fields = {
+                "captured_samples": event_or_captured,
+                "required_samples": required_samples,
+            }
         emit(
             "enrollment_progress",
-            "success",
+            "success" if fields.get("quality") != "rejected" else "retry",
             "Owner enrollment progress",
-            captured_samples=captured_samples,
-            required_samples=required_samples,
+            **fields,
         )
 
     output_path = enroll_owner(paths, progress)

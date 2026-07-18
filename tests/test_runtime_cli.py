@@ -12,6 +12,7 @@ from unittest.mock import patch
 import numpy as np
 
 import runtime_cli
+from enrollment_state_machine import EnrollmentPose, EnrollmentProgressEvent
 from face_verifier import RuntimeDependencyError, VerifyResult
 
 
@@ -185,6 +186,33 @@ class RuntimeCLITests(unittest.TestCase):
         self.assertEqual(events[1]["captured_samples"], 1)
         self.assertEqual(events[1]["required_samples"], 2)
         self.assertEqual(events[-1]["template_path"], str(output_path))
+
+    def test_enroll_emits_structured_pose_quality_progress(self):
+        output_path = self.support_dir / "data" / "owner_face.npy"
+
+        def fake_enroll(paths, progress):
+            progress(
+                EnrollmentProgressEvent(
+                    pose=EnrollmentPose.LEFT.value,
+                    quality="rejected",
+                    reason="too_dark",
+                    accepted_pose_count=1,
+                    required_pose_count=5,
+                    accepted_sample_count=2,
+                    required_sample_count=10,
+                )
+            )
+            return output_path
+
+        with patch("runtime_cli.enroll_owner", side_effect=fake_enroll):
+            result = self.run_cli("enroll")
+
+        event = self.events(result)[1]
+        self.assertEqual(event["pose"], "left")
+        self.assertEqual(event["quality"], "rejected")
+        self.assertEqual(event["reason"], "too_dark")
+        self.assertEqual(event["accepted_pose_count"], 1)
+        self.assertEqual(event["required_pose_count"], 5)
 
     def test_agent_uses_explicit_release_paths_and_emits_lifecycle_events(self):
         def fake_agent(paths, on_started):
