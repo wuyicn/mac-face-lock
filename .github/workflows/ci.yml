@@ -93,27 +93,12 @@ jobs:
             src/app/Models.swift src/app/SetupModels.swift \
             src/app/LocalJSONStore.swift src/app/SetupStore.swift \
             src/app/PermissionCenter.swift src/app/RuntimeCommandRunner.swift \
-            src/app/ServiceManager.swift src/app/SourceDataMigrator.swift \
-            src/app/SetupCoordinator.swift \
+            src/app/ServiceManager.swift src/app/SetupCoordinator.swift \
             tests/swift/SetupCoordinatorTests.swift \
             -framework AppKit -framework AVFoundation \
             -framework ApplicationServices -framework CoreGraphics \
             -o "$RUNNER_TEMP/mac-face-lock-setup-coordinator-tests"
           "$RUNNER_TEMP/mac-face-lock-setup-coordinator-tests"
-      - name: Run Swift source-data-migration tests
-        run: |
-          xcrun swiftc -parse-as-library -DTESTING \
-            src/app/ProjectLocator.swift src/app/AppEnvironment.swift \
-            src/app/Models.swift src/app/SetupModels.swift \
-            src/app/LocalJSONStore.swift src/app/SetupStore.swift \
-            src/app/PermissionCenter.swift src/app/RuntimeCommandRunner.swift \
-            src/app/ServiceManager.swift src/app/SourceDataMigrator.swift \
-            src/app/SetupCoordinator.swift \
-            tests/swift/SourceDataMigratorTests.swift \
-            -framework AppKit -framework AVFoundation \
-            -framework ApplicationServices -framework CoreGraphics \
-            -o "$RUNNER_TEMP/mac-face-lock-source-migration-tests"
-          "$RUNNER_TEMP/mac-face-lock-source-migration-tests"
       - name: Run Swift project-locator tests
         run: |
           xcrun swiftc -parse-as-library -DTESTING \

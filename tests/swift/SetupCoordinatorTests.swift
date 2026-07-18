@@ -589,10 +589,6 @@ private struct CoordinatorFixture {
             .appendingPathComponent("mac-face-lock-coordinator-\(UUID().uuidString)")
         let dataURL = root.appendingPathComponent("data", isDirectory: true)
         try FileManager.default.createDirectory(at: dataURL, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(
-            at: root.appendingPathComponent("config", isDirectory: true),
-            withIntermediateDirectories: true
-        )
         localStore = LocalJSONStore(resourcesURL: root, dataURL: dataURL)
         setupStore = try SetupStore(localStore: localStore, mode: mode)
         environment = AppEnvironment(
@@ -642,6 +638,7 @@ struct SetupCoordinatorTests {
         try testOpenLogsReportsCustomerSafeFailure()
         try await testHealthyCompletedRelaunchAndForegroundStayReadyWithoutRuntime()
         try await testFreshPreparationPassiveRefreshRunsNoRuntimeCommand()
+        try await testFreshReleaseContinuesThroughRequiredEnrollment()
         try await testRuntimeDiagnosticsAreSerialized()
         try testStrictStaticOwnerProfileInspection()
         try testSharedNumpyHeaderCorpusMatchesSwiftInspector()
@@ -650,8 +647,6 @@ struct SetupCoordinatorTests {
         try await testParentCancellationPropagatesToEnrollmentChildAtStart()
         try await testCameraOnlyDiagnosisKeepsValidOwnerProfile()
         try await testCompletedCameraRevocationRecoveryPreservesHistoryAndSkipsEnrollment()
-        try await testMigrationRequiresExplicitChoiceAndCanRetryVisibleFailure()
-        try await testPendingMigrationRecoveryBlocksPreparationAndCanRetry()
         print("Setup coordinator tests passed")
     }
 
@@ -1352,6 +1347,41 @@ struct SetupCoordinatorTests {
         try require(
             runner.commands.isEmpty,
             "passive first-run refresh launched diagnose before customer action"
+        )
+    }
+
+    private static func testFreshReleaseContinuesThroughRequiredEnrollment()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try Data().write(to: fixture.environment.runtimeExecutableURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fixture.environment.runtimeExecutableURL.path
+        )
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: FakeServiceManager(state: .notInstalled),
+            applicationURL: URL(fileURLWithPath: "/Applications/Mac Face Lock.app"),
+            ownerProfileInspector: FakeOwnerProfileInspector(valid: false)
+        )
+
+        let prepared = await coordinator.prepareForSetup()
+        try require(prepared, "preparation did not continue without a migration choice")
+        try require(
+            coordinator.currentStep == .permissions,
+            "preparation did not advance to permissions"
+        )
+
+        let continued = await coordinator.continueFromPermissions()
+        try require(continued, "granted camera permission did not continue")
+        try require(
+            coordinator.currentStep == .enrollment,
+            "release onboarding skipped required enrollment"
         )
     }
 
@@ -2198,182 +2228,5 @@ struct SetupCoordinatorTests {
 
         runner.deliverEOF()
         await enrollment.value
-    }
-
-    private static func testMigrationRequiresExplicitChoiceAndCanRetryVisibleFailure() async throws {
-        let fixture = try CoordinatorFixture(mode: .source)
-        defer { fixture.remove() }
-        let source = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "legacy-source-\(UUID().uuidString)"
-        )
-        defer { try? FileManager.default.removeItem(at: source) }
-        try FileManager.default.createDirectory(
-            at: source.appendingPathComponent("config"),
-            withIntermediateDirectories: true
-        )
-        try FileManager.default.createDirectory(
-            at: source.appendingPathComponent("data"),
-            withIntermediateDirectories: true
-        )
-        try Data("agent\n".utf8).write(
-            to: source.appendingPathComponent("agent.py")
-        )
-        let sourceConfig = Data("{\"mode\":\"presence_guard\"}".utf8)
-        try sourceConfig.write(
-            to: source.appendingPathComponent("config/config.json")
-        )
-        let preferencesURL = source.appendingPathComponent(
-            "data/ui-preferences.json"
-        )
-        try Data("{\"schema_version\":2}".utf8).write(to: preferencesURL)
-
-        let migrator = SourceDataMigrator(candidateRootURLs: [source])
-        let coordinator = SetupCoordinator(
-            environment: fixture.environment,
-            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
-            setupStore: fixture.setupStore,
-            localStore: fixture.localStore,
-            runtimeRunner: FakeRuntimeRunner(),
-            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
-            ownerProfileInspector: FakeOwnerProfileInspector(valid: false),
-            sourceDataMigrator: migrator
-        )
-
-        try require(
-            coordinator.sourceInstallCandidates.count == 1
-                && coordinator.migrationDecision == .pending,
-            "discovered source data did not require an explicit import decision"
-        )
-        let preparedBeforeDecision = await coordinator.prepareForSetup()
-        try require(
-            !preparedBeforeDecision,
-            "preparation advanced before import or skip was chosen"
-        )
-        try require(
-            coordinator.currentStep == .preparation,
-            "migration choice gate changed the onboarding step"
-        )
-
-        let candidate = coordinator.sourceInstallCandidates[0]
-        try require(
-            !coordinator.importSourceData(candidate),
-            "malformed migration unexpectedly succeeded"
-        )
-        try require(
-            coordinator.currentError?.contains("界面偏好") == true
-                && coordinator.migrationDecision == .pending,
-            "migration failure was not visible and retryable"
-        )
-
-        try Data(
-            "{\"schema_version\":1,\"appearance\":\"dark\",\"accent\":\"amethyst\"}".utf8
-        ).write(to: preferencesURL)
-        try require(
-            !coordinator.importSourceData(candidate),
-            "changed payload bypassed candidate provenance on retry"
-        )
-        guard let refreshedCandidate =
-            coordinator.sourceInstallCandidates.first else {
-            throw TestFailure.assertion(
-                "changed payload did not refresh the safe candidate"
-            )
-        }
-        try require(
-            coordinator.importSourceData(refreshedCandidate),
-            "corrected migration did not succeed after safe rediscovery"
-        )
-        guard case .imported = coordinator.migrationDecision else {
-            throw TestFailure.assertion("successful migration did not record the explicit choice")
-        }
-        let importedConfig = try Data(contentsOf: fixture.environment.configURL)
-        try require(
-            importedConfig == sourceConfig,
-            "coordinator imported source data into the wrong destination"
-        )
-        let sourceConfigAfterImport = try Data(
-            contentsOf: source.appendingPathComponent("config/config.json")
-        )
-        try require(
-            sourceConfigAfterImport == sourceConfig,
-            "coordinator import modified the source config"
-        )
-
-        let skipFixture = try CoordinatorFixture(mode: .source)
-        defer { skipFixture.remove() }
-        let skipCoordinator = SetupCoordinator(
-            environment: skipFixture.environment,
-            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
-            setupStore: skipFixture.setupStore,
-            localStore: skipFixture.localStore,
-            runtimeRunner: FakeRuntimeRunner(),
-            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
-            ownerProfileInspector: FakeOwnerProfileInspector(valid: false),
-            sourceDataMigrator: SourceDataMigrator(candidateRootURLs: [source])
-        )
-        skipCoordinator.skipSourceDataImport()
-        try require(
-            skipCoordinator.migrationDecision == .skipped,
-            "skip was not recorded as an explicit customer choice"
-        )
-        let sourceConfigAfterSkip = try Data(
-            contentsOf: source.appendingPathComponent("config/config.json")
-        )
-        try require(
-            sourceConfigAfterSkip == sourceConfig,
-            "skip modified or marked the source installation"
-        )
-    }
-
-    private static func testPendingMigrationRecoveryBlocksPreparationAndCanRetry() async throws {
-        let fixture = try CoordinatorFixture(mode: .source)
-        defer { fixture.remove() }
-        try FileManager.default.createDirectory(
-            at: fixture.root.appendingPathComponent("config"),
-            withIntermediateDirectories: true
-        )
-        let transaction = fixture.root.appendingPathComponent(
-            "backups/import-corrupt"
-        )
-        try FileManager.default.createDirectory(
-            at: transaction,
-            withIntermediateDirectories: true
-        )
-        try Data("corrupt-journal".utf8).write(
-            to: transaction.appendingPathComponent("journal.json")
-        )
-        let migrator = SourceDataMigrator(candidateRootURLs: [])
-        let coordinator = SetupCoordinator(
-            environment: fixture.environment,
-            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
-            setupStore: fixture.setupStore,
-            localStore: fixture.localStore,
-            runtimeRunner: FakeRuntimeRunner(),
-            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
-            ownerProfileInspector: FakeOwnerProfileInspector(valid: false),
-            sourceDataMigrator: migrator
-        )
-        try require(
-            coordinator.migrationDecision.recoveryFailureMessage != nil
-                && coordinator.currentError?.contains("恢复") == true,
-            "pending recovery failure was not visible at startup"
-        )
-        let prepared = await coordinator.prepareForSetup()
-        try require(!prepared, "preparation bypassed failed migration recovery")
-        coordinator.skipSourceDataImport()
-        try require(
-            coordinator.migrationDecision.recoveryFailureMessage != nil,
-            "skip bypassed an unresolved migration recovery"
-        )
-
-        try FileManager.default.removeItem(at: transaction)
-        try require(
-            coordinator.retryMigrationRecovery(),
-            "recovery retry did not clear a repaired pending transaction"
-        )
-        try require(
-            coordinator.migrationDecision == .notRequired
-                && coordinator.currentError == nil,
-            "successful recovery retry did not restore the first-run gate"
-        )
     }
 }

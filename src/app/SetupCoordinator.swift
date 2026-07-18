@@ -21,14 +21,7 @@ final class NumpyOwnerProfileInspector: OwnerProfileInspecting {
         guard let data = try? Data(
             contentsOf: url,
             options: [.mappedIfSafe]
-        ) else {
-            return OwnerProfileInspection(isValid: false, fingerprint: nil)
-        }
-        return inspect(data)
-    }
-
-    func inspect(_ data: Data) -> OwnerProfileInspection {
-        guard data.count >= 10, data.count <= maximumBytes,
+        ), data.count >= 10, data.count <= maximumBytes,
               Array(data.prefix(6)) == [0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59] else {
             return OwnerProfileInspection(isValid: false, fingerprint: nil)
         }
@@ -464,8 +457,6 @@ final class SetupCoordinator: ObservableObject {
     @Published private(set) var serviceStatus: ServiceStatus?
     @Published private(set) var enrollmentLifecycle: EnrollmentLifecycle
     @Published private(set) var recoveryStep: SetupStep?
-    @Published private(set) var sourceInstallCandidates: [SourceInstallCandidate]
-    @Published private(set) var migrationDecision: MigrationDecision
 
     private let environment: AppEnvironment
     private let permissionCenter: PermissionCenter
@@ -478,7 +469,6 @@ final class SetupCoordinator: ObservableObject {
     private let fileManager: FileManager
     private let logOpener: (URL) -> Bool
     private let ownerProfileInspector: OwnerProfileInspecting
-    private let sourceDataMigrator: SourceDataMigrator?
 
     private var ownerProfileValid: Bool
     private var diagnosisPassed: Bool
@@ -506,8 +496,7 @@ final class SetupCoordinator: ObservableObject {
         applicationURL: URL? = nil,
         fileManager: FileManager = .default,
         logOpener: ((URL) -> Bool)? = nil,
-        ownerProfileInspector: OwnerProfileInspecting? = nil,
-        sourceDataMigrator: SourceDataMigrator? = nil
+        ownerProfileInspector: OwnerProfileInspecting? = nil
     ) {
         let storedRecord = setupStore.record
         let resolvedOwnerProfileInspector =
@@ -524,24 +513,6 @@ final class SetupCoordinator: ObservableObject {
             && initialInspection.isValid
             && storedRecord.ownerProfileFingerprint != nil
             && storedRecord.ownerProfileFingerprint == initialInspection.fingerprint
-        let resolvedMigrator = sourceDataMigrator
-            ?? (environment.mode == .release ? SourceDataMigrator() : nil)
-        var initialMigrationError: String?
-        if let resolvedMigrator {
-            do {
-                try resolvedMigrator.recoverPendingImports(
-                    destination: environment.supportURL
-                )
-            } catch {
-                initialMigrationError =
-                    "上次数据导入尚未安全恢复，请先重试恢复；保护保持关闭。"
-            }
-        }
-        let discoveredCandidates =
-            storedRecord.currentStep == .preparation
-                && initialMigrationError == nil
-            ? (resolvedMigrator?.discoverCandidates() ?? [])
-            : []
         self.environment = environment
         self.permissionCenter = permissionCenter
         self.setupStore = setupStore
@@ -564,9 +535,8 @@ final class SetupCoordinator: ObservableObject {
         self.fileManager = fileManager
         self.logOpener = logOpener ?? { NSWorkspace.shared.open($0) }
         self.ownerProfileInspector = resolvedOwnerProfileInspector
-        self.sourceDataMigrator = resolvedMigrator
         self.progress = nil
-        self.currentError = initialMigrationError
+        self.currentError = nil
         self.permissionStates = [:]
         self.currentStep = restoredStep
         self.hasCompletedOnboarding = storedRecord.isComplete
@@ -575,13 +545,6 @@ final class SetupCoordinator: ObservableObject {
         self.recoveryStep = storedRecord.isComplete && !durableOwnerEvidence
             ? (initialInspection.isValid ? .safetyTest : .enrollment)
             : nil
-        self.sourceInstallCandidates = discoveredCandidates
-        self.migrationDecision = initialMigrationError != nil
-            ? .recoveryFailed(
-                initialMigrationError
-                    ?? "上次数据导入尚未安全恢复，请重试恢复后再继续。"
-            )
-            : (discoveredCandidates.isEmpty ? .notRequired : .pending)
         self.ownerProfileValid = initialInspection.isValid
         self.diagnosisPassed = durableOwnerEvidence
         self.ownerTestPassed = durableOwnerEvidence
@@ -658,23 +621,14 @@ final class SetupCoordinator: ObservableObject {
 
     @discardableResult
     func prepareForSetup() async -> Bool {
-        guard migrationDecision.recoveryFailureMessage == nil else {
-            currentError = migrationDecision.recoveryFailureMessage
-                ?? "请先恢复上次未完成的数据导入；保护保持关闭。"
-            return false
-        }
         currentError = nil
-        guard migrationDecision != .pending else {
-            currentError = "发现旧版源码数据，请先明确选择“导入”或“跳过”。"
-            return false
-        }
         let issues = preparationIssues()
         guard issues.isEmpty else {
             currentError = issues.joined(separator: " ")
             return false
         }
         do {
-            try persistStep(.permissions, completing: [.preparation])
+            try persistStep(.permissions, completing: .preparation)
             await refreshPermissions()
             return true
         } catch {
@@ -694,87 +648,11 @@ final class SetupCoordinator: ObservableObject {
             return false
         }
         do {
-            refreshStaticOwnerProfileEvidence()
-            if ownerProfileValid {
-                try persistStep(
-                    .safetyTest,
-                    completing: [.permissions, .enrollment]
-                )
-            } else {
-                try persistStep(.enrollment, completing: [.permissions])
-            }
+            try persistStep(.enrollment, completing: .permissions)
             currentError = nil
             return true
         } catch {
             currentError = "无法保存权限检查结果，请检查应用支持目录权限后重试。"
-            return false
-        }
-    }
-
-    @discardableResult
-    func importSourceData(_ candidate: SourceInstallCandidate) -> Bool {
-        guard migrationDecision == .pending,
-              sourceInstallCandidates.contains(candidate),
-              let sourceDataMigrator else {
-            currentError = "当前没有可导入的旧版源码数据。"
-            return false
-        }
-        do {
-            let result = try sourceDataMigrator.import(
-                candidate: candidate,
-                destination: environment.supportURL
-            )
-            migrationDecision = .imported(result)
-            currentError = nil
-            refreshStaticOwnerProfileEvidence()
-            updateReadiness()
-            return true
-        } catch {
-            let message = (error as? LocalizedError)?.errorDescription
-                ?? "旧版数据导入失败，未更改当前数据；请修复后重试或选择跳过。"
-            if let migrationError = error as? SourceDataMigrationError,
-               migrationError == .recoveryFailed
-                || migrationError == .rollbackFailed {
-                migrationDecision = .recoveryFailed(message)
-            } else {
-                sourceInstallCandidates =
-                    sourceDataMigrator.discoverCandidates()
-                migrationDecision = .pending
-            }
-            currentError = message
-            return false
-        }
-    }
-
-    func skipSourceDataImport() {
-        guard migrationDecision == .pending else {
-            return
-        }
-        migrationDecision = .skipped
-        currentError = nil
-    }
-
-    @discardableResult
-    func retryMigrationRecovery() -> Bool {
-        guard migrationDecision.recoveryFailureMessage != nil,
-              let sourceDataMigrator else {
-            return false
-        }
-        do {
-            try sourceDataMigrator.recoverPendingImports(
-                destination: environment.supportURL
-            )
-            sourceInstallCandidates = sourceDataMigrator.discoverCandidates()
-            migrationDecision = sourceInstallCandidates.isEmpty
-                ? .notRequired
-                : .pending
-            currentError = nil
-            return true
-        } catch {
-            let message = (error as? LocalizedError)?.errorDescription
-                ?? "上次数据导入仍未恢复，请保留本地数据并再次重试；保护保持关闭。"
-            migrationDecision = .recoveryFailed(message)
-            currentError = message
             return false
         }
     }
@@ -1052,7 +930,7 @@ final class SetupCoordinator: ObservableObject {
             if hasCompletedOnboarding {
                 try persistCompletedEvidencePreservingHistory()
             } else {
-                try persistStep(.completion, completing: [.safetyTest])
+                try persistStep(.completion, completing: .safetyTest)
             }
             currentError = nil
             return true
@@ -1269,11 +1147,10 @@ final class SetupCoordinator: ObservableObject {
 
     private func persistStep(
         _ step: SetupStep,
-        completing completedStepsToAdd: [SetupStep] = []
+        completing completedStep: SetupStep? = nil
     ) throws {
         var completedSteps = setupStore.record.completedSteps
-        for completedStep in completedStepsToAdd
-            where !completedSteps.contains(completedStep) {
+        if let completedStep, !completedSteps.contains(completedStep) {
             completedSteps.append(completedStep)
         }
         let record = OnboardingRecord(

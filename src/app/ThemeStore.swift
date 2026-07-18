@@ -33,10 +33,6 @@ final class ThemeStore: ObservableObject {
         }
     }
 
-    func reload() {
-        preferences = localStore.readPreferences()
-    }
-
     func setAppearance(_ appearance: AppearanceMode) {
         var updated = preferences
         updated.appearance = appearance

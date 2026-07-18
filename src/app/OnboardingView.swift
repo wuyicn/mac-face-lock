@@ -183,11 +183,7 @@ struct OnboardingView: View {
                 SetupRequirementRow(text: "应用支持目录可在本机安全写入")
             }
 
-            if setupCoordinator.migrationDecision.recoveryFailureMessage != nil {
-                migrationRecoveryCard
-            } else if !setupCoordinator.sourceInstallCandidates.isEmpty {
-                sourceImportCard
-            }
+            legacySourceBetaNotice
 
             CustomerActionStatusView(state: actionState)
 
@@ -205,124 +201,24 @@ struct OnboardingView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(
-                isWorking
-                    || setupCoordinator.migrationDecision == .pending
-                    || setupCoordinator.migrationDecision.recoveryFailureMessage != nil
-            )
+            .disabled(isWorking)
         }
     }
 
-    private var migrationRecoveryCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label("需要恢复上次导入", systemImage: "arrow.counterclockwise.circle")
+    private var legacySourceBetaNotice: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("源码测试版数据", systemImage: "archivebox")
                 .font(.headline)
-            Text(setupCoordinator.currentError ?? "上次导入尚未恢复，保护保持关闭。")
-                .font(.callout)
-                .foregroundStyle(Color(nsColor: .systemRed))
-                .fixedSize(horizontal: false, vertical: true)
-            Button("重试恢复") {
-                actionState = .working("正在恢复上次未完成的数据导入…")
-                if setupCoordinator.retryMigrationRecovery() {
-                    actionState = .success("数据恢复完成，可以继续准备检查")
-                } else {
-                    actionState = .failure(
-                        setupCoordinator.currentError ?? "恢复未完成，请再次重试"
-                    )
-                }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(isWorking)
-            Button("查看日志") {
-                setupCoordinator.openLogs()
-            }
-            .buttonStyle(.bordered)
-            .disabled(isWorking)
-        }
-        .padding(16)
-        .background(
-            Color(nsColor: .systemRed).opacity(0.08),
-            in: RoundedRectangle(cornerRadius: 14)
-        )
-    }
-
-    private var sourceImportCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Label("发现旧版源码数据", systemImage: "externaldrive.badge.plus")
-                .font(.headline)
-            Text("可以复制旧版配置、本人资料、界面偏好和最近的活动记录。旧目录不会被删除、修改或标记。")
+            Text("如果您使用过源码测试版，本版本不会自动读取或迁移旧数据。请重新录入本人并完成安全测试；原目录和数据将保持不变。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-
-            ForEach(setupCoordinator.sourceInstallCandidates) { candidate in
-                VStack(alignment: .leading, spacing: 9) {
-                    Text(candidate.displayName)
-                        .font(.headline)
-                    Text(candidate.rootURL.path)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .truncationMode(.middle)
-                    Text(migrationItemsDescription(candidate.availableItems))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    HStack {
-                        Button("导入旧版数据") {
-                            actionState = .working("正在复制并验证旧版本地数据…")
-                            if setupCoordinator.importSourceData(candidate) {
-                                themeStore.reload()
-                                actionState = .success("旧版数据已安全导入；旧目录保持不变")
-                            } else {
-                                actionState = .failure(
-                                    setupCoordinator.currentError
-                                        ?? "导入失败，当前数据未改变，可以修复后重试"
-                                )
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-
-                        Button("跳过导入") {
-                            setupCoordinator.skipSourceDataImport()
-                            actionState = .success("已跳过导入；旧目录保持不变")
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                    .disabled(
-                        isWorking || setupCoordinator.migrationDecision != .pending
-                    )
-                }
-                .padding(14)
-                .background(
-                    Color.primary.opacity(0.05),
-                    in: RoundedRectangle(cornerRadius: 12)
-                )
-            }
         }
-        .padding(16)
+        .padding(14)
         .background(
-            themeStore.accentColor.opacity(0.08),
-            in: RoundedRectangle(cornerRadius: 14)
+            Color.primary.opacity(0.05),
+            in: RoundedRectangle(cornerRadius: 12)
         )
-    }
-
-    private func migrationItemsDescription(_ items: Set<MigrationItem>) -> String {
-        let labels = MigrationItem.allCases.compactMap { item -> String? in
-            guard items.contains(item) else {
-                return nil
-            }
-            switch item {
-            case .configuration:
-                return "配置"
-            case .ownerTemplate:
-                return "本人资料"
-            case .uiPreferences:
-                return "界面偏好"
-            case .activityHistory:
-                return "活动记录"
-            }
-        }
-        return "可导入：" + labels.joined(separator: "、")
     }
 
     private var permissionsStep: some View {
