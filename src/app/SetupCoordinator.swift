@@ -493,6 +493,7 @@ final class SetupCoordinator: ObservableObject {
     @Published private(set) var enrollmentRejectionReason: String?
     @Published private(set) var recoveryStep: SetupStep?
     @Published private(set) var legacyCleanupState: LegacyCleanupState
+    @Published private(set) var legacyOrphanRecoveryAvailable = false
 
     private let environment: AppEnvironment
     private let permissionCenter: PermissionCenter
@@ -522,6 +523,7 @@ final class SetupCoordinator: ObservableObject {
     private var runtimeReadinessBusy = false
     private var runtimeReadinessWaiters: [RuntimeReadinessWaiter] = []
     private var confirmedLegacyCandidate: LegacyCleanupCandidate?
+    private var legacyOrphanRecoveryCandidate: LegacyOrphanRecoveryCandidate?
     private var legacyCleanupGeneration: UInt64 = 0
 
     init(
@@ -636,7 +638,17 @@ final class SetupCoordinator: ObservableObject {
               let legacyInstallCleaner else {
             return
         }
-        applyLegacyInspection(legacyInstallCleaner.inspect())
+        let inspection = legacyInstallCleaner.inspect()
+        let orphanCandidate: LegacyOrphanRecoveryCandidate?
+        if case .ambiguous = inspection {
+            orphanCandidate = legacyInstallCleaner.inspectRecoverableOrphan()
+        } else {
+            orphanCandidate = nil
+        }
+        applyLegacyInspection(
+            inspection,
+            orphanCandidate: orphanCandidate
+        )
     }
 
     func recheckLegacyInstall() async {
@@ -647,6 +659,36 @@ final class SetupCoordinator: ObservableObject {
         }
         publishLegacyCleanupState(.unchecked)
         await inspectLegacyInstall()
+    }
+
+    @discardableResult
+    func recoverKnownLegacyOrphan() async -> Bool {
+        guard environment.mode == .release,
+              case .ambiguous = legacyCleanupState,
+              let candidate = legacyOrphanRecoveryCandidate,
+              let legacyInstallCleaner else {
+            return false
+        }
+        publishLegacyCleanupState(.cleaning)
+        let generation = legacyCleanupGeneration
+        let result = await legacyInstallCleaner.removeRecoverableOrphan(candidate)
+        guard legacyCleanupGeneration == generation,
+              legacyCleanupState == .cleaning else {
+            publishBlockedLegacyCleanupEffects()
+            return false
+        }
+        let nextCandidate: LegacyOrphanRecoveryCandidate?
+        if case .ambiguous = result {
+            nextCandidate = legacyInstallCleaner.inspectRecoverableOrphan()
+        } else {
+            nextCandidate = nil
+        }
+        applyLegacyInspection(result, orphanCandidate: nextCandidate)
+        if result == .notFound {
+            currentError = nil
+            return true
+        }
+        return false
     }
 
     func legacyDiagnosticData() -> Data? {
@@ -1859,10 +1901,13 @@ final class SetupCoordinator: ObservableObject {
 
     private func publishLegacyCleanupState(
         _ state: LegacyCleanupState,
-        confirmedCandidate: LegacyCleanupCandidate? = nil
+        confirmedCandidate: LegacyCleanupCandidate? = nil,
+        orphanCandidate: LegacyOrphanRecoveryCandidate? = nil
     ) {
         legacyCleanupGeneration &+= 1
         confirmedLegacyCandidate = confirmedCandidate
+        legacyOrphanRecoveryCandidate = orphanCandidate
+        legacyOrphanRecoveryAvailable = orphanCandidate != nil
         legacyCleanupState = state
         if !legacyCleanupAllowsServiceAccess {
             publishBlockedLegacyCleanupEffects()
@@ -1885,7 +1930,10 @@ final class SetupCoordinator: ObservableObject {
         updateReadiness()
     }
 
-    private func applyLegacyInspection(_ inspection: LegacyCleanupInspection) {
+    private func applyLegacyInspection(
+        _ inspection: LegacyCleanupInspection,
+        orphanCandidate: LegacyOrphanRecoveryCandidate? = nil
+    ) {
         switch inspection {
         case .confirmed(let candidate):
             publishLegacyCleanupState(
@@ -1895,7 +1943,10 @@ final class SetupCoordinator: ObservableObject {
         case .notFound:
             publishLegacyCleanupState(.notRequired)
         case .ambiguous(let message):
-            publishLegacyCleanupState(.ambiguous(message))
+            publishLegacyCleanupState(
+                .ambiguous(message),
+                orphanCandidate: orphanCandidate
+            )
         case .cleanupIncomplete(let message):
             publishLegacyCleanupState(.cleanupIncomplete(message))
         case .completed:

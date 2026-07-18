@@ -317,6 +317,42 @@ def collect_policy_violations(sources: dict[str, str]) -> list[str]:
 
 
 class LegacyCleanupPolicyTests(unittest.TestCase):
+    def test_known_orphan_recovery_is_current_app_only_and_fail_closed(self) -> None:
+        onboarding = (
+            PROJECT_DIR / "src/app/OnboardingView.swift"
+        ).read_text(encoding="utf-8")
+        coordinator = (
+            PROJECT_DIR / "src/app/SetupCoordinator.swift"
+        ).read_text(encoding="utf-8")
+        guide = (
+            PROJECT_DIR / "docs/legacy-install-resolution.md"
+        ).read_text(encoding="utf-8")
+
+        for token in (
+            "移除已知旧版后台注册并保留数据",
+            "legacyOrphanRecoveryAvailable",
+            "recoverKnownLegacyOrphan",
+            "confirmationDialog",
+        ):
+            self.assertIn(token, onboarding)
+        self.assertIn("func recoverKnownLegacyOrphan()", coordinator)
+        for token in (
+            "当前发行版",
+            "移除已知旧版后台注册并保留数据",
+            "只移除",
+            "源数据",
+            "未知或混合",
+            "继续保持阻塞",
+        ):
+            self.assertIn(token, guide)
+        for stale_or_technical in (
+            "以前的源码测试版",
+            "维护者指定的支持渠道",
+            "launchctl",
+            "~/Library",
+        ):
+            self.assertNotIn(stale_or_technical, guide)
+
     def test_cleanup_security_model_states_final_pathname_limit(self) -> None:
         model = (
             PROJECT_DIR / "docs/legacy-cleanup-security-model.md"

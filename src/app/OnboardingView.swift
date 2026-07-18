@@ -32,6 +32,7 @@ struct OnboardingView: View {
     @ObservedObject var setupCoordinator: SetupCoordinator
     @ObservedObject var themeStore: ThemeStore
     @State private var actionState: CustomerActionState = .idle
+    @State private var isConfirmingOrphanRecovery = false
 
     private let orderedSteps: [(SetupStep, String, String)] = [
         (.preparation, "准备检查", "checklist"),
@@ -80,6 +81,30 @@ struct OnboardingView: View {
         .onReceive(setupCoordinator.$currentStep.removeDuplicates()) { newStep in
             actionState = .idle
             updatePermissionPolling(for: newStep)
+        }
+        .confirmationDialog(
+            "确认移除已知旧版后台注册？",
+            isPresented: $isConfirmingOrphanRecovery,
+            titleVisibility: .visible
+        ) {
+            Button("移除已知旧版后台注册并保留数据", role: .destructive) {
+                actionState = .working("正在停止并移除已确认的旧版后台注册…")
+                Task {
+                    if await setupCoordinator.recoverKnownLegacyOrphan() {
+                        actionState = .success(
+                            "旧版后台注册已移除，旧版源数据保持不变"
+                        )
+                    } else {
+                        actionState = .failure(
+                            setupCoordinator.currentError
+                                ?? "旧版后台注册未能安全移除"
+                        )
+                    }
+                }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("只移除一个已精确识别的旧版后台注册；旧版本人模板、设置、活动记录、日志、源码和应用文件都不会删除。")
         }
         .task(id: setupCoordinator.currentStep) {
             if setupCoordinator.currentStep == .permissions {
@@ -225,7 +250,7 @@ struct OnboardingView: View {
             legacyDestructiveConfirmation
         case .cleaning:
             Label(
-                "正在停止并清除旧版，请不要退出应用…",
+                "正在处理已确认的旧版后台项目，请不要退出应用…",
                 systemImage: "hourglass"
             )
         case .ambiguous(let message):
@@ -234,15 +259,23 @@ struct OnboardingView: View {
                 message: message,
                 retryTitle: "重新检查",
                 secondaryActions: {
-                    HStack {
-                        Button("复制诊断摘要") {
-                            _ = setupCoordinator.copyLegacyDiagnostics()
+                    VStack(alignment: .leading, spacing: 8) {
+                        if setupCoordinator.legacyOrphanRecoveryAvailable {
+                            Button("移除已知旧版后台注册并保留数据") {
+                                isConfirmingOrphanRecovery = true
+                            }
+                            .buttonStyle(.borderedProminent)
                         }
-                        Button("保存诊断摘要") {
-                            _ = setupCoordinator.saveLegacyDiagnostics()
-                        }
-                        Button("打开处理指南") {
-                            _ = setupCoordinator.openLegacyResolutionGuide()
+                        HStack {
+                            Button("复制诊断摘要") {
+                                _ = setupCoordinator.copyLegacyDiagnostics()
+                            }
+                            Button("保存诊断摘要") {
+                                _ = setupCoordinator.saveLegacyDiagnostics()
+                            }
+                            Button("打开处理指南") {
+                                _ = setupCoordinator.openLegacyResolutionGuide()
+                            }
                         }
                     }
                 },

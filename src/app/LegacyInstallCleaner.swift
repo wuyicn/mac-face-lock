@@ -9,6 +9,17 @@ struct LegacyCleanupCandidate: Equatable, Sendable {
     let statusPlistIdentity: SecureFileIdentity
 }
 
+enum LegacyOrphanService: Equatable, Sendable {
+    case agent
+    case status
+}
+
+struct LegacyOrphanRecoveryCandidate: Equatable, Sendable {
+    let service: LegacyOrphanService
+    let rootURL: URL
+    let plistIdentity: SecureFileIdentity
+}
+
 enum LegacyCleanupInspection: Equatable, Sendable {
     case notFound
     case confirmed(LegacyCleanupCandidate)
@@ -19,6 +30,10 @@ enum LegacyCleanupInspection: Equatable, Sendable {
 
 protocol LegacyInstallCleaning: AnyObject {
     func inspect() -> LegacyCleanupInspection
+    func inspectRecoverableOrphan() -> LegacyOrphanRecoveryCandidate?
+    func removeRecoverableOrphan(
+        _ candidate: LegacyOrphanRecoveryCandidate
+    ) async -> LegacyCleanupInspection
     func acknowledgeCompletion() throws
     func clean(_ candidate: LegacyCleanupCandidate) async -> LegacyCleanupInspection
     func retry() async -> LegacyCleanupInspection
@@ -32,6 +47,16 @@ struct LegacyCleanupDiagnosticMetadata: Codable, Equatable {
 }
 
 extension LegacyInstallCleaning {
+    func inspectRecoverableOrphan() -> LegacyOrphanRecoveryCandidate? {
+        nil
+    }
+
+    func removeRecoverableOrphan(
+        _ candidate: LegacyOrphanRecoveryCandidate
+    ) async -> LegacyCleanupInspection {
+        .ambiguous("当前旧版结构不能安全自动处理。")
+    }
+
     func diagnosticMetadata() -> LegacyCleanupDiagnosticMetadata {
         LegacyCleanupDiagnosticMetadata(
             agentPlistPresent: false,
@@ -536,6 +561,48 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
                 statusPlistIdentity: statusIdentity
             )
         )
+    }
+
+    func inspectRecoverableOrphan() -> LegacyOrphanRecoveryCandidate? {
+        guard case .absent = journalStore.inspect(),
+              let snapshot = try? readLegacyPlists() else {
+            return nil
+        }
+        return recoverableOrphan(from: snapshot)
+    }
+
+    func removeRecoverableOrphan(
+        _ candidate: LegacyOrphanRecoveryCandidate
+    ) async -> LegacyCleanupInspection {
+        guard inspectRecoverableOrphan() == candidate else {
+            return .ambiguous("旧版后台注册已变化，未执行自动处理。")
+        }
+        let label: String
+        switch candidate.service {
+        case .agent:
+            label = LegacyIdentity.agentLabel
+        case .status:
+            label = LegacyIdentity.statusLabel
+        }
+
+        do {
+            try await stopAndVerify(label)
+            guard case .absent = journalStore.inspect(),
+                  let snapshot = try readLegacyPlists(),
+                  recoverableOrphan(from: snapshot) == candidate else {
+                throw LegacyCleanupError.verificationFailed(
+                    "orphan registration"
+                )
+            }
+            try testEventHandler?("beforeOrphanPlistRemoval")
+            try removePlistsBoundToSnapshot(snapshot, requireBoth: false)
+            try await verifyUnloaded(label)
+            return inspect()
+        } catch {
+            return .ambiguous(
+                "已知旧版后台注册未能安全移除，源数据保持不变，请重新检查。"
+            )
+        }
     }
 
     func acknowledgeCompletion() throws {
@@ -1110,6 +1177,46 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
                 }
             ),
             manifest: finalManifest
+        )
+    }
+
+    private func recoverableOrphan(
+        from snapshot: LegacyPlistSnapshot
+    ) -> LegacyOrphanRecoveryCandidate? {
+        guard snapshot.dataByName.count == 1 else {
+            return nil
+        }
+
+        let service: LegacyOrphanService
+        let name: String
+        let rootURL: URL
+        if let data = snapshot.dataByName[LegacyIdentity.agentPlist],
+           case .source(let sourceRoot) = parseAgent(data) {
+            service = .agent
+            name = LegacyIdentity.agentPlist
+            rootURL = sourceRoot
+        } else if let data = snapshot.dataByName[LegacyIdentity.statusPlist],
+                  case .source(let sourceRoot) = parseStatus(data) {
+            service = .status
+            name = LegacyIdentity.statusPlist
+            rootURL = sourceRoot
+        } else {
+            return nil
+        }
+
+        guard !isEqualOrDescendant(appURL, of: rootURL),
+              (try? SecureFileTree(
+                rootURL: rootURL,
+                requiredAncestorURL: homeURL,
+                requiredOwner: userID
+              )) != nil,
+              let identity = snapshot.identityByName[name] else {
+            return nil
+        }
+        return LegacyOrphanRecoveryCandidate(
+            service: service,
+            rootURL: rootURL,
+            plistIdentity: identity
         )
     }
 

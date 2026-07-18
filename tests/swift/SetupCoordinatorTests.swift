@@ -220,6 +220,8 @@ private final class FakeLegacyInstallCleaner: LegacyInstallCleaning {
     var acknowledgementError: Error?
     var suspendClean = false
     var onInspect: (() -> Void)?
+    var orphanCandidate: LegacyOrphanRecoveryCandidate?
+    var orphanRecoveryResult: LegacyCleanupInspection = .notFound
     var metadata = LegacyCleanupDiagnosticMetadata(
         agentPlistPresent: false,
         statusPlistPresent: false,
@@ -229,6 +231,7 @@ private final class FakeLegacyInstallCleaner: LegacyInstallCleaning {
     private(set) var acknowledgementCount = 0
     private(set) var cleanedCandidates: [LegacyCleanupCandidate] = []
     private(set) var retryCount = 0
+    private(set) var orphanRecoveryCount = 0
     private(set) var cleanStarted = false
     private var cleanContinuation: CheckedContinuation<Void, Never>?
 
@@ -246,6 +249,19 @@ private final class FakeLegacyInstallCleaner: LegacyInstallCleaning {
         inspectCount += 1
         onInspect?()
         return inspection
+    }
+
+    func inspectRecoverableOrphan() -> LegacyOrphanRecoveryCandidate? {
+        orphanCandidate
+    }
+
+    func removeRecoverableOrphan(
+        _ candidate: LegacyOrphanRecoveryCandidate
+    ) async -> LegacyCleanupInspection {
+        orphanRecoveryCount += 1
+        return candidate == orphanCandidate
+            ? orphanRecoveryResult
+            : .ambiguous("candidate mismatch")
     }
 
     func acknowledgeCompletion() throws {
@@ -733,6 +749,7 @@ struct SetupCoordinatorTests {
         try await testLegacyCleanupSourceAndReleaseBoundaries()
         try await testLegacyInspectionMapsEveryResult()
         try await testAmbiguousLegacyRecheckMapsResultOnce()
+        try await testKnownOrphanRecoveryIsExplicitAndUnknownAmbiguityStaysBlocked()
         try await testAmbiguousDiagnosticsAreStructuralAndSideEffectFree()
         try await testAmbiguousLegacyRecheckSerializesRepeatedRequests()
         try await testLegacyRecheckIgnoresNonAmbiguousStates()
@@ -1309,6 +1326,14 @@ struct SetupCoordinatorTests {
         )
     }
 
+    private static func orphanCandidate() -> LegacyOrphanRecoveryCandidate {
+        LegacyOrphanRecoveryCandidate(
+            service: .agent,
+            rootURL: URL(fileURLWithPath: "/tmp/legacy-mac-face-lock"),
+            plistIdentity: SecureFileIdentity(device: 1, inode: 3)
+        )
+    }
+
     private static func coordinator(
         fixture: CoordinatorFixture,
         cleaner: LegacyInstallCleaning?,
@@ -1429,6 +1454,66 @@ struct SetupCoordinatorTests {
             !fixture.localStore.readControl().protectionEnabled,
             "ambiguous recheck did not keep protection durably blocked"
         )
+    }
+
+    private static func testKnownOrphanRecoveryIsExplicitAndUnknownAmbiguityStaysBlocked()
+        async throws
+    {
+        do {
+            let fixture = try CoordinatorFixture()
+            defer { fixture.remove() }
+            let cleaner = FakeLegacyInstallCleaner(
+                inspection: .ambiguous("known lone source registration")
+            )
+            cleaner.orphanCandidate = orphanCandidate()
+            let service = FakeServiceManager(state: .healthy)
+            let subject = coordinator(
+                fixture: fixture,
+                cleaner: cleaner,
+                serviceManager: service
+            )
+
+            await subject.inspectLegacyInstall()
+            try require(
+                subject.legacyOrphanRecoveryAvailable,
+                "known orphan recovery was not published for explicit confirmation"
+            )
+            let recovered = await subject.recoverKnownLegacyOrphan()
+
+            try require(
+                recovered
+                    && cleaner.orphanRecoveryCount == 1
+                    && subject.legacyCleanupState == .notRequired
+                    && !subject.legacyOrphanRecoveryAvailable,
+                "confirmed known orphan recovery did not unblock setup"
+            )
+            try require(
+                service.statusChecks == 0
+                    && service.installs.isEmpty
+                    && service.uninstallCount == 0,
+                "known orphan recovery crossed into release service management"
+            )
+        }
+        do {
+            let fixture = try CoordinatorFixture()
+            defer { fixture.remove() }
+            let cleaner = FakeLegacyInstallCleaner(
+                inspection: .ambiguous("unknown or mixed structure")
+            )
+            let subject = coordinator(fixture: fixture, cleaner: cleaner)
+
+            await subject.inspectLegacyInstall()
+            let recovered = await subject.recoverKnownLegacyOrphan()
+
+            try require(
+                !subject.legacyOrphanRecoveryAvailable
+                    && !recovered
+                    && cleaner.orphanRecoveryCount == 0
+                    && subject.legacyCleanupState
+                        == .ambiguous("unknown or mixed structure"),
+                "unknown or mixed ambiguity was offered automatic deletion"
+            )
+        }
     }
 
     private static func testAmbiguousDiagnosticsAreStructuralAndSideEffectFree()

@@ -545,6 +545,8 @@ struct LegacyInstallCleanerTests {
         try testNoPlistsIsNotFound()
         try testCurrentReleaseAgentWithoutStatusIsNotFound()
         try testOnlyOneSourcePlistIsAmbiguous()
+        try await testRemovesOnlyExactKnownOrphanRegistrationAndPreservesSourceData()
+        try await testOrphanRecoveryRejectsUnknownMixedAndChangedRegistrations()
         try testMixedReleaseAndSourcePairIsAmbiguous()
         try testDifferentRootsAreAmbiguous()
         try testRootOutsideSuppliedHomeIsAmbiguous()
@@ -1756,6 +1758,119 @@ struct LegacyInstallCleanerTests {
             guard case .ambiguous = fixture.cleaner.inspect() else {
                 throw TestFailure.assertion("lone source Status was accepted")
             }
+        }
+    }
+
+    private static func testRemovesOnlyExactKnownOrphanRegistrationAndPreservesSourceData()
+        async throws
+    {
+        for service in [LegacyOrphanService.agent, .status] {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            try fixture.write("data/preserve.bin", "legacy-data-must-remain")
+            switch service {
+            case .agent:
+                try fixture.writeCurrentAgentPlist()
+            case .status:
+                try fixture.writeUnifiedStatusPlist()
+            }
+            guard case .ambiguous = fixture.cleaner.inspect(),
+                  let candidate = fixture.cleaner.inspectRecoverableOrphan() else {
+                throw TestFailure.assertion(
+                    "exact lone \(service) registration was not offered as recoverable"
+                )
+            }
+            try require(candidate.service == service, "wrong orphan service classified")
+
+            let result = await fixture.cleaner.removeRecoverableOrphan(candidate)
+
+            try require(result == .notFound, "known orphan recovery remained blocked")
+            try fixture.requirePreserved("data/preserve.bin")
+            try require(
+                !FileManager.default.fileExists(
+                    atPath: service == .agent
+                        ? fixture.agentURL.path
+                        : fixture.statusURL.path
+                ),
+                "known orphan plist was not removed"
+            )
+            try require(
+                !FileManager.default.fileExists(atPath: fixture.journalURL.path),
+                "registration-only recovery created a destructive cleanup journal"
+            )
+            let expectedLabel = service == .agent
+                ? "com.wuyi.mac-face-lock-agent"
+                : "com.wuyi.mac-face-lock-status"
+            try require(
+                fixture.commandRunner.calls.first?.arguments
+                    == ["bootout", "gui/\(getuid())/\(expectedLabel)"],
+                "known orphan recovery stopped the wrong service"
+            )
+        }
+    }
+
+    private static func testOrphanRecoveryRejectsUnknownMixedAndChangedRegistrations()
+        async throws
+    {
+        do {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            var unknown = fixture.currentAgentDictionary(root: fixture.legacyRoot)
+            unknown["Unexpected"] = "value"
+            try fixture.writePlist(unknown, to: fixture.agentURL)
+            try require(
+                fixture.cleaner.inspectRecoverableOrphan() == nil,
+                "unknown lone registration was offered for deletion"
+            )
+            try require(
+                fixture.commandRunner.calls.isEmpty
+                    && FileManager.default.fileExists(atPath: fixture.agentURL.path),
+                "unknown lone registration was mutated"
+            )
+        }
+        do {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            try fixture.writeReleaseAgentPlist()
+            try fixture.writeUnifiedStatusPlist()
+            try require(
+                fixture.cleaner.inspectRecoverableOrphan() == nil,
+                "mixed release/source registrations were offered for deletion"
+            )
+        }
+        do {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            try fixture.writeCurrentAgentPlist()
+            try fixture.write("data/preserve.bin", "preserve")
+            guard let candidate = fixture.cleaner.inspectRecoverableOrphan() else {
+                throw TestFailure.assertion("known orphan fixture was not recoverable")
+            }
+            fixture.commandRunner.resultProvider = { call, arguments in
+                if call == 1 {
+                    var replacement = fixture.currentAgentDictionary(
+                        root: fixture.legacyRoot
+                    )
+                    replacement["Unexpected"] = "replacement"
+                    try replaceFileAtomically(
+                        at: fixture.agentURL,
+                        with: plistData(replacement)
+                    )
+                }
+                return absentServiceResult(arguments: arguments)
+            }
+
+            guard case .ambiguous =
+                await fixture.cleaner.removeRecoverableOrphan(candidate) else {
+                throw TestFailure.assertion(
+                    "changed orphan registration was deleted"
+                )
+            }
+            try require(
+                FileManager.default.fileExists(atPath: fixture.agentURL.path),
+                "changed orphan registration did not survive"
+            )
+            try fixture.requirePreserved("data/preserve.bin")
         }
     }
 
