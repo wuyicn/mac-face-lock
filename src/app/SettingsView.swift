@@ -9,6 +9,7 @@ struct SettingsView: View {
     @State private var enrollmentAction: CustomerActionState = .idle
     @State private var protectionAction: CustomerActionState = .idle
     @State private var serviceAction: CustomerActionState = .idle
+    @State private var isConfirmingServiceUninstall = false
 
     var body: some View {
         ScrollView {
@@ -63,6 +64,29 @@ struct SettingsView: View {
         }
         .task {
             await setupCoordinator.refreshLiveReadiness()
+        }
+        .confirmationDialog(
+            "确认卸载后台服务？",
+            isPresented: $isConfirmingServiceUninstall,
+            titleVisibility: .visible
+        ) {
+            Button("卸载后台服务并保留数据", role: .destructive) {
+                serviceAction = .working("正在停止并卸载后台服务…")
+                Task {
+                    if await setupCoordinator.uninstallServicePreservingData() {
+                        serviceAction = .success(
+                            "后台服务已卸载；本人模板、设置和活动记录仍保留在本机"
+                        )
+                    } else {
+                        serviceAction = .failure(
+                            setupCoordinator.currentError ?? "后台服务卸载未完成"
+                        )
+                    }
+                }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("保护将停止，应用数据会保留，之后重新安装服务可继续使用。")
         }
     }
 
@@ -243,6 +267,12 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.bordered)
             }
+
+            Button("卸载后台服务并保留数据") {
+                isConfirmingServiceUninstall = true
+            }
+            .buttonStyle(.bordered)
+            .disabled(isWorking(serviceAction))
         }
     }
 

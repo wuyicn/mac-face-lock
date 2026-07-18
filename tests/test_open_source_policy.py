@@ -417,6 +417,28 @@ class OpenSourcePolicyTests(unittest.TestCase):
         ):
             self.assertIn(token, customer)
 
+    def test_customer_uninstall_is_a_visible_preserve_data_action(self):
+        settings = (PROJECT_DIR / "src" / "app" / "SettingsView.swift").read_text(
+            encoding="utf-8"
+        )
+        coordinator = (
+            PROJECT_DIR / "src" / "app" / "SetupCoordinator.swift"
+        ).read_text(encoding="utf-8")
+        customer = (
+            PROJECT_DIR / "docs" / "customer-installation.md"
+        ).read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+
+        self.assertIn("卸载后台服务并保留数据", settings)
+        self.assertIn("uninstallServicePreservingData", settings)
+        self.assertIn("func uninstallServicePreservingData()", coordinator)
+        for document in (customer, readme):
+            self.assertIn("卸载后台服务并保留数据", document)
+            self.assertLess(
+                document.index("卸载后台服务并保留数据"),
+                document.index("废纸篓"),
+            )
+
     def _read_required_document(self, name):
         path = PROJECT_DIR / name
         self.assertTrue(path.is_file(), f"{name} is missing")

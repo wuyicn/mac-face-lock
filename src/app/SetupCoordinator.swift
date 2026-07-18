@@ -1379,6 +1379,41 @@ final class SetupCoordinator: ObservableObject {
     }
 
     @discardableResult
+    func uninstallServicePreservingData() async -> Bool {
+        guard let cleanupGeneration = legacyCleanupAccessGeneration else {
+            publishBlockedLegacyCleanupEffects()
+            return false
+        }
+        guard let serviceManager else {
+            currentError = "当前安装没有可管理的后台服务。"
+            return false
+        }
+        currentError = nil
+        do {
+            _ = try localStore.writeControl(enabled: false)
+            guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
+                publishBlockedLegacyCleanupEffects()
+                return false
+            }
+            try await serviceManager.uninstallPreservingData()
+            guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
+                publishBlockedLegacyCleanupEffects()
+                return false
+            }
+            serviceStatus = await serviceManager.status()
+            serviceHealthy = false
+            updateReadiness()
+            return true
+        } catch {
+            recordDiagnosticError(error, operation: "uninstall_service_preserving_data")
+            currentError = localizedRuntimeError(error)
+            serviceHealthy = false
+            updateReadiness()
+            return false
+        }
+    }
+
+    @discardableResult
     func openLogs() -> Bool {
         let logsURL = environment.logsURL
         do {
