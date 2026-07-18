@@ -601,6 +601,16 @@ final class SetupCoordinator: ObservableObject {
         applyLegacyInspection(legacyInstallCleaner.inspect())
     }
 
+    func recheckLegacyInstall() async {
+        guard environment.mode == .release,
+              case .ambiguous = legacyCleanupState,
+              legacyInstallCleaner != nil else {
+            return
+        }
+        publishLegacyCleanupState(.unchecked)
+        await inspectLegacyInstall()
+    }
+
     @discardableResult
     func confirmLegacyCleanup() async -> Bool {
         guard case .confirmationRequired = legacyCleanupState,

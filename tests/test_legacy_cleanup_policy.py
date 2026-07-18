@@ -7,9 +7,21 @@ from pathlib import Path
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-NOTICE = (
-    "如果您使用过源码测试版，本版本不会自动读取或迁移旧数据。"
-    "请重新录入本人并完成安全测试；原目录和数据将保持不变。"
+LEGACY_WARNING = (
+    "检测到旧版 Mac Face Lock。继续将停止旧版后台服务，并永久删除旧版人脸模板、"
+    "配置、活动记录、证据、日志和旧应用。源码、Git 历史、文档、脚本和 Python "
+    "开发环境不会删除。此操作不可恢复。"
+)
+README_CLEANUP_POLICY = (
+    "如果发行版检测到本项目已知的源码测试版，会在首次设置中要求确认一次不可恢复的清理：\n"
+    "停止并移除旧 Agent 与旧状态服务，删除源码目录中的 config/config.json、data/、logs/\n"
+    "和已构建的 Mac Face Lock 应用。源码、Git 历史、文档、脚本与 .venv 保留。\n"
+    "旧人脸模板和设置不会导入；清理完成后必须重新授权、录入本人并完成安全测试。\n"
+    "卸载发行版不会恢复旧服务或旧数据。"
+)
+STALE_DATA_PROMISE = (
+    "原目录和数据将"
+    "保持不变"
 )
 MIGRATION_FORBIDDEN = (
     "SourceDataMigrator",
@@ -103,10 +115,10 @@ SWIFT_SENSITIVE_ANCHOR_BUDGETS = {
             1,
         ),
     },
-    NOTICE: {
+    LEGACY_WARNING: {
         "src/app/OnboardingView.swift": (
             1,
-            f'Text("{NOTICE}")',
+            f'Text("{LEGACY_WARNING}")',
             1,
         ),
     },
@@ -455,7 +467,7 @@ private func readLegacyPlistStatus() {
                 "src/app/LegacyInstallCleaner.swift, "
                 "src/app/SecureFileTree.swift"
             ),
-            NOTICE: "src/app/OnboardingView.swift",
+            LEGACY_WARNING: "src/app/OnboardingView.swift",
         }
 
         for anchor, allowed_sources in probes.items():
@@ -470,17 +482,74 @@ private func readLegacyPlistStatus() {
                     violations,
                 )
 
-    def test_release_onboarding_defers_automatic_source_beta_migration(self) -> None:
+    def test_release_onboarding_exposes_one_way_cleanup_flow(self) -> None:
         sources = load_policy_sources()
         onboarding = sources["src/app/OnboardingView.swift"]
 
-        self.assertIn(NOTICE, onboarding)
+        for text in (
+            LEGACY_WARNING,
+            "清除旧版并继续",
+            "取消",
+            "重试清理",
+            "检测到的旧版结构不完整",
+        ):
+            with self.subTest(customer_copy=text):
+                self.assertIn(text, onboarding)
+        self.assertNotIn(STALE_DATA_PROMISE, onboarding)
+        self.assertNotIn("导入旧版数据", onboarding)
+
+        for state in (
+            ".unchecked",
+            ".notRequired, .completed",
+            ".confirmationRequired",
+            ".cleaning",
+            ".ambiguous(let message)",
+            ".cleanupIncomplete(let message)",
+        ):
+            with self.subTest(cleanup_state=state):
+                self.assertIn(state, onboarding)
+
+        for action in (
+            "setupCoordinator.inspectLegacyInstall()",
+            "setupCoordinator.recheckLegacyInstall()",
+            "setupCoordinator.confirmLegacyCleanup()",
+            "setupCoordinator.cancelLegacyCleanup()",
+            "setupCoordinator.retryLegacyCleanup()",
+        ):
+            with self.subTest(cleanup_action=action):
+                self.assertIn(action, onboarding)
+
+        self.assertIn("legacyCleanupAllowsPreparation", onboarding)
+        self.assertIn(
+            ".disabled(isWorking || !legacyCleanupAllowsPreparation)",
+            onboarding,
+        )
         self.assertFalse((PROJECT_DIR / "src/app/SourceDataMigrator.swift").exists())
         self.assertFalse(
             (PROJECT_DIR / "tests/swift/SourceDataMigratorTests.swift").exists()
         )
         violations = collect_policy_violations(sources)
         self.assertEqual(violations, [], "\n".join(violations))
+
+    def test_public_docs_publish_one_way_cleanup_as_active_boundary(self) -> None:
+        readme = (PROJECT_DIR / "README.md").read_text()
+        active_design = (
+            PROJECT_DIR
+            / "docs/superpowers/specs/2026-07-17-self-contained-onboarding-design.md"
+        ).read_text()
+        historical_design = (
+            PROJECT_DIR
+            / "docs/superpowers/specs/2026-07-18-defer-source-beta-migration-design.md"
+        ).read_text()
+        superseding_design = "2026-07-18-one-way-legacy-cleanup-design.md"
+
+        self.assertIn(README_CLEANUP_POLICY, readme)
+        self.assertIn("开源 Beta", active_design)
+        self.assertNotIn(STALE_DATA_PROMISE, active_design)
+        for design in (active_design, historical_design):
+            with self.subTest(design_boundary=design[:80]):
+                self.assertIn("Superseded boundary", design)
+                self.assertIn(superseding_design, design)
 
 
 if __name__ == "__main__":

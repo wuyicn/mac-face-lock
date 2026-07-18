@@ -714,6 +714,9 @@ struct SetupCoordinatorTests {
         try await testBlockedReentryCannotPublishStatusInstallOrEnable()
         try await testLegacyCleanupSourceAndReleaseBoundaries()
         try await testLegacyInspectionMapsEveryResult()
+        try await testAmbiguousLegacyRecheckMapsResultOnce()
+        try await testAmbiguousLegacyRecheckSerializesRepeatedRequests()
+        try await testLegacyRecheckIgnoresNonAmbiguousStates()
         try await testLegacyCleanupPreparationAndActions()
         try await testCompletedCleanupRequiresFreshEnrollment()
         try await testServiceManagerIsUntouchedForEveryBlockedCleanupState()
@@ -1375,6 +1378,141 @@ struct SetupCoordinatorTests {
                 )
             }
         }
+    }
+
+    private static func testAmbiguousLegacyRecheckMapsResultOnce() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let candidate = legacyCandidate(
+            root: fixture.root.appendingPathComponent("legacy")
+        )
+        let cleaner = FakeLegacyInstallCleaner(
+            inspection: .ambiguous("old structure incomplete")
+        )
+        let subject = coordinator(fixture: fixture, cleaner: cleaner)
+
+        await subject.inspectLegacyInstall()
+        cleaner.inspection = .confirmed(candidate)
+        _ = try fixture.localStore.writeControl(enabled: true)
+
+        await subject.recheckLegacyInstall()
+
+        try require(
+            cleaner.inspectCount == 2,
+            "ambiguous recheck did not invoke exactly one new inspection"
+        )
+        try require(
+            subject.legacyCleanupState == .confirmationRequired,
+            "ambiguous recheck did not map the new inspection result"
+        )
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "ambiguous recheck did not keep protection durably blocked"
+        )
+    }
+
+    private static func testAmbiguousLegacyRecheckSerializesRepeatedRequests()
+        async throws
+    {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let cleaner = FakeLegacyInstallCleaner(
+            inspection: .ambiguous("old structure incomplete")
+        )
+        let subject = coordinator(fixture: fixture, cleaner: cleaner)
+        await subject.inspectLegacyInstall()
+        cleaner.inspection = .notFound
+
+        async let first: Void = subject.recheckLegacyInstall()
+        async let second: Void = subject.recheckLegacyInstall()
+        _ = await (first, second)
+        await subject.recheckLegacyInstall()
+
+        try require(
+            cleaner.inspectCount == 2,
+            "concurrent or repeated recheck duplicated the new inspection"
+        )
+        try require(
+            subject.legacyCleanupState == .notRequired,
+            "serialized recheck did not publish the terminal inspection result"
+        )
+    }
+
+    private static func testLegacyRecheckIgnoresNonAmbiguousStates() async throws {
+        let inspections: [LegacyCleanupInspection] = [
+            .notFound,
+            .confirmed(legacyCandidate()),
+            .cleanupIncomplete("partial"),
+            .completed,
+        ]
+
+        for inspection in inspections {
+            let fixture = try CoordinatorFixture()
+            defer { fixture.remove() }
+            let cleaner = FakeLegacyInstallCleaner(inspection: inspection)
+            let subject = coordinator(fixture: fixture, cleaner: cleaner)
+            await subject.inspectLegacyInstall()
+            let countBeforeRecheck = cleaner.inspectCount
+
+            await subject.recheckLegacyInstall()
+
+            try require(
+                cleaner.inspectCount == countBeforeRecheck,
+                "recheck inspected non-ambiguous state \(subject.legacyCleanupState)"
+            )
+        }
+
+        let uncheckedFixture = try CoordinatorFixture()
+        defer { uncheckedFixture.remove() }
+        let uncheckedCleaner = FakeLegacyInstallCleaner(inspection: .notFound)
+        let uncheckedSubject = coordinator(
+            fixture: uncheckedFixture,
+            cleaner: uncheckedCleaner
+        )
+        await uncheckedSubject.recheckLegacyInstall()
+        try require(
+            uncheckedCleaner.inspectCount == 0,
+            "recheck inspected unchecked state"
+        )
+
+        let cleaningFixture = try CoordinatorFixture()
+        defer { cleaningFixture.remove() }
+        let cleaningCleaner = FakeLegacyInstallCleaner(
+            inspection: .confirmed(legacyCandidate())
+        )
+        cleaningCleaner.suspendClean = true
+        let cleaningSubject = coordinator(
+            fixture: cleaningFixture,
+            cleaner: cleaningCleaner
+        )
+        await cleaningSubject.inspectLegacyInstall()
+        let cleaningTask = Task {
+            await cleaningSubject.confirmLegacyCleanup()
+        }
+        for _ in 0..<40 where !cleaningCleaner.cleanStarted {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let countBeforeCleaningRecheck = cleaningCleaner.inspectCount
+        await cleaningSubject.recheckLegacyInstall()
+        try require(
+            cleaningCleaner.inspectCount == countBeforeCleaningRecheck,
+            "recheck inspected while cleanup was running"
+        )
+        cleaningCleaner.finishClean()
+        _ = await cleaningTask.value
+
+        let sourceFixture = try CoordinatorFixture(mode: .source)
+        defer { sourceFixture.remove() }
+        let sourceCleaner = FakeLegacyInstallCleaner(inspection: .ambiguous("source"))
+        let sourceSubject = coordinator(
+            fixture: sourceFixture,
+            cleaner: sourceCleaner
+        )
+        await sourceSubject.recheckLegacyInstall()
+        try require(
+            sourceCleaner.inspectCount == 0,
+            "source mode invoked legacy recheck"
+        )
     }
 
     private static func testLegacyCleanupPreparationAndActions() async throws {

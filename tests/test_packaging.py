@@ -305,6 +305,22 @@ class UnifiedPackagingTests(unittest.TestCase):
             with self.subTest(shell_copy=shell_copy):
                 self.assertNotIn(shell_copy, user_facing_sources)
 
+        for technical_copy in (
+            "launchctl",
+            "bash ",
+            "scripts/",
+            "config/config.json",
+            "data/",
+            "logs/",
+            ".venv",
+            "dist/",
+            "Library/LaunchAgents",
+            "/Users/",
+            "~/Library",
+        ):
+            with self.subTest(onboarding_technical_copy=technical_copy):
+                self.assertNotIn(technical_copy, onboarding)
+
     def test_ui_consumers_do_not_rebuild_the_validated_data_path(self) -> None:
         for relative_path in (
             "src/app/AppDelegate.swift",

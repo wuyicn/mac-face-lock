@@ -183,7 +183,7 @@ struct OnboardingView: View {
                 SetupRequirementRow(text: "应用支持目录可在本机安全写入")
             }
 
-            legacySourceBetaNotice
+            legacyCleanupCard
 
             CustomerActionStatusView(state: actionState)
 
@@ -201,22 +201,83 @@ struct OnboardingView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(isWorking)
+            .disabled(isWorking || !legacyCleanupAllowsPreparation)
+        }
+        .task {
+            if setupCoordinator.legacyCleanupState == .unchecked {
+                await setupCoordinator.inspectLegacyInstall()
+            }
         }
     }
 
-    private var legacySourceBetaNotice: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("源码测试版数据", systemImage: "archivebox")
+    @ViewBuilder
+    private var legacyCleanupCard: some View {
+        switch setupCoordinator.legacyCleanupState {
+        case .unchecked:
+            Label("正在检查旧版安装…", systemImage: "magnifyingglass")
+        case .notRequired, .completed:
+            Label(
+                "未发现需要清理的旧版运行环境",
+                systemImage: "checkmark.circle.fill"
+            )
+            .foregroundStyle(Color(nsColor: .systemGreen))
+        case .confirmationRequired:
+            legacyDestructiveConfirmation
+        case .cleaning:
+            Label(
+                "正在停止并清除旧版，请不要退出应用…",
+                systemImage: "hourglass"
+            )
+        case .ambiguous(let message):
+            LegacyCleanupProblemCard(
+                title: "检测到的旧版结构不完整",
+                message: message,
+                retryTitle: "重新检查",
+                retry: {
+                    Task { await setupCoordinator.recheckLegacyInstall() }
+                }
+            )
+        case .cleanupIncomplete(let message):
+            LegacyCleanupProblemCard(
+                title: "旧版清理尚未完成",
+                message: message,
+                retryTitle: "重试清理",
+                retry: {
+                    Task { _ = await setupCoordinator.retryLegacyCleanup() }
+                }
+            )
+        }
+    }
+
+    private var legacyDestructiveConfirmation: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("需要清除旧版", systemImage: "exclamationmark.triangle.fill")
                 .font(.headline)
-            Text("如果您使用过源码测试版，本版本不会自动读取或迁移旧数据。请重新录入本人并完成安全测试；原目录和数据将保持不变。")
+                .foregroundStyle(Color(nsColor: .systemRed))
+            Text("检测到旧版 Mac Face Lock。继续将停止旧版后台服务，并永久删除旧版人脸模板、配置、活动记录、证据、日志和旧应用。源码、Git 历史、文档、脚本和 Python 开发环境不会删除。此操作不可恢复。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            Text("清理完成后，需要重新授权、录入本人并完成安全测试。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            if let message = setupCoordinator.currentError {
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(Color(nsColor: .systemOrange))
+            }
+            HStack {
+                Button("清除旧版并继续", role: .destructive) {
+                    Task { _ = await setupCoordinator.confirmLegacyCleanup() }
+                }
+                Button("取消", role: .cancel) {
+                    setupCoordinator.cancelLegacyCleanup()
+                }
+            }
         }
         .padding(14)
         .background(
-            Color.primary.opacity(0.05),
+            Color(nsColor: .systemRed).opacity(0.08),
             in: RoundedRectangle(cornerRadius: 12)
         )
     }
@@ -529,6 +590,16 @@ struct OnboardingView: View {
         return false
     }
 
+    private var legacyCleanupAllowsPreparation: Bool {
+        switch setupCoordinator.legacyCleanupState {
+        case .notRequired, .completed:
+            return true
+        case .unchecked, .confirmationRequired, .cleaning,
+             .ambiguous, .cleanupIncomplete:
+            return false
+        }
+    }
+
     private var isEnrollmentWorking: Bool {
         setupCoordinator.enrollmentLifecycle != .idle
     }
@@ -585,6 +656,32 @@ struct OnboardingView: View {
         case .notDetermined, .denied:
             return Color(nsColor: .systemRed)
         }
+    }
+}
+
+private struct LegacyCleanupProblemCard: View {
+    let title: String
+    let message: String
+    let retryTitle: String
+    let retry: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(title, systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(Color(nsColor: .systemOrange))
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button(retryTitle, action: retry)
+                .buttonStyle(.bordered)
+        }
+        .padding(14)
+        .background(
+            Color(nsColor: .systemOrange).opacity(0.10),
+            in: RoundedRectangle(cornerRadius: 12)
+        )
     }
 }
 
