@@ -2,6 +2,38 @@ import AppKit
 import Combine
 import CryptoKit
 import Foundation
+import UniformTypeIdentifiers
+
+private struct LegacyCleanupDiagnosticReport: Codable, Equatable {
+    static let schemaVersion = 1
+
+    let schemaVersion: Int
+    let state: String
+    let reason: String
+    let agentPlistPresent: Bool
+    let statusPlistPresent: Bool
+    let cleanupRecordPresent: Bool
+
+    static func ambiguous(
+        metadata: LegacyCleanupDiagnosticMetadata
+    ) -> LegacyCleanupDiagnosticReport {
+        LegacyCleanupDiagnosticReport(
+            schemaVersion: schemaVersion,
+            state: "blocked",
+            reason: "legacy_structure_ambiguous",
+            agentPlistPresent: metadata.agentPlistPresent,
+            statusPlistPresent: metadata.statusPlistPresent,
+            cleanupRecordPresent: metadata.cleanupRecordPresent
+        )
+    }
+
+    func encoded() throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        return try encoder.encode(self)
+    }
+}
 
 struct OwnerProfileInspection: Equatable {
     let isValid: Bool
@@ -615,6 +647,68 @@ final class SetupCoordinator: ObservableObject {
         }
         publishLegacyCleanupState(.unchecked)
         await inspectLegacyInstall()
+    }
+
+    func legacyDiagnosticData() -> Data? {
+        guard case .ambiguous = legacyCleanupState,
+              let legacyInstallCleaner else {
+            return nil
+        }
+        let report = LegacyCleanupDiagnosticReport.ambiguous(
+            metadata: legacyInstallCleaner.diagnosticMetadata()
+        )
+        return try? report.encoded()
+    }
+
+    @discardableResult
+    func copyLegacyDiagnostics() -> Bool {
+        guard let data = legacyDiagnosticData(),
+              let text = String(data: data, encoding: .utf8) else {
+            currentError = "当前没有可导出的旧版诊断摘要。"
+            return false
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        let copied = pasteboard.setString(text, forType: .string)
+        currentError = copied ? nil : "无法复制诊断摘要，请尝试保存文件。"
+        return copied
+    }
+
+    @discardableResult
+    func saveLegacyDiagnostics() -> Bool {
+        guard let data = legacyDiagnosticData() else {
+            currentError = "当前没有可导出的旧版诊断摘要。"
+            return false
+        }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "mac-face-lock-legacy-diagnostic.json"
+        panel.allowedContentTypes = [.json]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else {
+            return false
+        }
+        do {
+            try data.write(to: destination, options: .atomic)
+            currentError = nil
+            return true
+        } catch {
+            currentError = "无法保存诊断摘要，请选择其他位置后重试。"
+            return false
+        }
+    }
+
+    @discardableResult
+    func openLegacyResolutionGuide() -> Bool {
+        let guide = environment.resourcesURL.appendingPathComponent(
+            "help/legacy-install-resolution.md"
+        )
+        guard fileManager.isReadableFile(atPath: guide.path) else {
+            currentError = "处理指南缺失，请重新安装发行版。"
+            return false
+        }
+        let opened = NSWorkspace.shared.open(guide)
+        currentError = opened ? nil : "无法打开处理指南，请重新安装发行版。"
+        return opened
     }
 
     @discardableResult

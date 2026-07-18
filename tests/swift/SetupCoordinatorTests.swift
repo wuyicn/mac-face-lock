@@ -211,6 +211,11 @@ private final class FakeLegacyInstallCleaner: LegacyInstallCleaning {
     var acknowledgementError: Error?
     var suspendClean = false
     var onInspect: (() -> Void)?
+    var metadata = LegacyCleanupDiagnosticMetadata(
+        agentPlistPresent: false,
+        statusPlistPresent: false,
+        cleanupRecordPresent: false
+    )
     private(set) var inspectCount = 0
     private(set) var acknowledgementCount = 0
     private(set) var cleanedCandidates: [LegacyCleanupCandidate] = []
@@ -256,6 +261,10 @@ private final class FakeLegacyInstallCleaner: LegacyInstallCleaning {
     func retry() async -> LegacyCleanupInspection {
         retryCount += 1
         return retryResult
+    }
+
+    func diagnosticMetadata() -> LegacyCleanupDiagnosticMetadata {
+        metadata
     }
 
     func finishClean() {
@@ -715,6 +724,7 @@ struct SetupCoordinatorTests {
         try await testLegacyCleanupSourceAndReleaseBoundaries()
         try await testLegacyInspectionMapsEveryResult()
         try await testAmbiguousLegacyRecheckMapsResultOnce()
+        try await testAmbiguousDiagnosticsAreStructuralAndSideEffectFree()
         try await testAmbiguousLegacyRecheckSerializesRepeatedRequests()
         try await testLegacyRecheckIgnoresNonAmbiguousStates()
         try await testLegacyCleanupPreparationAndActions()
@@ -1408,6 +1418,63 @@ struct SetupCoordinatorTests {
         try require(
             !fixture.localStore.readControl().protectionEnabled,
             "ambiguous recheck did not keep protection durably blocked"
+        )
+    }
+
+    private static func testAmbiguousDiagnosticsAreStructuralAndSideEffectFree()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let cleaner = FakeLegacyInstallCleaner(
+            inspection: .ambiguous("secret-template-value")
+        )
+        cleaner.metadata = LegacyCleanupDiagnosticMetadata(
+            agentPlistPresent: true,
+            statusPlistPresent: false,
+            cleanupRecordPresent: true
+        )
+        let service = FakeServiceManager(state: .healthy)
+        let subject = coordinator(
+            fixture: fixture,
+            cleaner: cleaner,
+            serviceManager: service
+        )
+
+        await subject.inspectLegacyInstall()
+        guard let data = subject.legacyDiagnosticData(),
+              let object = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any] else {
+            throw TestFailure.assertion("ambiguous diagnostic was not JSON")
+        }
+        try require(
+            Set(object.keys) == [
+                "schema_version",
+                "state",
+                "reason",
+                "agent_plist_present",
+                "status_plist_present",
+                "cleanup_record_present",
+            ],
+            "diagnostic exposed fields outside the privacy-safe schema"
+        )
+        let text = String(decoding: data, as: UTF8.self)
+        for sensitive in [
+            "secret-template-value",
+            "owner_face",
+            "config.json",
+            fixture.root.path,
+        ] {
+            try require(
+                !text.contains(sensitive),
+                "diagnostic leaked sensitive content: \(sensitive)"
+            )
+        }
+        try require(
+            cleaner.cleanedCandidates.isEmpty
+                && cleaner.retryCount == 0
+                && service.statusChecks == 0
+                && service.installs.isEmpty,
+            "diagnostic export crossed the ambiguous no-mutation gate"
         )
     }
 

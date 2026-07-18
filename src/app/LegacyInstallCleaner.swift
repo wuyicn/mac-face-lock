@@ -22,6 +22,23 @@ protocol LegacyInstallCleaning: AnyObject {
     func acknowledgeCompletion() throws
     func clean(_ candidate: LegacyCleanupCandidate) async -> LegacyCleanupInspection
     func retry() async -> LegacyCleanupInspection
+    func diagnosticMetadata() -> LegacyCleanupDiagnosticMetadata
+}
+
+struct LegacyCleanupDiagnosticMetadata: Codable, Equatable {
+    let agentPlistPresent: Bool
+    let statusPlistPresent: Bool
+    let cleanupRecordPresent: Bool
+}
+
+extension LegacyInstallCleaning {
+    func diagnosticMetadata() -> LegacyCleanupDiagnosticMetadata {
+        LegacyCleanupDiagnosticMetadata(
+            agentPlistPresent: false,
+            statusPlistPresent: false,
+            cleanupRecordPresent: false
+        )
+    }
 }
 
 private enum LegacyIdentity {
@@ -523,6 +540,28 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
 
     func acknowledgeCompletion() throws {
         try journalStore.acknowledgeCompletion()
+    }
+
+    func diagnosticMetadata() -> LegacyCleanupDiagnosticMetadata {
+        let snapshot: LegacyPlistSnapshot?
+        do {
+            snapshot = try readLegacyPlists()
+        } catch {
+            snapshot = nil
+        }
+        let names = Set(snapshot?.dataByName.keys.map { $0 } ?? [])
+        let cleanupRecordPresent: Bool
+        switch journalStore.inspect() {
+        case .absent:
+            cleanupRecordPresent = false
+        case .record, .invalid:
+            cleanupRecordPresent = true
+        }
+        return LegacyCleanupDiagnosticMetadata(
+            agentPlistPresent: names.contains(LegacyIdentity.agentPlist),
+            statusPlistPresent: names.contains(LegacyIdentity.statusPlist),
+            cleanupRecordPresent: cleanupRecordPresent
+        )
     }
 
     func clean(_ candidate: LegacyCleanupCandidate) async -> LegacyCleanupInspection {

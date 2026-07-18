@@ -20,12 +20,15 @@ cp -R "$ROOT_DIR/dist/Mac Face Lock.app" "$APP"
 
 rm -rf "$RESOURCES/runtime"
 mkdir -p "$RESOURCES/runtime" "$RESOURCES/defaults"
+mkdir -p "$RESOURCES/help"
 cp -R \
   "$ROOT_DIR/dist/runtime/MacFaceLockRuntime" \
   "$RESOURCES/runtime/MacFaceLockRuntime"
 cp "$ROOT_DIR/config/config.json" "$RESOURCES/defaults/config.json"
 cp "$ROOT_DIR/LICENSE" "$RESOURCES/LICENSE"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$RESOURCES/THIRD_PARTY_NOTICES.md"
+cp "$ROOT_DIR/docs/legacy-install-resolution.md" \
+  "$RESOURCES/help/legacy-install-resolution.md"
 
 while IFS= read -r code_path; do
   codesign --sign - --force "$code_path" >/dev/null 2>&1

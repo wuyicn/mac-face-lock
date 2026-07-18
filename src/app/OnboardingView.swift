@@ -233,6 +233,19 @@ struct OnboardingView: View {
                 title: "检测到的旧版结构不完整",
                 message: message,
                 retryTitle: "重新检查",
+                secondaryActions: {
+                    HStack {
+                        Button("复制诊断摘要") {
+                            _ = setupCoordinator.copyLegacyDiagnostics()
+                        }
+                        Button("保存诊断摘要") {
+                            _ = setupCoordinator.saveLegacyDiagnostics()
+                        }
+                        Button("打开处理指南") {
+                            _ = setupCoordinator.openLegacyResolutionGuide()
+                        }
+                    }
+                },
                 retry: {
                     Task { await setupCoordinator.recheckLegacyInstall() }
                 }
@@ -242,6 +255,7 @@ struct OnboardingView: View {
                 title: "旧版清理尚未完成",
                 message: message,
                 retryTitle: "重试清理",
+                secondaryActions: { EmptyView() },
                 retry: {
                     Task { _ = await setupCoordinator.retryLegacyCleanup() }
                 }
@@ -706,7 +720,22 @@ private struct LegacyCleanupProblemCard: View {
     let title: String
     let message: String
     let retryTitle: String
+    let secondaryActions: () -> AnyView
     let retry: () -> Void
+
+    init<Actions: View>(
+        title: String,
+        message: String,
+        retryTitle: String,
+        @ViewBuilder secondaryActions: @escaping () -> Actions,
+        retry: @escaping () -> Void
+    ) {
+        self.title = title
+        self.message = message
+        self.retryTitle = retryTitle
+        self.secondaryActions = { AnyView(secondaryActions()) }
+        self.retry = retry
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -719,6 +748,7 @@ private struct LegacyCleanupProblemCard: View {
                 .fixedSize(horizontal: false, vertical: true)
             Button(retryTitle, action: retry)
                 .buttonStyle(.bordered)
+            secondaryActions()
         }
         .padding(14)
         .background(
