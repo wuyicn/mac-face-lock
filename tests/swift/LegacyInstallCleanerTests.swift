@@ -47,7 +47,7 @@ private struct LegacyCleanerFixture {
     let commandRunner: RecordingServiceCommandRunner
     let cleaner: LegacyInstallCleaner
 
-    init() throws {
+    init(appURLInsideLegacyRoot: Bool = false) throws {
         container = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "mac-face-lock-legacy-cleaner-\(UUID().uuidString)",
@@ -60,7 +60,12 @@ private struct LegacyCleanerFixture {
             isDirectory: true
         )
         outsideRoot = container.appendingPathComponent("outside-source", isDirectory: true)
-        appURL = container.appendingPathComponent("Mac Face Lock.app", isDirectory: true)
+        appURL = appURLInsideLegacyRoot
+            ? legacyRoot.appendingPathComponent(
+                "dist/Mac Face Lock.app",
+                isDirectory: true
+            )
+            : container.appendingPathComponent("Mac Face Lock.app", isDirectory: true)
         supportURL = home.appendingPathComponent(
             "Library/Application Support/Mac Face Lock",
             isDirectory: true
@@ -137,24 +142,7 @@ private struct LegacyCleanerFixture {
     func writeUnifiedStatusPlist(root: URL? = nil) throws {
         let root = root ?? legacyRoot
         try writePlist(
-            [
-                "Label": "com.wuyi.mac-face-lock-status",
-                "ProgramArguments": [
-                    root.appendingPathComponent(
-                        "dist/Mac Face Lock.app/Contents/MacOS/MacFaceLock"
-                    ).path,
-                    root.path,
-                ],
-                "WorkingDirectory": root.path,
-                "RunAtLoad": true,
-                "KeepAlive": ["SuccessfulExit": false],
-                "StandardOutPath": root.appendingPathComponent(
-                    "logs/status.out.log"
-                ).path,
-                "StandardErrorPath": root.appendingPathComponent(
-                    "logs/status.err.log"
-                ).path,
-            ],
+            unifiedStatusDictionary(root: root),
             to: statusURL
         )
     }
@@ -162,53 +150,14 @@ private struct LegacyCleanerFixture {
     func writeHistoricalStatusPlist(root: URL? = nil) throws {
         let root = root ?? legacyRoot
         try writePlist(
-            [
-                "Label": "com.wuyi.mac-face-lock-status",
-                "ProgramArguments": [
-                    root.appendingPathComponent(
-                        "dist/Mac Face Lock Status.app/Contents/MacOS/MacFaceLockStatus"
-                    ).path,
-                    root.path,
-                ],
-                "WorkingDirectory": root.path,
-                "RunAtLoad": true,
-                "KeepAlive": true,
-                "StandardOutPath": root.appendingPathComponent(
-                    "logs/status.out.log"
-                ).path,
-                "StandardErrorPath": root.appendingPathComponent(
-                    "logs/status.err.log"
-                ).path,
-            ],
+            historicalStatusDictionary(root: root),
             to: statusURL
         )
     }
 
     func writeReleaseAgentPlist() throws {
         try writePlist(
-            [
-                "Label": "com.wuyi.mac-face-lock-agent",
-                "ProgramArguments": [
-                    appURL.appendingPathComponent(
-                        "Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent"
-                    ).path,
-                    "--resources-dir",
-                    appURL.appendingPathComponent("Contents/Resources").path,
-                    "--support-dir",
-                    supportURL.path,
-                    "agent",
-                ],
-                "WorkingDirectory": supportURL.path,
-                "RunAtLoad": true,
-                "KeepAlive": true,
-                "ProcessType": "Background",
-                "StandardOutPath": supportURL.appendingPathComponent(
-                    "logs/agent-launchd.log"
-                ).path,
-                "StandardErrorPath": supportURL.appendingPathComponent(
-                    "logs/agent-launchd.error.log"
-                ).path,
-            ],
+            releaseAgentDictionary(),
             to: agentURL
         )
     }
@@ -249,6 +198,74 @@ private struct LegacyCleanerFixture {
         ]
     }
 
+    func unifiedStatusDictionary(root: URL) -> [String: Any] {
+        [
+            "Label": "com.wuyi.mac-face-lock-status",
+            "ProgramArguments": [
+                root.appendingPathComponent(
+                    "dist/Mac Face Lock.app/Contents/MacOS/MacFaceLock"
+                ).path,
+                root.path,
+            ],
+            "WorkingDirectory": root.path,
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false],
+            "StandardOutPath": root.appendingPathComponent(
+                "logs/status.out.log"
+            ).path,
+            "StandardErrorPath": root.appendingPathComponent(
+                "logs/status.err.log"
+            ).path,
+        ]
+    }
+
+    func historicalStatusDictionary(root: URL) -> [String: Any] {
+        [
+            "Label": "com.wuyi.mac-face-lock-status",
+            "ProgramArguments": [
+                root.appendingPathComponent(
+                    "dist/Mac Face Lock Status.app/Contents/MacOS/MacFaceLockStatus"
+                ).path,
+                root.path,
+            ],
+            "WorkingDirectory": root.path,
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            "StandardOutPath": root.appendingPathComponent(
+                "logs/status.out.log"
+            ).path,
+            "StandardErrorPath": root.appendingPathComponent(
+                "logs/status.err.log"
+            ).path,
+        ]
+    }
+
+    func releaseAgentDictionary() -> [String: Any] {
+        [
+            "Label": "com.wuyi.mac-face-lock-agent",
+            "ProgramArguments": [
+                appURL.appendingPathComponent(
+                    "Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent"
+                ).path,
+                "--resources-dir",
+                appURL.appendingPathComponent("Contents/Resources").path,
+                "--support-dir",
+                supportURL.path,
+                "agent",
+            ],
+            "WorkingDirectory": supportURL.path,
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            "ProcessType": "Background",
+            "StandardOutPath": supportURL.appendingPathComponent(
+                "logs/agent-launchd.log"
+            ).path,
+            "StandardErrorPath": supportURL.appendingPathComponent(
+                "logs/agent-launchd.error.log"
+            ).path,
+        ]
+    }
+
     func sourceAgentExecutable(root: URL) -> String {
         root.appendingPathComponent(
             "dist/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent"
@@ -259,6 +276,7 @@ private struct LegacyCleanerFixture {
 @main
 struct LegacyInstallCleanerTests {
     static func main() throws {
+        try testRejectsCurrentAppInsideCandidateRoot()
         try testRecognizesInstalledCurrentPair()
         try testRecognizesInstalledHistoricalPair()
         try testRecognizesHistoricalStatusSchema()
@@ -271,10 +289,31 @@ struct LegacyInstallCleanerTests {
         try testUnknownArgumentIsAmbiguous()
         try testUnknownFieldCombinationIsAmbiguous()
         try testExternalPythonPathIsAmbiguous()
+        try testTraversingPythonPathIsAmbiguous()
+        try testIntegerBooleanFieldsAreAmbiguous()
         try testSymlinkPlistIsAmbiguous()
         try testHardLinkPlistIsAmbiguous()
         try testOversizedPlistIsAmbiguous()
         print("Legacy install cleaner tests passed")
+    }
+
+    private static func testRejectsCurrentAppInsideCandidateRoot() throws {
+        let fixture = try LegacyCleanerFixture(appURLInsideLegacyRoot: true)
+        defer { fixture.remove() }
+        try fixture.writeCurrentAgentPlist()
+        try fixture.writeUnifiedStatusPlist()
+
+        guard case .ambiguous(let message) = fixture.cleaner.inspect() else {
+            throw TestFailure.assertion("current app inside source root was confirmed")
+        }
+        try require(
+            message == "当前应用位于旧版源码目录内，无法自动确认。",
+            "self-candidate defense returned an unexpected message"
+        )
+        try require(
+            fixture.commandRunner.calls.isEmpty,
+            "self-candidate inspection unexpectedly ran a service command"
+        )
     }
 
     private static func testRecognizesInstalledCurrentPair() throws {
@@ -442,6 +481,136 @@ struct LegacyInstallCleanerTests {
             message == "旧版 PYTHONPATH 不属于已知源码环境。",
             "external PYTHONPATH returned an unsafe or unexpected message"
         )
+    }
+
+    private static func testTraversingPythonPathIsAmbiguous() throws {
+        for (label, suffix) in [
+            (
+                "traversing",
+                "/.venv/lib/python3.11/../../../../outside/site-packages"
+            ),
+            ("dot", "/.venv/lib/./python3.11/site-packages"),
+            ("repeated", "/.venv/lib/python3.11//site-packages"),
+            ("extra", "/.venv/lib/python3.11/extra/site-packages"),
+        ] {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            try fixture.writeHistoricalAgentPlist(
+                pythonPath: fixture.legacyRoot.path + suffix
+            )
+            try fixture.writeUnifiedStatusPlist()
+
+            guard case .ambiguous(let message) = fixture.cleaner.inspect() else {
+                throw TestFailure.assertion("\(label) PYTHONPATH was accepted")
+            }
+            try require(
+                message == "旧版 PYTHONPATH 不属于已知源码环境。",
+                "\(label) PYTHONPATH returned an unexpected message"
+            )
+        }
+    }
+
+    private static func testIntegerBooleanFieldsAreAmbiguous() throws {
+        for field in ["RunAtLoad", "KeepAlive"] {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            var agent = fixture.currentAgentDictionary(root: fixture.legacyRoot)
+            agent[field] = NSNumber(value: 1)
+            try fixture.writePlist(agent, to: fixture.agentURL)
+            try fixture.writeUnifiedStatusPlist()
+
+            guard case .ambiguous = fixture.cleaner.inspect() else {
+                throw TestFailure.assertion(
+                    "integer current Agent \(field) was accepted"
+                )
+            }
+        }
+
+        for field in ["RunAtLoad", "KeepAlive"] {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            var agent = fixture.currentAgentDictionary(root: fixture.legacyRoot)
+            agent["ProgramArguments"] = [
+                fixture.sourceAgentExecutable(root: fixture.legacyRoot),
+                "-u",
+                "agent.py",
+            ]
+            var environment = fixture.currentAgentEnvironment()
+            environment["PYTHONPATH"] = fixture.legacyRoot.appendingPathComponent(
+                ".venv/lib/python3.11/site-packages"
+            ).path
+            agent["EnvironmentVariables"] = environment
+            agent[field] = NSNumber(value: 1)
+            try fixture.writePlist(agent, to: fixture.agentURL)
+            try fixture.writeUnifiedStatusPlist()
+
+            guard case .ambiguous = fixture.cleaner.inspect() else {
+                throw TestFailure.assertion(
+                    "integer historical Agent \(field) was accepted"
+                )
+            }
+        }
+
+        do {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            try fixture.writeCurrentAgentPlist()
+            var status = fixture.unifiedStatusDictionary(root: fixture.legacyRoot)
+            status["RunAtLoad"] = NSNumber(value: 1)
+            try fixture.writePlist(status, to: fixture.statusURL)
+
+            guard case .ambiguous = fixture.cleaner.inspect() else {
+                throw TestFailure.assertion(
+                    "integer current Status RunAtLoad was accepted"
+                )
+            }
+        }
+
+        do {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            try fixture.writeCurrentAgentPlist()
+            var status = fixture.unifiedStatusDictionary(root: fixture.legacyRoot)
+            status["KeepAlive"] = [
+                "SuccessfulExit": NSNumber(value: 0),
+            ]
+            try fixture.writePlist(status, to: fixture.statusURL)
+
+            guard case .ambiguous = fixture.cleaner.inspect() else {
+                throw TestFailure.assertion(
+                    "integer nested SuccessfulExit was accepted"
+                )
+            }
+        }
+
+        for field in ["RunAtLoad", "KeepAlive"] {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            try fixture.writeCurrentAgentPlist()
+            var status = fixture.historicalStatusDictionary(root: fixture.legacyRoot)
+            status[field] = NSNumber(value: 1)
+            try fixture.writePlist(status, to: fixture.statusURL)
+
+            guard case .ambiguous = fixture.cleaner.inspect() else {
+                throw TestFailure.assertion(
+                    "integer historical Status \(field) was accepted"
+                )
+            }
+        }
+
+        for field in ["RunAtLoad", "KeepAlive"] {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            var release = fixture.releaseAgentDictionary()
+            release[field] = NSNumber(value: 1)
+            try fixture.writePlist(release, to: fixture.agentURL)
+
+            guard case .ambiguous = fixture.cleaner.inspect() else {
+                throw TestFailure.assertion(
+                    "integer release Agent \(field) was accepted"
+                )
+            }
+        }
     }
 
     private static func testSymlinkPlistIsAmbiguous() throws {

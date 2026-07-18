@@ -77,11 +77,7 @@ SWIFT_SENSITIVE_ANCHOR_BUDGETS = {
         ),
         "src/app/LegacyInstallCleaner.swift": (
             1,
-            """
-            candidateRoot
-                .appendingPathComponent(".venv/lib", isDirectory: true).path
-                + "/python"
-            """,
+            'relativeComponents[relativeComponents.startIndex] == ".venv"',
             1,
         ),
     },

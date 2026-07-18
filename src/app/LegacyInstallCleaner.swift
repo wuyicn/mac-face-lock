@@ -1,4 +1,5 @@
 import Darwin
+import CoreFoundation
 import Foundation
 
 struct LegacyCleanupCandidate: Equatable, Sendable {
@@ -131,6 +132,9 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
         guard agentRoot == statusRoot else {
             return .ambiguous("旧版后台服务不属于同一源码目录。")
         }
+        guard !isEqualOrDescendant(appURL, of: agentRoot) else {
+            return .ambiguous("当前应用位于旧版源码目录内，无法自动确认。")
+        }
 
         let rootTree: SecureFileTree
         do {
@@ -243,8 +247,8 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
         ]
         guard Set(dictionary.keys) == expectedKeys,
               dictionary["Label"] as? String == LegacyIdentity.agentLabel,
-              dictionary["RunAtLoad"] as? Bool == true,
-              dictionary["KeepAlive"] as? Bool == true,
+              exactBoolean(dictionary["RunAtLoad"], equals: true),
+              exactBoolean(dictionary["KeepAlive"], equals: true),
               let workingDirectory = dictionary["WorkingDirectory"] as? String,
               let candidateRoot = exactAbsoluteDirectory(workingDirectory),
               dictionary["StandardOutPath"] as? String
@@ -284,11 +288,10 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             return .invalid("旧版 Agent 配置无法识别。")
         }
 
-        let prefix = candidateRoot
-            .appendingPathComponent(".venv/lib", isDirectory: true).path + "/python"
-        let suffix = "/site-packages"
-        guard pythonPath.hasPrefix(prefix), pythonPath.hasSuffix(suffix),
-              !pythonPath.dropFirst(prefix.count).dropLast(suffix.count).isEmpty else {
+        guard isExactHistoricalPythonPath(
+            pythonPath,
+            candidateRoot: candidateRoot
+        ) else {
             return .invalid("旧版 PYTHONPATH 不属于已知源码环境。")
         }
         return .source(candidateRoot)
@@ -309,7 +312,7 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
         ]
         guard Set(dictionary.keys) == expectedKeys,
               dictionary["Label"] as? String == LegacyIdentity.statusLabel,
-              dictionary["RunAtLoad"] as? Bool == true,
+              exactBoolean(dictionary["RunAtLoad"], equals: true),
               let workingDirectory = dictionary["WorkingDirectory"] as? String,
               let candidateRoot = exactAbsoluteDirectory(workingDirectory),
               dictionary["StandardOutPath"] as? String
@@ -328,8 +331,9 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             candidateRoot.path,
         ]
         if arguments == unifiedArguments,
-           let keepAlive = dictionary["KeepAlive"] as? [String: Bool],
-           keepAlive == ["SuccessfulExit": false] {
+           let keepAlive = dictionary["KeepAlive"] as? [String: Any],
+           Set(keepAlive.keys) == ["SuccessfulExit"],
+           exactBoolean(keepAlive["SuccessfulExit"], equals: false) {
             return .source(candidateRoot)
         }
 
@@ -340,7 +344,7 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             candidateRoot.path,
         ]
         if arguments == historicalArguments,
-           dictionary["KeepAlive"] as? Bool == true {
+           exactBoolean(dictionary["KeepAlive"], equals: true) {
             return .source(candidateRoot)
         }
         return .invalid("旧版状态服务配置无法识别。")
@@ -371,8 +375,8 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             && dictionary["Label"] as? String == LegacyIdentity.agentLabel
             && dictionary["ProgramArguments"] as? [String] == arguments
             && dictionary["WorkingDirectory"] as? String == supportURL.path
-            && dictionary["RunAtLoad"] as? Bool == true
-            && dictionary["KeepAlive"] as? Bool == true
+            && exactBoolean(dictionary["RunAtLoad"], equals: true)
+            && exactBoolean(dictionary["KeepAlive"], equals: true)
             && dictionary["ProcessType"] as? String == "Background"
             && dictionary["StandardOutPath"] as? String
                 == supportURL.appendingPathComponent("logs/agent-launchd.log").path
@@ -390,6 +394,17 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
         ) as? [String: Any]
     }
 
+    private func exactBoolean(_ value: Any?, equals expected: Bool) -> Bool {
+        guard let value else {
+            return false
+        }
+        let object = value as CFTypeRef
+        guard CFGetTypeID(object) == CFBooleanGetTypeID() else {
+            return false
+        }
+        return value as? Bool == expected
+    }
+
     private func exactAbsoluteDirectory(_ path: String) -> URL? {
         guard path.hasPrefix("/") else {
             return nil
@@ -399,5 +414,61 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             return nil
         }
         return url
+    }
+
+    private func isExactHistoricalPythonPath(
+        _ path: String,
+        candidateRoot: URL
+    ) -> Bool {
+        guard path.hasPrefix("/") else {
+            return false
+        }
+        let canonicalURL = URL(fileURLWithPath: path).standardizedFileURL
+        guard canonicalURL.path == path else {
+            return false
+        }
+
+        let rootComponents = candidateRoot.pathComponents
+        let pathComponents = canonicalURL.pathComponents
+        guard pathComponents.count == rootComponents.count + 4,
+              zip(rootComponents, pathComponents).allSatisfy(==) else {
+            return false
+        }
+        let relativeComponents = pathComponents.dropFirst(rootComponents.count)
+        guard relativeComponents[relativeComponents.startIndex] == ".venv",
+              relativeComponents[relativeComponents.index(
+                  relativeComponents.startIndex,
+                  offsetBy: 1
+              )] == "lib",
+              relativeComponents.last == "site-packages" else {
+            return false
+        }
+
+        let versionComponent = relativeComponents[
+            relativeComponents.index(relativeComponents.startIndex, offsetBy: 2)
+        ]
+        guard versionComponent.hasPrefix("python") else {
+            return false
+        }
+        let version = versionComponent.dropFirst("python".count)
+        let versionParts = version.split(
+            separator: ".",
+            omittingEmptySubsequences: false
+        )
+        return versionParts.count == 2
+            && versionParts.allSatisfy {
+                !$0.isEmpty && $0.utf8.allSatisfy { byte in
+                    byte >= 0x30 && byte <= 0x39
+                }
+            }
+    }
+
+    private func isEqualOrDescendant(_ candidate: URL, of root: URL) -> Bool {
+        let rootComponents = root.pathComponents
+        let candidateComponents = candidate.pathComponents
+        guard candidateComponents.count >= rootComponents.count else {
+            return false
+        }
+        return zip(rootComponents, candidateComponents).allSatisfy(==)
     }
 }
