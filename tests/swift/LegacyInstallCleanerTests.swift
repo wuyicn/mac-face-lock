@@ -324,10 +324,9 @@ private struct LegacyCleanerFixture {
     }
 
     func writeCompletionMarker() throws {
-        try writeJournalObject([
-            "schema_version": 1,
-            "completed": true,
-        ])
+        try Data(
+            #"{"schema_version":1,"completed":true}"#.utf8
+        ).write(to: journalURL)
         guard chmod(journalURL.path, 0o600) == 0 else {
             throw TestFailure.assertion("could not set completion marker mode")
         }
@@ -511,6 +510,9 @@ struct LegacyInstallCleanerTests {
         try testInspectSurfacesIncompleteJournalBeforePlists()
         try testInspectSurfacesCompletionMarker()
         try testInspectRejectsInvalidJournalBeforePlists()
+        try testAcknowledgesOnlyExactCompletionMarker()
+        try testAcknowledgementRejectsIncompleteAndInvalidJournals()
+        try testAcknowledgementTreatsMissingMarkerAsConsumed()
         try testInspectHasNoExecutionSideEffects()
         try await testSupportOverlapBlocksBeforeMutation()
         try await testSupportRootABABlocksBeforeMutation()
@@ -608,6 +610,87 @@ struct LegacyInstallCleanerTests {
         try require(
             fixture.commandRunner.calls.isEmpty,
             "invalid journal inspection unexpectedly ran launchctl"
+        )
+    }
+
+    private static func testAcknowledgesOnlyExactCompletionMarker() throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.writeCompletionMarker()
+        try fixture.writeSupport("keep.txt", "preserve")
+
+        try fixture.cleaner.acknowledgeCompletion()
+
+        try require(
+            !FileManager.default.fileExists(atPath: fixture.journalURL.path),
+            "completion acknowledgement did not remove the exact marker"
+        )
+        try require(
+            FileManager.default.fileExists(
+                atPath: fixture.supportURL.appendingPathComponent("keep.txt").path
+            ),
+            "completion acknowledgement removed unrelated support data"
+        )
+    }
+
+    private static func testAcknowledgementRejectsIncompleteAndInvalidJournals()
+        throws {
+        do {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            try fixture.writeValidJournal(rootURL: fixture.legacyRoot)
+
+            var rejected = false
+            do {
+                try fixture.cleaner.acknowledgeCompletion()
+            } catch {
+                rejected = true
+            }
+            try require(rejected, "incomplete journal was acknowledged")
+            try require(
+                FileManager.default.fileExists(atPath: fixture.journalURL.path),
+                "incomplete journal was removed during acknowledgement"
+            )
+        }
+
+        do {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            try Data(
+                #"{"completed":true,"schema_version":1}"#.utf8
+            ).write(to: fixture.journalURL)
+            guard chmod(fixture.journalURL.path, 0o600) == 0 else {
+                throw TestFailure.assertion("could not set invalid marker mode")
+            }
+            guard case .ambiguous = fixture.cleaner.inspect() else {
+                throw TestFailure.assertion(
+                    "noncanonical completion bytes were accepted during inspection"
+                )
+            }
+
+            var rejected = false
+            do {
+                try fixture.cleaner.acknowledgeCompletion()
+            } catch {
+                rejected = true
+            }
+            try require(rejected, "noncanonical completion bytes were acknowledged")
+            try require(
+                FileManager.default.fileExists(atPath: fixture.journalURL.path),
+                "invalid journal was removed during acknowledgement"
+            )
+        }
+    }
+
+    private static func testAcknowledgementTreatsMissingMarkerAsConsumed() throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+
+        try fixture.cleaner.acknowledgeCompletion()
+
+        try require(
+            !FileManager.default.fileExists(atPath: fixture.journalURL.path),
+            "missing marker acknowledgement created a journal"
         )
     }
 

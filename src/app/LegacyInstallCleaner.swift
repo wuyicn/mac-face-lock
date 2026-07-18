@@ -19,6 +19,7 @@ enum LegacyCleanupInspection: Equatable, Sendable {
 
 protocol LegacyInstallCleaning: AnyObject {
     func inspect() -> LegacyCleanupInspection
+    func acknowledgeCompletion() throws
     func clean(_ candidate: LegacyCleanupCandidate) async -> LegacyCleanupInspection
     func retry() async -> LegacyCleanupInspection
 }
@@ -65,11 +66,6 @@ private enum LegacyCleanupError: Error {
     case couldNotWriteJournal
     case serviceStillLoaded(String)
     case verificationFailed(String)
-}
-
-private struct LegacyCleanupCompletion: Codable, Equatable {
-    let schemaVersion: Int
-    let completed: Bool
 }
 
 private enum LegacyCleanupRecord {
@@ -173,18 +169,12 @@ private final class LegacyCleanupJournalStore {
             return .invalid
         }
 
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        if let completion = try? decoder.decode(
-            LegacyCleanupCompletion.self,
-            from: data
-        ), completion == LegacyCleanupCompletion(
-            schemaVersion: LegacyCleanupJournal.currentSchemaVersion,
-            completed: true
-        ), hasExactKeys(data, expected: ["schema_version", "completed"]) {
+        if data == Self.completionData {
             return .record(.completed)
         }
 
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
         guard
             let journal = try? decoder.decode(
                 LegacyCleanupJournal.self,
@@ -198,6 +188,35 @@ private final class LegacyCleanupJournalStore {
             return .invalid
         }
         return .record(.journal(journal))
+    }
+
+    func acknowledgeCompletion() throws {
+        guard let supportTree else {
+            throw LegacyCleanupError.invalidJournal
+        }
+        let manifest = try supportTree.preflight(
+            relativeTargets: [Self.journalName],
+            budget: SecureTreeBudget(
+                maximumEntries: 1,
+                maximumLogicalBytes: UInt64(Self.completionData.count)
+            )
+        )
+        guard !manifest.entriesDeepestFirst.isEmpty else {
+            return
+        }
+        guard manifest.entriesDeepestFirst.count == 1,
+              manifest.entriesDeepestFirst[0].kind == .file else {
+            throw LegacyCleanupError.invalidJournal
+        }
+        let data = try supportTree.loadValidatedFile(
+            Self.journalName,
+            maximumBytes: Self.maximumBytes,
+            requiredMode: 0o600
+        )
+        guard data == Self.completionData else {
+            throw LegacyCleanupError.invalidJournal
+        }
+        try supportTree.remove(manifest)
     }
 
     private func save(_ journal: LegacyCleanupJournal) throws {
@@ -446,6 +465,10 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
                 statusPlistIdentity: statusIdentity
             )
         )
+    }
+
+    func acknowledgeCompletion() throws {
+        try journalStore.acknowledgeCompletion()
     }
 
     func clean(_ candidate: LegacyCleanupCandidate) async -> LegacyCleanupInspection {

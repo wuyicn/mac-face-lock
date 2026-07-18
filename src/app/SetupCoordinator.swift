@@ -1784,6 +1784,21 @@ final class SetupCoordinator: ObservableObject {
         serviceHealthy = false
         serviceStatus = nil
         runtimeValidationRequired = true
+        do {
+            try setupStore.disableProtectionForLegacyCleanup()
+            guard let legacyInstallCleaner else {
+                throw SetupCoordinatorError.persistenceFailed
+            }
+            try legacyInstallCleaner.acknowledgeCompletion()
+        } catch {
+            publishLegacyCleanupState(
+                .cleanupIncomplete(
+                    "旧版清理已完成，但无法确认重置结果。"
+                )
+            )
+            currentError = "无法确认旧版清理重置结果，请重试清理。"
+            return false
+        }
         publishLegacyCleanupState(.completed)
         currentError = nil
         updateReadiness()

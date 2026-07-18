@@ -208,9 +208,11 @@ private final class FakeLegacyInstallCleaner: LegacyInstallCleaning {
     var inspection: LegacyCleanupInspection
     var cleanResult: LegacyCleanupInspection
     var retryResult: LegacyCleanupInspection
+    var acknowledgementError: Error?
     var suspendClean = false
     var onInspect: (() -> Void)?
     private(set) var inspectCount = 0
+    private(set) var acknowledgementCount = 0
     private(set) var cleanedCandidates: [LegacyCleanupCandidate] = []
     private(set) var retryCount = 0
     private(set) var cleanStarted = false
@@ -230,6 +232,14 @@ private final class FakeLegacyInstallCleaner: LegacyInstallCleaning {
         inspectCount += 1
         onInspect?()
         return inspection
+    }
+
+    func acknowledgeCompletion() throws {
+        acknowledgementCount += 1
+        if let acknowledgementError {
+            throw acknowledgementError
+        }
+        inspection = .notFound
     }
 
     func clean(_ candidate: LegacyCleanupCandidate) async -> LegacyCleanupInspection {
@@ -696,7 +706,10 @@ struct SetupCoordinatorTests {
         try testReleaseCoordinatorStartsDurablyDisabled()
         try await testBlockedTransitionsClearPublishedReadinessImmediately()
         try await testCompletedMarkerResetsOnRelaunch()
+        try await testConsumedMarkerPreservesPartialFreshProgressOnSecondRelaunch()
+        try await testConsumedMarkerPreservesCompletedFreshOnboarding()
         try await testCompletedMarkerRetriesFailedResetOnNextLaunch()
+        try await testFailedAcknowledgementRetriesWithoutResettingFreshProgress()
         try await testRefreshInspectionBarrierRunsOnceBeforeServiceStatus()
         try await testBlockedReentryCannotPublishStatusInstallOrEnable()
         try await testLegacyCleanupSourceAndReleaseBoundaries()
@@ -773,6 +786,17 @@ struct SetupCoordinatorTests {
             appVersion: "0.1.0-beta",
             ownerProfileFingerprint: "stable-owner",
             requiresOwnerReverification: false
+        )
+    }
+
+    private static func partialFreshRecord() -> OnboardingRecord {
+        OnboardingRecord(
+            currentStep: .permissions,
+            completedSteps: [.preparation],
+            completedAt: nil,
+            appVersion: "0.1.0-beta",
+            ownerProfileFingerprint: nil,
+            requiresOwnerReverification: true
         )
     }
 
@@ -885,6 +909,99 @@ struct SetupCoordinatorTests {
             service.statusChecks == 1,
             "service access did not wait for successful completion reset"
         )
+        try require(
+            cleaner.acknowledgementCount == 1
+                && cleaner.inspection == .notFound,
+            "successful reset did not consume the completion marker"
+        )
+    }
+
+    private static func testConsumedMarkerPreservesPartialFreshProgressOnSecondRelaunch()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try fixture.setupStore.save(completedRecord())
+        let cleaner = FakeLegacyInstallCleaner(inspection: .completed)
+        let first = coordinator(
+            fixture: fixture,
+            cleaner: cleaner,
+            serviceManager: FakeServiceManager(state: .healthy),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        await first.refreshLiveReadiness()
+        try fixture.setupStore.save(partialFreshRecord())
+        let secondStore = try SetupStore(
+            localStore: fixture.localStore,
+            mode: .release
+        )
+        let second = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: secondStore,
+            localStore: fixture.localStore,
+            serviceManager: FakeServiceManager(state: .healthy),
+            legacyInstallCleaner: cleaner,
+            applicationURL: URL(fileURLWithPath: "/Applications/Mac Face Lock.app"),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        await second.inspectLegacyInstall()
+
+        try require(
+            second.legacyCleanupState == .notRequired
+                && second.currentStep == .permissions
+                && secondStore.record == partialFreshRecord(),
+            "second relaunch reset partially completed fresh onboarding"
+        )
+        try require(
+            cleaner.acknowledgementCount == 1,
+            "second relaunch acknowledged an already consumed marker"
+        )
+    }
+
+    private static func testConsumedMarkerPreservesCompletedFreshOnboarding()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try fixture.setupStore.save(completedRecord())
+        let cleaner = FakeLegacyInstallCleaner(inspection: .completed)
+        let first = coordinator(
+            fixture: fixture,
+            cleaner: cleaner,
+            serviceManager: FakeServiceManager(state: .healthy),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        await first.refreshLiveReadiness()
+        try fixture.setupStore.save(completedRecord())
+        let secondStore = try SetupStore(
+            localStore: fixture.localStore,
+            mode: .release
+        )
+        let second = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: secondStore,
+            localStore: fixture.localStore,
+            serviceManager: FakeServiceManager(state: .healthy),
+            legacyInstallCleaner: cleaner,
+            applicationURL: URL(fileURLWithPath: "/Applications/Mac Face Lock.app"),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        await second.inspectLegacyInstall()
+
+        try require(
+            second.legacyCleanupState == .notRequired
+                && second.hasCompletedOnboarding
+                && secondStore.record.isComplete,
+            "second relaunch reset completed fresh onboarding"
+        )
+        try require(
+            cleaner.acknowledgementCount == 1,
+            "completed fresh relaunch acknowledged an already consumed marker"
+        )
     }
 
     private static func testCompletedMarkerRetriesFailedResetOnNextLaunch()
@@ -898,10 +1015,11 @@ struct SetupCoordinatorTests {
         guard chmod(fixture.environment.dataURL.path, 0o500) == 0 else {
             throw TestFailure.assertion("could not make onboarding directory read-only")
         }
+        let cleaner = FakeLegacyInstallCleaner(inspection: .completed)
         let firstService = FakeServiceManager(state: .healthy)
         let first = coordinator(
             fixture: fixture,
-            cleaner: FakeLegacyInstallCleaner(inspection: .completed),
+            cleaner: cleaner,
             serviceManager: firstService,
             ownerProfileInspector: FakeOwnerProfileInspector()
         )
@@ -916,7 +1034,8 @@ struct SetupCoordinatorTests {
         )
         try require(
             firstService.statusChecks == 0
-                && fixture.setupStore.record.isComplete,
+                && fixture.setupStore.record.isComplete
+                && cleaner.acknowledgementCount == 0,
             "failed completion reset crossed service gate or erased retry evidence"
         )
 
@@ -934,7 +1053,7 @@ struct SetupCoordinatorTests {
             setupStore: relaunchedStore,
             localStore: fixture.localStore,
             serviceManager: relaunchedService,
-            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .completed),
+            legacyInstallCleaner: cleaner,
             applicationURL: URL(fileURLWithPath: "/Applications/Mac Face Lock.app"),
             ownerProfileInspector: FakeOwnerProfileInspector()
         )
@@ -950,6 +1069,61 @@ struct SetupCoordinatorTests {
         try require(
             relaunchedService.statusChecks == 1,
             "next launch did not delay service access until reset succeeded"
+        )
+        try require(
+            cleaner.acknowledgementCount == 1
+                && cleaner.inspection == .notFound,
+            "successful retry did not consume the retained completion marker"
+        )
+    }
+
+    private static func testFailedAcknowledgementRetriesWithoutResettingFreshProgress()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try fixture.setupStore.save(completedRecord())
+        let cleaner = FakeLegacyInstallCleaner(inspection: .completed)
+        cleaner.acknowledgementError = TestFailure.assertion(
+            "injected acknowledgement failure"
+        )
+        let firstService = FakeServiceManager(state: .healthy)
+        let first = coordinator(
+            fixture: fixture,
+            cleaner: cleaner,
+            serviceManager: firstService,
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        await first.refreshLiveReadiness()
+
+        try require(
+            first.legacyCleanupState == .cleanupIncomplete(
+                "旧版清理已完成，但无法确认重置结果。"
+            ),
+            "acknowledgement failure did not remain blocked"
+        )
+        try require(
+            cleaner.acknowledgementCount == 1
+                && cleaner.inspection == .completed
+                && firstService.statusChecks == 0,
+            "failed acknowledgement consumed the marker or crossed the service gate"
+        )
+        cleaner.acknowledgementError = nil
+        let retried = await first.retryLegacyCleanup()
+
+        try require(
+            retried
+                && first.legacyCleanupState == .completed
+                && first.currentStep == .preparation
+                && !fixture.setupStore.record.isComplete
+                && fixture.setupStore.record.requiresOwnerReverification == true,
+            "acknowledgement retry lost the durable fresh reset"
+        )
+        try require(
+            cleaner.acknowledgementCount == 2
+                && cleaner.inspection == .notFound
+                && firstService.statusChecks == 0,
+            "acknowledgement retry did not consume the marker while staying service-safe"
         )
     }
 
