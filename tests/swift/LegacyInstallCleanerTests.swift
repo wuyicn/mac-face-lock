@@ -323,6 +323,16 @@ private struct LegacyCleanerFixture {
         }
     }
 
+    func writeCompletionMarker() throws {
+        try writeJournalObject([
+            "schema_version": 1,
+            "completed": true,
+        ])
+        guard chmod(journalURL.path, 0o600) == 0 else {
+            throw TestFailure.assertion("could not set completion marker mode")
+        }
+    }
+
     func makeCleaner(userID: uid_t) -> LegacyInstallCleaner {
         LegacyInstallCleaner(
             homeURL: home,
@@ -498,6 +508,9 @@ private struct LegacyCleanerFixture {
 @main
 struct LegacyInstallCleanerTests {
     static func main() async throws {
+        try testInspectSurfacesIncompleteJournalBeforePlists()
+        try testInspectSurfacesCompletionMarker()
+        try testInspectRejectsInvalidJournalBeforePlists()
         try testInspectHasNoExecutionSideEffects()
         try await testSupportOverlapBlocksBeforeMutation()
         try await testSupportRootABABlocksBeforeMutation()
@@ -541,6 +554,61 @@ struct LegacyInstallCleanerTests {
         try testHardLinkPlistIsAmbiguous()
         try testOversizedPlistIsAmbiguous()
         print("Legacy install cleaner tests passed")
+    }
+
+    private static func testInspectSurfacesIncompleteJournalBeforePlists() throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.writeValidJournal(rootURL: fixture.legacyRoot)
+
+        guard case .cleanupIncomplete = fixture.cleaner.inspect() else {
+            throw TestFailure.assertion(
+                "valid incomplete journal did not override absent legacy plists"
+            )
+        }
+        try require(
+            fixture.commandRunner.calls.isEmpty,
+            "journal inspection unexpectedly ran launchctl"
+        )
+    }
+
+    private static func testInspectSurfacesCompletionMarker() throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.writeCompletionMarker()
+
+        guard case .completed = fixture.cleaner.inspect() else {
+            throw TestFailure.assertion(
+                "completion marker was not surfaced explicitly"
+            )
+        }
+        try require(
+            fixture.commandRunner.calls.isEmpty,
+            "completion inspection unexpectedly ran launchctl"
+        )
+    }
+
+    private static func testInspectRejectsInvalidJournalBeforePlists() throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.writeJournalObject([
+            "schema_version": 1,
+            "completed": false,
+            "unexpected": true,
+        ])
+        guard chmod(fixture.journalURL.path, 0o600) == 0 else {
+            throw TestFailure.assertion("could not set invalid journal mode")
+        }
+
+        guard case .ambiguous = fixture.cleaner.inspect() else {
+            throw TestFailure.assertion(
+                "invalid journal was ignored when legacy plists were absent"
+            )
+        }
+        try require(
+            fixture.commandRunner.calls.isEmpty,
+            "invalid journal inspection unexpectedly ran launchctl"
+        )
     }
 
     private static func testInspectHasNoExecutionSideEffects() throws {
@@ -1199,7 +1267,7 @@ struct LegacyInstallCleanerTests {
             switch result {
             case .ambiguous, .cleanupIncomplete:
                 break
-            case .notFound, .confirmed:
+            case .notFound, .confirmed, .completed:
                 throw TestFailure.assertion(
                     "\(label) support overlap was not safely refused: \(result)"
                 )

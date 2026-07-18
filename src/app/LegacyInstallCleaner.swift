@@ -14,6 +14,7 @@ enum LegacyCleanupInspection: Equatable, Sendable {
     case confirmed(LegacyCleanupCandidate)
     case ambiguous(String)
     case cleanupIncomplete(String)
+    case completed
 }
 
 protocol LegacyInstallCleaning: AnyObject {
@@ -74,6 +75,12 @@ private struct LegacyCleanupCompletion: Codable, Equatable {
 private enum LegacyCleanupRecord {
     case journal(LegacyCleanupJournal)
     case completed
+}
+
+private enum LegacyCleanupRecordInspection {
+    case absent
+    case record(LegacyCleanupRecord)
+    case invalid
 }
 
 private func readSecureData(
@@ -140,8 +147,15 @@ private final class LegacyCleanupJournalStore {
     }
 
     func load() throws -> LegacyCleanupRecord {
-        guard let supportTree else {
+        guard case .record(let record) = inspect() else {
             throw LegacyCleanupError.invalidJournal
+        }
+        return record
+    }
+
+    func inspect() -> LegacyCleanupRecordInspection {
+        guard let supportTree else {
+            return .invalid
         }
         let data: Data
         do {
@@ -150,8 +164,13 @@ private final class LegacyCleanupJournalStore {
                 maximumBytes: Self.maximumBytes,
                 requiredMode: 0o600
             )
+        } catch let error as SecureFileTreeError {
+            if case .systemCall("fstatat", _, ENOENT) = error {
+                return .absent
+            }
+            return .invalid
         } catch {
-            throw LegacyCleanupError.invalidJournal
+            return .invalid
         }
 
         let decoder = JSONDecoder()
@@ -163,7 +182,7 @@ private final class LegacyCleanupJournalStore {
             schemaVersion: LegacyCleanupJournal.currentSchemaVersion,
             completed: true
         ), hasExactKeys(data, expected: ["schema_version", "completed"]) {
-            return .completed
+            return .record(.completed)
         }
 
         guard
@@ -176,9 +195,9 @@ private final class LegacyCleanupJournalStore {
             journal.relativeTargets == LegacyIdentity.targets,
             validatedRootURL(journal.rootPath) != nil
         else {
-            throw LegacyCleanupError.invalidJournal
+            return .invalid
         }
-        return .journal(journal)
+        return .record(.journal(journal))
     }
 
     private func save(_ journal: LegacyCleanupJournal) throws {
@@ -333,6 +352,19 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
     }
 
     func inspect() -> LegacyCleanupInspection {
+        switch journalStore.inspect() {
+        case .absent:
+            break
+        case .record(.completed):
+            return .completed
+        case .record(.journal):
+            return .cleanupIncomplete(
+                "旧版清理未完成。已安全保留进度，请重试清理。"
+            )
+        case .invalid:
+            return .ambiguous("旧版清理记录无效，无法自动继续。")
+        }
+
         let snapshot: LegacyPlistSnapshot
         do {
             guard let inspected = try readLegacyPlists() else {

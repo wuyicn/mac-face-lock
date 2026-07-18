@@ -137,6 +137,13 @@ private final class FakeServiceManager: ServiceManaging {
     private(set) var restartCount = 0
     private(set) var uninstallCount = 0
     private(set) var statusChecks = 0
+    var suspendStatus = false
+    var suspendInstall = false
+    var onStatus: (() -> Void)?
+    private(set) var statusStarted = false
+    private(set) var installStarted = false
+    private var statusContinuation: CheckedContinuation<Void, Never>?
+    private var installContinuation: CheckedContinuation<Void, Never>?
 
     init(state: ServiceState, pid: Int32? = 42) {
         currentStatus = ServiceStatus(
@@ -155,10 +162,23 @@ private final class FakeServiceManager: ServiceManaging {
             throw installError
         }
         installs.append((appURL, supportURL))
+        installStarted = true
+        if suspendInstall {
+            await withCheckedContinuation { continuation in
+                installContinuation = continuation
+            }
+        }
     }
 
     func status() async -> ServiceStatus {
         statusChecks += 1
+        statusStarted = true
+        onStatus?()
+        if suspendStatus {
+            await withCheckedContinuation { continuation in
+                statusContinuation = continuation
+            }
+        }
         return currentStatus
     }
 
@@ -172,6 +192,16 @@ private final class FakeServiceManager: ServiceManaging {
     func uninstallPreservingData() async throws {
         uninstallCount += 1
     }
+
+    func finishStatus() {
+        statusContinuation?.resume()
+        statusContinuation = nil
+    }
+
+    func finishInstall() {
+        installContinuation?.resume()
+        installContinuation = nil
+    }
 }
 
 private final class FakeLegacyInstallCleaner: LegacyInstallCleaning {
@@ -179,6 +209,7 @@ private final class FakeLegacyInstallCleaner: LegacyInstallCleaning {
     var cleanResult: LegacyCleanupInspection
     var retryResult: LegacyCleanupInspection
     var suspendClean = false
+    var onInspect: (() -> Void)?
     private(set) var inspectCount = 0
     private(set) var cleanedCandidates: [LegacyCleanupCandidate] = []
     private(set) var retryCount = 0
@@ -197,6 +228,7 @@ private final class FakeLegacyInstallCleaner: LegacyInstallCleaning {
 
     func inspect() -> LegacyCleanupInspection {
         inspectCount += 1
+        onInspect?()
         return inspection
     }
 
@@ -661,6 +693,12 @@ private struct CoordinatorFixture {
 @MainActor
 struct SetupCoordinatorTests {
     static func main() async throws {
+        try testReleaseCoordinatorStartsDurablyDisabled()
+        try await testBlockedTransitionsClearPublishedReadinessImmediately()
+        try await testCompletedMarkerResetsOnRelaunch()
+        try await testCompletedMarkerRetriesFailedResetOnNextLaunch()
+        try await testRefreshInspectionBarrierRunsOnceBeforeServiceStatus()
+        try await testBlockedReentryCannotPublishStatusInstallOrEnable()
         try await testLegacyCleanupSourceAndReleaseBoundaries()
         try await testLegacyInspectionMapsEveryResult()
         try await testLegacyCleanupPreparationAndActions()
@@ -724,6 +762,342 @@ struct SetupCoordinatorTests {
             check: check,
             failedChecks: nil,
             decision: decision
+        )
+    }
+
+    private static func completedRecord() -> OnboardingRecord {
+        OnboardingRecord(
+            currentStep: .completion,
+            completedSteps: SetupStep.allCases,
+            completedAt: "2026-07-18T00:00:00Z",
+            appVersion: "0.1.0-beta",
+            ownerProfileFingerprint: "stable-owner",
+            requiresOwnerReverification: false
+        )
+    }
+
+    private static func testReleaseCoordinatorStartsDurablyDisabled() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "mac-face-lock-initial-disable-\(UUID().uuidString)"
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataURL = root.appendingPathComponent("data", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: dataURL,
+            withIntermediateDirectories: true
+        )
+        let localStore = LocalJSONStore(resourcesURL: root, dataURL: dataURL)
+        try localStore.writeOnboarding(completedRecord())
+        _ = try localStore.writeControl(enabled: true)
+        let setupStore = try SetupStore(localStore: localStore, mode: .release)
+        let environment = AppEnvironment(
+            mode: .release,
+            resourcesURL: root,
+            supportURL: root,
+            configURL: root.appendingPathComponent("config/config.json"),
+            dataURL: dataURL,
+            logsURL: root.appendingPathComponent("logs"),
+            runtimeExecutableURL: root.appendingPathComponent("runtime")
+        )
+
+        let subject = SetupCoordinator(
+            environment: environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: setupStore,
+            localStore: localStore,
+            serviceManager: FakeServiceManager(state: .healthy),
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        try require(
+            subject.legacyCleanupState == .unchecked,
+            "release coordinator did not start unchecked"
+        )
+        try require(
+            !localStore.readControl().protectionEnabled,
+            "release coordinator exposed enabled control before async inspection"
+        )
+        try require(
+            !subject.isLiveReady,
+            "unchecked release coordinator published live readiness"
+        )
+    }
+
+    private static func testBlockedTransitionsClearPublishedReadinessImmediately()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try fixture.setupStore.save(completedRecord())
+        let cleaner = FakeLegacyInstallCleaner(inspection: .notFound)
+        let service = FakeServiceManager(state: .healthy)
+        let subject = coordinator(
+            fixture: fixture,
+            cleaner: cleaner,
+            serviceManager: service,
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+        await subject.refreshLiveReadiness()
+        try require(subject.serviceStatus != nil, "fixture did not publish service status")
+        _ = try fixture.localStore.writeControl(enabled: true)
+
+        subject.applyLegacyInspectionForTesting(.ambiguous("late legacy state"))
+
+        try require(
+            subject.legacyCleanupState == .ambiguous("late legacy state"),
+            "blocked transition did not publish its cleanup state"
+        )
+        try require(
+            subject.serviceStatus == nil
+                && subject.checks[.serviceHealth] == false
+                && !subject.isLiveReady,
+            "blocked transition retained service or readiness publication"
+        )
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "blocked transition did not durably disable protection"
+        )
+    }
+
+    private static func testCompletedMarkerResetsOnRelaunch() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try fixture.setupStore.save(completedRecord())
+        let cleaner = FakeLegacyInstallCleaner(inspection: .completed)
+        let service = FakeServiceManager(state: .healthy)
+        let subject = coordinator(
+            fixture: fixture,
+            cleaner: cleaner,
+            serviceManager: service,
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        await subject.refreshLiveReadiness()
+
+        try require(cleaner.inspectCount == 1, "completion marker was not inspected once")
+        try require(
+            subject.legacyCleanupState == .completed
+                && !subject.hasCompletedOnboarding
+                && subject.currentStep == .preparation,
+            "completion marker did not reset stale completed onboarding"
+        )
+        try require(
+            service.statusChecks == 1,
+            "service access did not wait for successful completion reset"
+        )
+    }
+
+    private static func testCompletedMarkerRetriesFailedResetOnNextLaunch()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer {
+            _ = chmod(fixture.environment.dataURL.path, 0o700)
+            fixture.remove()
+        }
+        try fixture.setupStore.save(completedRecord())
+        guard chmod(fixture.environment.dataURL.path, 0o500) == 0 else {
+            throw TestFailure.assertion("could not make onboarding directory read-only")
+        }
+        let firstService = FakeServiceManager(state: .healthy)
+        let first = coordinator(
+            fixture: fixture,
+            cleaner: FakeLegacyInstallCleaner(inspection: .completed),
+            serviceManager: firstService,
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        await first.refreshLiveReadiness()
+
+        try require(
+            first.legacyCleanupState == .cleanupIncomplete(
+                "旧版清理已完成，但无法重置首次设置状态。"
+            ),
+            "failed completion reset did not remain blocked"
+        )
+        try require(
+            firstService.statusChecks == 0
+                && fixture.setupStore.record.isComplete,
+            "failed completion reset crossed service gate or erased retry evidence"
+        )
+
+        guard chmod(fixture.environment.dataURL.path, 0o700) == 0 else {
+            throw TestFailure.assertion("could not restore onboarding directory")
+        }
+        let relaunchedStore = try SetupStore(
+            localStore: fixture.localStore,
+            mode: .release
+        )
+        let relaunchedService = FakeServiceManager(state: .healthy)
+        let relaunched = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: relaunchedStore,
+            localStore: fixture.localStore,
+            serviceManager: relaunchedService,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .completed),
+            applicationURL: URL(fileURLWithPath: "/Applications/Mac Face Lock.app"),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        await relaunched.refreshLiveReadiness()
+
+        try require(
+            relaunched.legacyCleanupState == .completed
+                && !relaunched.hasCompletedOnboarding
+                && relaunched.currentStep == .preparation,
+            "next launch did not retry and complete onboarding reset"
+        )
+        try require(
+            relaunchedService.statusChecks == 1,
+            "next launch did not delay service access until reset succeeded"
+        )
+    }
+
+    private static func testRefreshInspectionBarrierRunsOnceBeforeServiceStatus()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        var events: [String] = []
+        let cleaner = FakeLegacyInstallCleaner(inspection: .notFound)
+        cleaner.onInspect = { events.append("inspect") }
+        let service = FakeServiceManager(state: .healthy)
+        service.onStatus = { events.append("status") }
+        let subject = coordinator(
+            fixture: fixture,
+            cleaner: cleaner,
+            serviceManager: service
+        )
+
+        async let liveRefresh: Void = subject.refreshLiveReadiness()
+        async let authorizationRefresh: Void =
+            subject.refreshCurrentAuthorizationStatus()
+        _ = await (liveRefresh, authorizationRefresh)
+
+        try require(
+            cleaner.inspectCount == 1,
+            "concurrent initial refreshes duplicated cleanup inspection"
+        )
+        try require(
+            events.first == "inspect"
+                && events.filter { $0 == "status" }.count == 2,
+            "refresh reached service status before the inspection barrier"
+        )
+    }
+
+    private static func testBlockedReentryCannotPublishStatusInstallOrEnable()
+        async throws {
+        try await assertBlockedReentryDropsStatus()
+        try await assertBlockedReentryStopsAfterInstall()
+        try await assertBlockedReentryCannotEnableControl()
+    }
+
+    private static func assertBlockedReentryDropsStatus() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let cleaner = FakeLegacyInstallCleaner(inspection: .notFound)
+        let service = FakeServiceManager(state: .healthy)
+        service.suspendStatus = true
+        let subject = coordinator(
+            fixture: fixture,
+            cleaner: cleaner,
+            serviceManager: service,
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+        let refresh = Task { await subject.refreshLiveReadiness() }
+        for _ in 0..<40 where !service.statusStarted {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        cleaner.inspection = .ambiguous("repeated inspection")
+        await subject.inspectLegacyInstall()
+        try require(
+            cleaner.inspectCount == 1
+                && subject.legacyCleanupState == .notRequired,
+            "allowed cleanup state was inspected repeatedly"
+        )
+        subject.applyLegacyInspectionForTesting(.ambiguous("blocked during status"))
+        service.finishStatus()
+        await refresh.value
+
+        try require(
+            subject.serviceStatus == nil
+                && subject.checks[.serviceHealth] == false
+                && !subject.isLiveReady,
+            "suspended status published after cleanup became blocked"
+        )
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "suspended status re-enabled control after cleanup became blocked"
+        )
+    }
+
+    private static func assertBlockedReentryStopsAfterInstall() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let runner = FakeRuntimeRunner()
+        runner.events[.diagnose] = [event("diagnosis_complete")]
+        let service = FakeServiceManager(state: .healthy)
+        service.suspendInstall = true
+        let subject = coordinator(
+            fixture: fixture,
+            cleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            serviceManager: service,
+            runtimeRunner: runner,
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+        await subject.inspectLegacyInstall()
+        let diagnosis = Task { await subject.runDiagnosis() }
+        for _ in 0..<40 where !service.installStarted {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        subject.applyLegacyInspectionForTesting(.cleanupIncomplete("blocked during install"))
+        service.finishInstall()
+        await diagnosis.value
+
+        try require(
+            service.statusChecks == 0 && subject.serviceStatus == nil,
+            "suspended install crossed the blocked gate to status publication"
+        )
+    }
+
+    private static func assertBlockedReentryCannotEnableControl() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let runner = FakeRuntimeRunner()
+        runner.events[.diagnose] = [event("diagnosis_complete")]
+        runner.events[.verifyOwner] = [
+            event("owner_verification_complete", decision: "owner"),
+        ]
+        let service = FakeServiceManager(state: .healthy)
+        service.suspendStatus = true
+        let subject = coordinator(
+            fixture: fixture,
+            cleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            serviceManager: service,
+            runtimeRunner: runner,
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+        await subject.inspectLegacyInstall()
+        let enable = Task {
+            do {
+                try await subject.enableProtection()
+                return true
+            } catch {
+                return false
+            }
+        }
+        for _ in 0..<40 where !service.statusStarted {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        subject.applyLegacyInspectionForTesting(.ambiguous("blocked during enable"))
+        service.finishStatus()
+        let enabled = await enable.value
+
+        try require(!enabled, "enable succeeded after cleanup became blocked")
+        try require(
+            !fixture.localStore.readControl().protectionEnabled
+                && !subject.hasCompletedOnboarding
+                && !subject.isLiveReady,
+            "suspended enable published completion or enabled control after block"
         )
     }
 
@@ -811,6 +1185,7 @@ struct SetupCoordinatorTests {
             defer { fixture.remove() }
             let cleaner = FakeLegacyInstallCleaner(inspection: inspection)
             let subject = coordinator(fixture: fixture, cleaner: cleaner)
+            _ = try fixture.localStore.writeControl(enabled: true)
 
             await subject.inspectLegacyInstall()
 
@@ -819,6 +1194,12 @@ struct SetupCoordinatorTests {
                 "inspection \(inspection) mapped to the wrong cleanup state"
             )
             try require(cleaner.inspectCount == 1, "inspection was not invoked exactly once")
+            if expectedState != .notRequired {
+                try require(
+                    !fixture.localStore.readControl().protectionEnabled,
+                    "blocked inspection \(inspection) did not durably disable protection"
+                )
+            }
         }
     }
 
@@ -921,6 +1302,7 @@ struct SetupCoordinatorTests {
             cleaner: cleaningCleaner
         )
         await cleaningSubject.inspectLegacyInstall()
+        _ = try cleaningFixture.localStore.writeControl(enabled: true)
         let cleaningTask = Task {
             await cleaningSubject.confirmLegacyCleanup()
         }
@@ -928,8 +1310,22 @@ struct SetupCoordinatorTests {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         try require(
-            cleaningSubject.legacyCleanupState == .cleaning,
-            "cleanup did not publish the cleaning state"
+            cleaningSubject.legacyCleanupState == .cleaning
+                && !cleaningFixture.localStore.readControl().protectionEnabled,
+            "cleaning transition did not durably disable protection"
+        )
+        _ = try cleaningFixture.localStore.writeControl(enabled: true)
+        cleaningSubject.applyLegacyInspectionForTesting(
+            .cleanupIncomplete("re-entered while cleaning")
+        )
+        try require(
+            cleaningSubject.legacyCleanupState
+                == .cleanupIncomplete("re-entered while cleaning"),
+            "cleanup re-entry did not publish the blocked state"
+        )
+        try require(
+            !cleaningFixture.localStore.readControl().protectionEnabled,
+            "cleanup re-entry did not durably disable protection"
         )
         let cleaningPreparation = await cleaningSubject.prepareForSetup()
         try require(
@@ -993,10 +1389,7 @@ struct SetupCoordinatorTests {
 
     private static func testServiceManagerIsUntouchedForEveryBlockedCleanupState()
         async throws {
-        try await assertServiceManagerUntouched(
-            inspection: nil,
-            expectedState: .unchecked
-        )
+        try await assertUncheckedDirectServicePathsAreUntouched()
         try await assertServiceManagerUntouched(
             inspection: .confirmed(legacyCandidate()),
             expectedState: .confirmationRequired
@@ -1044,6 +1437,37 @@ struct SetupCoordinatorTests {
         )
         cleaner.finishClean()
         _ = await cleaningTask.value
+    }
+
+    private static func assertUncheckedDirectServicePathsAreUntouched()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let service = FakeServiceManager(state: .healthy)
+        let runner = FakeRuntimeRunner()
+        runner.events[.diagnose] = [event("diagnosis_complete")]
+        let subject = coordinator(
+            fixture: fixture,
+            cleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            serviceManager: service,
+            runtimeRunner: runner
+        )
+
+        await subject.restartService()
+        await subject.reinstallService()
+        await subject.runDiagnosis()
+
+        try require(
+            subject.legacyCleanupState == .unchecked,
+            "direct service actions advanced unchecked inspection"
+        )
+        try require(
+            service.statusChecks == 0
+                && service.restartCount == 0
+                && service.installs.isEmpty
+                && service.uninstallCount == 0,
+            "a direct service action crossed the unchecked gate"
+        )
     }
 
     private static func assertServiceManagerUntouched(

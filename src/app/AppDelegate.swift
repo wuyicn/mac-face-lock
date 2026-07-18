@@ -111,8 +111,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.desktopWindowController = desktopWindowController
         self.statusMenuController = statusMenuController
 
-        faceLockStore.startPolling()
-        statusMenuController.startRefreshing()
         if !setupCoordinator.hasCompletedOnboarding {
             desktopWindowController.show()
         }
@@ -122,6 +120,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 desktopWindowController.show()
             }
             await setupCoordinator.refreshLiveReadiness()
+            faceLockStore.startPolling()
+            statusMenuController.startRefreshing()
             faceLockStore.refresh()
             statusMenuController.refresh()
         }

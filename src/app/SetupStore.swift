@@ -17,7 +17,16 @@ final class SetupStore {
         self.localStore = localStore
         self.mode = mode
         self.record = localStore.readOnboarding()
+        try disableProtectionForLegacyCleanup()
         try enforceReleaseSafety(for: record)
+    }
+
+    func disableProtectionForLegacyCleanup() throws {
+        guard mode == .release,
+              localStore.readControl().protectionEnabled else {
+            return
+        }
+        _ = try localStore.writeControl(enabled: false)
     }
 
     func save(_ record: OnboardingRecord) throws {

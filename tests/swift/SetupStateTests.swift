@@ -37,7 +37,8 @@ struct SetupStateTests {
         try testOnboardingRoundTripPersistsProgressWithoutPermissionClaims()
         try testReleaseMissingOnboardingPersistsDisabledControl()
         try testSourceMissingOnboardingPreservesEnabledFallback()
-        try testCompletedReleaseOnboardingPreservesControl()
+        try testCompletedReleaseOnboardingDisablesControlBeforeInspection()
+        try testReleaseInitializationFailsWhenControlCannotBeDisabled()
         try testCompletedRoutingKeepsRecoveryAvailableWhenLiveHealthIsLost()
         try testLegacyCleanupAttentionOverridesCompletedRouting()
         print("Setup state tests passed")
@@ -331,7 +332,7 @@ struct SetupStateTests {
         )
     }
 
-    private static func testCompletedReleaseOnboardingPreservesControl() throws {
+    private static func testCompletedReleaseOnboardingDisablesControlBeforeInspection() throws {
         let fixture = try makeStore()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -350,8 +351,42 @@ struct SetupStateTests {
         )
         try require(setupStore.record.isComplete, "valid release onboarding was not complete")
         try require(
-            fixture.store.readControl().protectionEnabled,
-            "completed release onboarding unexpectedly disabled protection"
+            !fixture.store.readControl().protectionEnabled,
+            "completed release onboarding stayed enabled before cleanup inspection"
+        )
+    }
+
+    private static func testReleaseInitializationFailsWhenControlCannotBeDisabled()
+        throws {
+        let fixture = try makeStore()
+        defer {
+            _ = chmod(fixture.store.dataURL.path, 0o700)
+            try? FileManager.default.removeItem(at: fixture.root)
+        }
+        let completed = OnboardingRecord(
+            currentStep: .completion,
+            completedSteps: SetupStep.allCases,
+            completedAt: "2026-07-17T12:00:00+08:00",
+            appVersion: "0.1.0-beta"
+        )
+        try fixture.store.writeOnboarding(completed)
+        _ = try fixture.store.writeControl(enabled: true)
+        guard chmod(fixture.store.dataURL.path, 0o500) == 0 else {
+            throw TestFailure.assertion("could not make control directory read-only")
+        }
+
+        var initializationFailed = false
+        do {
+            _ = try SetupStore(
+                localStore: fixture.store,
+                mode: .release
+            )
+        } catch {
+            initializationFailed = true
+        }
+        try require(
+            initializationFailed,
+            "release setup initialized after durable disable failed"
         )
     }
 }
