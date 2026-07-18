@@ -52,6 +52,7 @@ private struct LegacyCleanupJournal: Codable, Equatable {
     let rootIdentity: SecureFileIdentity
     let relativeTargets: [String]
     var phase: LegacyCleanupPhase
+    var tombstones: [SecureTreeTombstone]?
 }
 
 private enum LegacyCleanupPhase: String, Codable {
@@ -125,7 +126,8 @@ private final class LegacyCleanupJournalStore {
                 rootPath: candidate.rootURL.path,
                 rootIdentity: candidate.rootIdentity,
                 relativeTargets: LegacyIdentity.targets,
-                phase: phase
+                phase: phase,
+                tombstones: nil
             )
         )
     }
@@ -135,6 +137,16 @@ private final class LegacyCleanupJournalStore {
             throw LegacyCleanupError.invalidJournal
         }
         journal.phase = phase
+        try save(journal)
+    }
+
+    func recordTombstones(_ tombstones: [SecureTreeTombstone]) throws {
+        guard case .journal(var journal) = try load(),
+              journal.phase == .servicesStopped,
+              journal.tombstones == nil else {
+            throw LegacyCleanupError.invalidJournal
+        }
+        journal.tombstones = tombstones
         try save(journal)
     }
 
@@ -290,15 +302,57 @@ private final class LegacyCleanupJournalStore {
                 "root_identity",
                 "relative_targets",
                 "phase",
+            ] || Set(dictionary.keys) == [
+                "schema_version",
+                "root_path",
+                "root_identity",
+                "relative_targets",
+                "phase",
+                "tombstones",
             ],
             let identity = dictionary["root_identity"] as? [String: Any],
             Set(identity.keys) == ["device", "inode"],
             isExactUnsignedInteger(identity["device"]),
-            isExactUnsignedInteger(identity["inode"])
+            isExactUnsignedInteger(identity["inode"]),
+            hasExactTombstoneShape(dictionary["tombstones"])
         else {
             return false
         }
         return true
+    }
+
+    private func hasExactTombstoneShape(_ value: Any?) -> Bool {
+        guard let value else {
+            return true
+        }
+        guard let tombstones = value as? [[String: Any]],
+              tombstones.count <= LegacyIdentity.targets.count else {
+            return false
+        }
+        return tombstones.allSatisfy { tombstone in
+            guard Set(tombstone.keys) == [
+                "original_relative_path",
+                "tombstone_relative_path",
+                "identity",
+                "kind",
+            ],
+            let identity = tombstone["identity"] as? [String: Any],
+            Set(identity.keys) == ["device", "inode"],
+            isExactUnsignedInteger(identity["device"]),
+            isExactUnsignedInteger(identity["inode"]),
+            let original = tombstone["original_relative_path"] as? String,
+            LegacyIdentity.targets.contains(original),
+            let moved = tombstone["tombstone_relative_path"] as? String,
+            moved.contains(".mac-face-lock-delete-"),
+            let kind = tombstone["kind"] as? String,
+            ["file", "directory"].contains(kind)
+            else {
+                return false
+            }
+            let originalParent = (original as NSString).deletingLastPathComponent
+            let movedParent = (moved as NSString).deletingLastPathComponent
+            return originalParent == movedParent
+        }
     }
 
     private func isExactUnsignedInteger(_ value: Any?) -> Bool {
@@ -488,8 +542,25 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             try await stopAndVerify(LegacyIdentity.statusLabel)
             try await stopAndVerify(LegacyIdentity.agentLabel)
             try journalStore.advance(to: .servicesStopped)
-            try preflightAllRemainingTargetsWithoutMutation(candidate)
-            try removeSourceTargets(candidate)
+            let tree = try sourceTree(for: candidate)
+            let manifest = try preflightAllRemainingTargetsWithoutMutation(
+                candidate,
+                tree: tree
+            )
+            let tombstones = try tree.makeTombstones(
+                manifest: manifest,
+                relativeTargets: LegacyIdentity.targets
+            )
+            try journalStore.recordTombstones(tombstones)
+            try tree.remove(
+                manifest,
+                tombstones: tombstones,
+                afterRename: { _ in
+                    try self.testEventHandler?(
+                        "afterSourceTombstoneRename"
+                    )
+                }
+            )
             try journalStore.advance(to: .sourceTargetsRemoved)
             try removeLegacyPlists(candidate)
             try journalStore.advance(to: .plistsRemoved)
@@ -504,7 +575,7 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
     }
 
     func retry() async -> LegacyCleanupInspection {
-        let journal: LegacyCleanupJournal
+        var journal: LegacyCleanupJournal
         do {
             switch try journalStore.load() {
             case .completed:
@@ -522,15 +593,44 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             try await stopAndVerify(LegacyIdentity.agentLabel)
             if journal.phase == .confirmed {
                 try journalStore.advance(to: .servicesStopped)
+                guard case .journal(let advanced) = try journalStore.load() else {
+                    throw LegacyCleanupError.invalidJournal
+                }
+                journal = advanced
             }
 
             try preflightRetryWithoutMutation(journal)
-            try removeSourceTargets(
-                rootURL: URL(
-                    fileURLWithPath: journal.rootPath,
-                    isDirectory: true
-                ),
+            let rootURL = URL(
+                fileURLWithPath: journal.rootPath,
+                isDirectory: true
+            )
+            let tree = try sourceTree(
+                rootURL: rootURL,
                 rootIdentity: journal.rootIdentity
+            )
+            if journal.tombstones == nil {
+                let manifest = try tree.preflight(
+                    relativeTargets: LegacyIdentity.targets,
+                    budget: .legacyCleanup
+                )
+                let tombstones = try tree.makeTombstones(
+                    manifest: manifest,
+                    relativeTargets: LegacyIdentity.targets
+                )
+                try journalStore.recordTombstones(tombstones)
+                guard case .journal(let updated) = try journalStore.load() else {
+                    throw LegacyCleanupError.invalidJournal
+                }
+                journal = updated
+            }
+            try tree.recoverTombstones(
+                journal.tombstones ?? [],
+                budget: .legacyCleanup,
+                afterRename: { _ in
+                    try self.testEventHandler?(
+                        "afterSourceTombstoneRename"
+                    )
+                }
             )
             if journal.phase == .confirmed || journal.phase == .servicesStopped {
                 try journalStore.advance(to: .sourceTargetsRemoved)
@@ -574,10 +674,24 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             rootURL: rootURL,
             rootIdentity: journal.rootIdentity
         )
-        _ = try tree.preflight(
-            relativeTargets: LegacyIdentity.targets,
+        let tombstoneTargets = journal.tombstones?.map(
+            \.tombstoneRelativePath
+        ) ?? []
+        let manifest = try tree.preflight(
+            relativeTargets: LegacyIdentity.targets + tombstoneTargets,
             budget: .legacyCleanup
         )
+        for tombstone in journal.tombstones ?? [] {
+            let entries = manifest.entriesDeepestFirst.filter {
+                $0.relativePath == tombstone.originalRelativePath
+                    || $0.relativePath == tombstone.tombstoneRelativePath
+            }
+            guard entries.count <= 1,
+                  entries.first?.identity == tombstone.identity || entries.isEmpty
+            else {
+                throw LegacyCleanupError.verificationFailed("tombstone")
+            }
+        }
         try validateRemainingLegacyPlists(rootURL: rootURL)
     }
 
@@ -615,14 +729,15 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
     }
 
     private func preflightAllRemainingTargetsWithoutMutation(
-        _ candidate: LegacyCleanupCandidate
-    ) throws {
-        let tree = try sourceTree(for: candidate)
-        _ = try tree.preflight(
+        _ candidate: LegacyCleanupCandidate,
+        tree: SecureFileTree
+    ) throws -> SecureTreeManifest {
+        let manifest = try tree.preflight(
             relativeTargets: LegacyIdentity.targets,
             budget: .legacyCleanup
         )
         try verifyLegacyPlistIdentities(candidate)
+        return manifest
     }
 
     private func removeSourceTargets(

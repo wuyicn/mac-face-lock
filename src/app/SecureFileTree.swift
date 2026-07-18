@@ -61,6 +61,13 @@ struct SecureTreeManifest: Codable, Equatable, Sendable {
     let entriesDeepestFirst: [SecureTreeEntry]
 }
 
+struct SecureTreeTombstone: Codable, Equatable, Sendable {
+    let originalRelativePath: String
+    let tombstoneRelativePath: String
+    let identity: SecureFileIdentity
+    let kind: SecureTreeEntry.Kind
+}
+
 enum SecureFileTreeError: Error, Equatable {
     case invalidRoot(String)
     case invalidRelativePath(String)
@@ -603,12 +610,271 @@ final class SecureFileTree {
     }
 
     func remove(_ manifest: SecureTreeManifest) throws {
+        let roots = manifest.entriesDeepestFirst.filter { entry in
+            !manifest.entriesDeepestFirst.contains { possibleParent in
+                possibleParent.relativePath != entry.relativePath
+                    && entry.relativePath.hasPrefix(
+                        possibleParent.relativePath + "/"
+                    )
+            }
+        }.map(\.relativePath)
+        let tombstones = try makeTombstones(
+            manifest: manifest,
+            relativeTargets: roots
+        )
+        try remove(manifest, tombstones: tombstones)
+    }
+
+    func makeTombstones(
+        manifest: SecureTreeManifest,
+        relativeTargets: [String],
+        nonce: () -> String = { UUID().uuidString.lowercased() }
+    ) throws -> [SecureTreeTombstone] {
+        guard manifest.rootIdentity == rootIdentity else {
+            throw SecureFileTreeError.identityChanged(rootPath)
+        }
+        let entries = Dictionary(
+            uniqueKeysWithValues: manifest.entriesDeepestFirst.map {
+                ($0.relativePath, $0)
+            }
+        )
+        return try relativeTargets.compactMap { target in
+            _ = try validatedComponents(target)
+            guard let entry = entries[target] else {
+                return nil
+            }
+            let components = try validatedComponents(target)
+            let parent = components.dropLast().joined(separator: "/")
+            let privateName = ".mac-face-lock-delete-\(nonce())"
+            let tombstonePath = parent.isEmpty
+                ? privateName
+                : parent + "/" + privateName
+            return SecureTreeTombstone(
+                originalRelativePath: target,
+                tombstoneRelativePath: tombstonePath,
+                identity: entry.identity,
+                kind: entry.kind
+            )
+        }
+    }
+
+    func remove(
+        _ manifest: SecureTreeManifest,
+        tombstones: [SecureTreeTombstone],
+        beforeRename: ((SecureTreeTombstone) throws -> Void)? = nil,
+        afterRename: ((SecureTreeTombstone) throws -> Void)? = nil
+    ) throws {
         guard manifest.rootIdentity == rootIdentity else {
             throw SecureFileTreeError.identityChanged(rootPath)
         }
         try requireStableRoot()
+        let entries = Dictionary(
+            uniqueKeysWithValues: manifest.entriesDeepestFirst.map {
+                ($0.relativePath, $0)
+            }
+        )
+        for tombstone in tombstones {
+            guard let rootEntry = entries[tombstone.originalRelativePath],
+                  rootEntry.identity == tombstone.identity,
+                  rootEntry.kind == tombstone.kind else {
+                throw SecureFileTreeError.identityChanged(
+                    tombstone.originalRelativePath
+                )
+            }
+            try moveToTombstone(
+                tombstone,
+                entry: rootEntry,
+                beforeRename: beforeRename,
+                afterRename: afterRename
+            )
+            try deleteMovedTree(
+                manifest: manifest,
+                tombstone: tombstone
+            )
+        }
+        try requireStableRoot()
+    }
 
-        for entry in manifest.entriesDeepestFirst {
+    func recoverTombstones(
+        _ tombstones: [SecureTreeTombstone],
+        budget: SecureTreeBudget,
+        beforeRename: ((SecureTreeTombstone) throws -> Void)? = nil,
+        afterRename: ((SecureTreeTombstone) throws -> Void)? = nil
+    ) throws {
+        try requireStableRoot()
+        for tombstone in tombstones {
+            let originalManifest = try preflight(
+                relativeTargets: [tombstone.originalRelativePath],
+                budget: budget
+            )
+            if let original = originalManifest.entriesDeepestFirst.first(
+                where: { $0.relativePath == tombstone.originalRelativePath }
+            ) {
+                guard original.identity == tombstone.identity,
+                      original.kind == tombstone.kind else {
+                    throw SecureFileTreeError.identityChanged(
+                        tombstone.originalRelativePath
+                    )
+                }
+                try moveToTombstone(
+                    tombstone,
+                    entry: original,
+                    beforeRename: beforeRename,
+                    afterRename: afterRename
+                )
+            }
+
+            let movedManifest = try preflight(
+                relativeTargets: [tombstone.tombstoneRelativePath],
+                budget: budget
+            )
+            guard let movedRoot = movedManifest.entriesDeepestFirst.first(
+                where: { $0.relativePath == tombstone.tombstoneRelativePath }
+            ) else {
+                continue
+            }
+            guard movedRoot.identity == tombstone.identity,
+                  movedRoot.kind == tombstone.kind else {
+                throw SecureFileTreeError.identityChanged(
+                    tombstone.tombstoneRelativePath
+                )
+            }
+            try deleteManifestEntries(movedManifest.entriesDeepestFirst)
+        }
+        try requireStableRoot()
+    }
+
+    private func moveToTombstone(
+        _ tombstone: SecureTreeTombstone,
+        entry: SecureTreeEntry,
+        beforeRename: ((SecureTreeTombstone) throws -> Void)?,
+        afterRename: ((SecureTreeTombstone) throws -> Void)?
+    ) throws {
+        let originalComponents = try validatedComponents(
+            tombstone.originalRelativePath
+        )
+        let tombstoneComponents = try validatedComponents(
+            tombstone.tombstoneRelativePath
+        )
+        guard originalComponents.dropLast() == tombstoneComponents.dropLast(),
+              tombstoneComponents.last?.hasPrefix(
+                ".mac-face-lock-delete-"
+              ) == true else {
+            throw SecureFileTreeError.invalidRelativePath(
+                tombstone.tombstoneRelativePath
+            )
+        }
+        let (parentFD, originalName) = try openParent(
+            originalComponents,
+            path: tombstone.originalRelativePath,
+            missingIsAllowed: true
+        )
+        guard parentFD >= 0, let movedName = tombstoneComponents.last else {
+            return
+        }
+        defer { Darwin.close(parentFD) }
+
+        var current = stat()
+        guard fstatat(
+            parentFD,
+            originalName,
+            &current,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0 else {
+            if errno == ENOENT {
+                return
+            }
+            throw SecureFileTreeError.systemCall(
+                "fstatat",
+                tombstone.originalRelativePath,
+                errno
+            )
+        }
+        try validateEntryStat(current, entry: entry)
+        try beforeRename?(tombstone)
+        guard renameatx_np(
+            parentFD,
+            originalName,
+            parentFD,
+            movedName,
+            UInt32(RENAME_EXCL)
+        ) == 0 else {
+            throw SecureFileTreeError.systemCall(
+                "renameatx_np",
+                tombstone.originalRelativePath,
+                errno
+            )
+        }
+        guard fsync(parentFD) == 0 else {
+            throw SecureFileTreeError.systemCall(
+                "fsync",
+                tombstone.originalRelativePath,
+                errno
+            )
+        }
+        try afterRename?(tombstone)
+
+        var moved = stat()
+        guard fstatat(
+            parentFD,
+            movedName,
+            &moved,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0 else {
+            throw SecureFileTreeError.systemCall(
+                "fstatat",
+                tombstone.tombstoneRelativePath,
+                errno
+            )
+        }
+        try validateMovedEntryStat(moved, entry: entry)
+    }
+
+    private func deleteMovedTree(
+        manifest: SecureTreeManifest,
+        tombstone: SecureTreeTombstone
+    ) throws {
+        let movedEntries = manifest.entriesDeepestFirst.compactMap { entry
+            -> SecureTreeEntry? in
+            let original = tombstone.originalRelativePath
+            guard entry.relativePath == original
+                    || entry.relativePath.hasPrefix(original + "/") else {
+                return nil
+            }
+            let suffix = String(entry.relativePath.dropFirst(original.count))
+            return SecureTreeEntry(
+                relativePath: tombstone.tombstoneRelativePath + suffix,
+                identity: entry.identity,
+                kind: entry.kind,
+                fileVersion: entry.fileVersion
+            )
+        }
+        do {
+            try deleteManifestEntries(
+                movedEntries,
+                renamedRootPath: tombstone.tombstoneRelativePath
+            )
+        } catch SecureFileTreeError.identityChanged(let path) {
+            guard path == tombstone.tombstoneRelativePath
+                    || path.hasPrefix(
+                        tombstone.tombstoneRelativePath + "/"
+                    ) else {
+                throw SecureFileTreeError.identityChanged(path)
+            }
+            let suffix = String(
+                path.dropFirst(tombstone.tombstoneRelativePath.count)
+            )
+            throw SecureFileTreeError.identityChanged(
+                tombstone.originalRelativePath + suffix
+            )
+        }
+    }
+
+    private func deleteManifestEntries(
+        _ entries: [SecureTreeEntry],
+        renamedRootPath: String? = nil
+    ) throws {
+        for entry in entries {
             let components = try validatedComponents(entry.relativePath)
             let (parentFD, name) = try openParent(
                 components,
@@ -618,12 +884,54 @@ final class SecureFileTree {
             guard parentFD >= 0 else {
                 continue
             }
-            do {
-                defer { Darwin.close(parentFD) }
-                try removeEntry(parentFD: parentFD, name: name, entry: entry)
+            defer { Darwin.close(parentFD) }
+            try removeEntry(
+                parentFD: parentFD,
+                name: name,
+                entry: entry,
+                allowRenameCtimeChange:
+                    entry.relativePath == renamedRootPath
+            )
+        }
+    }
+
+    private func validateEntryStat(
+        _ current: stat,
+        entry: SecureTreeEntry
+    ) throws {
+        let (identity, kind) = try Self.checkedIdentity(
+            current,
+            path: entry.relativePath,
+            requiredOwner: requiredOwner
+        )
+        guard identity == entry.identity,
+              kind == entry.kind,
+              Self.fileVersion(current, kind: kind) == entry.fileVersion else {
+            throw SecureFileTreeError.identityChanged(entry.relativePath)
+        }
+    }
+
+    private func validateMovedEntryStat(
+        _ current: stat,
+        entry: SecureTreeEntry
+    ) throws {
+        let (identity, kind) = try Self.checkedIdentity(
+            current,
+            path: entry.relativePath,
+            requiredOwner: requiredOwner
+        )
+        guard identity == entry.identity, kind == entry.kind else {
+            throw SecureFileTreeError.identityChanged(entry.relativePath)
+        }
+        if let expected = entry.fileVersion {
+            guard let actual = Self.fileVersion(current, kind: kind),
+                  actual.logicalSize == expected.logicalSize,
+                  actual.modificationSeconds == expected.modificationSeconds,
+                  actual.modificationNanoseconds
+                    == expected.modificationNanoseconds else {
+                throw SecureFileTreeError.identityChanged(entry.relativePath)
             }
         }
-        try requireStableRoot()
     }
 
     private static func checkedIdentity(
@@ -1140,7 +1448,8 @@ final class SecureFileTree {
     private func removeEntry(
         parentFD: Int32,
         name: String,
-        entry: SecureTreeEntry
+        entry: SecureTreeEntry,
+        allowRenameCtimeChange: Bool = false
     ) throws {
         var current = stat()
         guard fstatat(parentFD, name, &current, AT_SYMLINK_NOFOLLOW) == 0 else {
@@ -1154,11 +1463,20 @@ final class SecureFileTree {
             path: entry.relativePath,
             requiredOwner: requiredOwner
         )
-        guard
-            currentIdentity == entry.identity,
-            currentKind == entry.kind,
-            Self.fileVersion(current, kind: currentKind) == entry.fileVersion
-        else {
+        guard currentIdentity == entry.identity,
+              currentKind == entry.kind else {
+            throw SecureFileTreeError.identityChanged(entry.relativePath)
+        }
+        if allowRenameCtimeChange, let expected = entry.fileVersion {
+            guard let actual = Self.fileVersion(current, kind: currentKind),
+                  actual.logicalSize == expected.logicalSize,
+                  actual.modificationSeconds == expected.modificationSeconds,
+                  actual.modificationNanoseconds
+                    == expected.modificationNanoseconds else {
+                throw SecureFileTreeError.identityChanged(entry.relativePath)
+            }
+        } else if Self.fileVersion(current, kind: currentKind)
+                    != entry.fileVersion {
             throw SecureFileTreeError.identityChanged(entry.relativePath)
         }
         let flags = entry.kind == .directory ? AT_REMOVEDIR : 0

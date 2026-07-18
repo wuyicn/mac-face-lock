@@ -526,6 +526,7 @@ struct LegacyInstallCleanerTests {
         try await testLoadedServiceBlocksDeletion()
         try await testSourceDeletionFailurePreservesPlists()
         try await testFailureAfterSourceDeletionIsIncomplete()
+        try await testRetryRecoversInterruptedSourceTombstone()
         try await testInitialPlistReplacementBlocksDeletion()
         try await testInitialInPlacePlistMutationBlocksDeletion()
         try await testRetryPlistReplacementBlocksDeletion()
@@ -1160,6 +1161,35 @@ struct LegacyInstallCleanerTests {
             persistedAgent == replacementData,
             "replacement release Agent plist was changed"
         )
+    }
+
+    private static func testRetryRecoversInterruptedSourceTombstone() async throws {
+        let fixture = try LegacyCleanerFixture(testEventHandler: { event in
+            if event == "afterSourceTombstoneRename" {
+                throw TestFailure.assertion("simulated source interruption")
+            }
+        })
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        let candidate = try fixture.confirmedCandidate()
+
+        guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion(
+                "interruption after source rename was not retryable"
+            )
+        }
+        let journal = try fixture.journalObject()
+        guard let tombstones = journal["tombstones"] as? [[String: Any]],
+              !tombstones.isEmpty else {
+            throw TestFailure.assertion(
+                "interrupted cleanup did not journal tombstone identities"
+            )
+        }
+
+        let retryCleaner = fixture.makeCleaner(userID: getuid())
+        let result = await retryCleaner.retry()
+        try require(result == .notFound, "tombstone recovery did not complete")
+        try fixture.requireAllowlistedTargetsAbsent()
     }
 
     private static func testInitialInPlacePlistMutationBlocksDeletion() async throws {

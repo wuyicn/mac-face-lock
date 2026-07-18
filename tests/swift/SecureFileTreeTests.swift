@@ -77,6 +77,8 @@ struct SecureFileTreeTests {
         try testEnforcesEntryAndByteBudgets()
         try testReadLimitIsEnforced()
         try testIdentityReplacementBlocksRemoval()
+        try testReplacementInsideFinalWindowIsNotDeleted()
+        try testInterruptedTombstoneIsRecoveredSafely()
         try testInPlaceMutationBlocksRemoval()
         try testDescriptorBoundAtomicFileRoundTrip()
         try testDescriptorBoundWriteRejectsUnsafeNames()
@@ -408,13 +410,115 @@ struct SecureFileTreeTests {
             try tree.remove(manifest)
             throw TestFailure.assertion("replacement was deleted")
         } catch SecureFileTreeError.identityChanged("data/state.json") {
+            let privateReplacement = try FileManager.default
+                .contentsOfDirectory(
+                    at: fixture.root,
+                    includingPropertiesForKeys: nil
+                )
+                .first {
+                    $0.lastPathComponent.hasPrefix(
+                        ".mac-face-lock-delete-"
+                    )
+                }?
+                .appendingPathComponent("state.json")
             try require(
                 FileManager.default.fileExists(
                     atPath: fixture.root.appendingPathComponent("data/state.json").path
+                ) || (
+                    privateReplacement.map {
+                        FileManager.default.fileExists(atPath: $0.path)
+                    } ?? false
                 ),
                 "replacement was removed after identity mismatch"
             )
         }
+    }
+
+    private static func testReplacementInsideFinalWindowIsNotDeleted() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        try fixture.write("data/state.json", bytes: [1])
+        let tree = try makeTree(fixture)
+        let manifest = try tree.preflight(
+            relativeTargets: ["data/state.json"],
+            budget: .legacyCleanup
+        )
+        let tombstones = try tree.makeTombstones(
+            manifest: manifest,
+            relativeTargets: ["data/state.json"],
+            nonce: { "race" }
+        )
+        let original = fixture.root.appendingPathComponent("data/state.json")
+        do {
+            try tree.remove(
+                manifest,
+                tombstones: tombstones,
+                beforeRename: { _ in
+                    try FileManager.default.removeItem(at: original)
+                    try fixture.write("data/state.json", bytes: [9])
+                }
+            )
+            throw TestFailure.assertion("unmanifested replacement was deleted")
+        } catch SecureFileTreeError.identityChanged {
+            let moved = fixture.root.appendingPathComponent(
+                tombstones[0].tombstoneRelativePath
+            )
+            try require(
+                FileManager.default.fileExists(atPath: moved.path),
+                "unmanifested inode was deleted after atomic rename"
+            )
+            let movedData = try Data(contentsOf: moved)
+            try require(
+                movedData == Data([9]),
+                "moved unmanifested inode contents changed"
+            )
+        }
+    }
+
+    private static func testInterruptedTombstoneIsRecoveredSafely() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        try fixture.write("logs/event.json", bytes: [7])
+        let tree = try makeTree(fixture)
+        let manifest = try tree.preflight(
+            relativeTargets: ["logs"],
+            budget: .legacyCleanup
+        )
+        let tombstones = try tree.makeTombstones(
+            manifest: manifest,
+            relativeTargets: ["logs"],
+            nonce: { "interrupted" }
+        )
+        do {
+            try tree.remove(
+                manifest,
+                tombstones: tombstones,
+                afterRename: { _ in
+                    throw TestFailure.assertion("simulated interruption")
+                }
+            )
+            throw TestFailure.assertion("interruption did not stop removal")
+        } catch TestFailure.assertion("simulated interruption") {
+            // Expected.
+        }
+        try require(
+            FileManager.default.fileExists(
+                atPath: fixture.root.appendingPathComponent(
+                    tombstones[0].tombstoneRelativePath
+                ).path
+            ),
+            "interrupted tombstone was lost"
+        )
+
+        try tree.recoverTombstones(tombstones, budget: .legacyCleanup)
+        try require(
+            !FileManager.default.fileExists(
+                atPath: fixture.root.appendingPathComponent(
+                    tombstones[0].tombstoneRelativePath
+                ).path
+            ),
+            "safe retry did not remove the verified tombstone"
+        )
     }
 
     private static func testInPlaceMutationBlocksRemoval() throws {
