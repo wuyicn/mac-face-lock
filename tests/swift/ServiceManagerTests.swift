@@ -289,7 +289,10 @@ private struct ServiceFixture {
 struct ServiceManagerTests {
     static func main() async throws {
         try testProductionHealthWindowCoversPermissionAndHeartbeatStartup()
-        try await testReleaseHealthReadsOnlyCurrentManagedFiles()
+        try await testInstallReadsOnlyCurrentManagedFiles()
+        try await testStatusReadsOnlyCurrentManagedFiles()
+        try await testRestartReadsNoFiles()
+        try await testUninstallReadsNoFiles()
         try await testInstallRendersOnlyApplicationAndSupportPaths()
         try await testFailedStableHealthRestoresPreviousPlistAndJob()
         try await testUninstallPreservesApplicationData()
@@ -322,27 +325,89 @@ struct ServiceManagerTests {
         )
     }
 
-    private static func testReleaseHealthReadsOnlyCurrentManagedFiles() async throws {
-        let fixture = try ServiceFixture(printPIDs: [42, 42, 42, 42])
-        try fixture.seedHealthyStateSequence(sequences: [1, 2, 3, 4])
-        let manager = fixture.manager()
+    private static func testInstallReadsOnlyCurrentManagedFiles() async throws {
+        let fixture = try ServiceFixture(printPIDs: [42, 42, 42])
+        try fixture.seedHealthyStateSequence(sequences: [1, 2, 3])
 
-        try await manager.install(
+        try await fixture.manager().install(
             appURL: fixture.appURL,
             supportURL: fixture.supportURL
         )
-        let status = await manager.status()
+
+        try requireReadBoundary(
+            fixture,
+            operation: "install",
+            allowedReadPaths: [
+                fixture.templateURL.standardizedFileURL.path,
+                fixture.plistURL.standardizedFileURL.path,
+                fixture.stateURL.standardizedFileURL.path,
+            ]
+        )
+    }
+
+    private static func testStatusReadsOnlyCurrentManagedFiles() async throws {
+        let fixture = try ServiceFixture(loaded: true, printPIDs: [42])
+        try seedInstalledReleaseAgent(in: fixture)
+        try fixture.seedHealthyState()
+
+        let status = await fixture.manager().status()
 
         try require(status.isHealthy, "current release Agent did not report healthy")
+        try requireReadBoundary(
+            fixture,
+            operation: "status",
+            allowedReadPaths: [
+                fixture.plistURL.standardizedFileURL.path,
+                fixture.stateURL.standardizedFileURL.path,
+            ]
+        )
+    }
+
+    private static func testRestartReadsNoFiles() async throws {
+        let fixture = try ServiceFixture()
+
+        try await fixture.manager().restart()
+
+        try requireReadBoundary(
+            fixture,
+            operation: "restart",
+            allowedReadPaths: []
+        )
+    }
+
+    private static func testUninstallReadsNoFiles() async throws {
+        let fixture = try ServiceFixture(loaded: true)
+        fixture.fileSystem.seed(Data("current plist".utf8), at: fixture.plistURL)
+
+        try await fixture.manager().uninstallPreservingData()
+
+        try requireReadBoundary(
+            fixture,
+            operation: "uninstall",
+            allowedReadPaths: []
+        )
+    }
+
+    private static func seedInstalledReleaseAgent(
+        in fixture: ServiceFixture
+    ) throws {
+        let rendered = try renderTemplate(
+            try ServiceFixture.templateData(),
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        fixture.fileSystem.seed(rendered, at: fixture.plistURL)
+    }
+
+    private static func requireReadBoundary(
+        _ fixture: ServiceFixture,
+        operation: String,
+        allowedReadPaths: Set<String>
+    ) throws {
         let actualReadPaths = Set(fixture.fileSystem.readPaths)
-        let expectedReadPaths: Set<String> = [
-            fixture.templateURL.standardizedFileURL.path,
-            fixture.plistURL.standardizedFileURL.path,
-            fixture.stateURL.standardizedFileURL.path,
-        ]
         try require(
-            actualReadPaths == expectedReadPaths,
-            "release health read outside current managed files: "
+            actualReadPaths == allowedReadPaths,
+            "\(operation) read outside current managed files: "
                 + actualReadPaths.sorted().joined(separator: ", ")
         )
 
@@ -350,18 +415,25 @@ struct ServiceManagerTests {
             "com.wuyi.mac-face-lock-status.plist"
         ).standardizedFileURL.path
         try require(
-            !fixture.fileSystem.readPaths.contains(legacyStatusPlist),
-            "release health read the legacy status LaunchAgent plist"
+            !actualReadPaths.contains(legacyStatusPlist),
+            "\(operation) read the legacy status LaunchAgent plist"
         )
         let launchAgentsPrefix = fixture.launchAgentsURL.standardizedFileURL.path + "/"
-        let launchAgentReadPaths = Set(
-            fixture.fileSystem.readPaths.filter {
-                $0.hasPrefix(launchAgentsPrefix)
-            }
+        let launchAgentReadPaths = actualReadPaths.filter {
+            $0.hasPrefix(launchAgentsPrefix)
+        }
+        let allowedLaunchAgentReadPaths = allowedReadPaths.filter {
+            $0.hasPrefix(launchAgentsPrefix)
+        }
+        try require(
+            launchAgentReadPaths == allowedLaunchAgentReadPaths,
+            "\(operation) read an extra LaunchAgents file"
         )
         try require(
-            launchAgentReadPaths == [fixture.plistURL.standardizedFileURL.path],
-            "release health read an extra LaunchAgents file"
+            launchAgentReadPaths.isSubset(
+                of: [fixture.plistURL.standardizedFileURL.path]
+            ),
+            "\(operation) read a non-current LaunchAgents plist"
         )
     }
 

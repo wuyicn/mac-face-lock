@@ -66,6 +66,9 @@ DIRECTORY_ENUMERATION_CAPABILITIES = {
     "enumerator(": re.compile(r"\benumerator\s*\("),
     "subpathsOfDirectory": re.compile(r"\bsubpathsOfDirectory\s*\("),
 }
+NORMALIZED_DIRECTORY_ENUMERATION_CAPABILITIES = {
+    "subpaths(atPath:)": "subpathsatPath",
+}
 FILE_READ_CAPABILITIES = {
     "Data(contentsOf:)": (
         re.compile(r"\bData\s*\(\s*contentsOf\s*:"),
@@ -144,6 +147,15 @@ def collect_policy_violations(sources: dict[str, str]) -> list[str]:
                         f"{source_name}: directory-enumeration capability "
                         f"'{capability}' is forbidden"
                     )
+            for (
+                capability,
+                normalized_needle,
+            ) in NORMALIZED_DIRECTORY_ENUMERATION_CAPABILITIES.items():
+                if normalized_needle in searchable_content:
+                    violations.append(
+                        f"{source_name}: directory-enumeration capability "
+                        f"'{capability}' is forbidden"
+                    )
             for capability, policy in FILE_READ_CAPABILITIES.items():
                 expression, allowed_sources = policy
                 if expression.search(content) and source_name not in allowed_sources:
@@ -199,6 +211,24 @@ def collect_policy_violations(sources: dict[str, str]) -> list[str]:
 
 
 class LegacyMigrationDeferralTests(unittest.TestCase):
+    def test_directory_enumeration_rejects_whitespace_subpaths_at_path(
+        self,
+    ) -> None:
+        sources = load_policy_sources()
+        sources["src/app/LegacyProbe.swift"] = """
+let legacyEntries = fileManager.subpaths (
+    atPath : legacyRoot.path
+)
+"""
+
+        violations = collect_policy_violations(sources)
+
+        self.assertIn(
+            "src/app/LegacyProbe.swift: directory-enumeration capability "
+            "'subpaths(atPath:)' is forbidden",
+            violations,
+        )
+
     def test_file_read_capability_rejects_chained_launchagents_helper(self) -> None:
         sources = load_policy_sources()
         sources["src/app/LegacyProbe.swift"] = """
