@@ -2,11 +2,27 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-UV_BIN="${UV_BIN:-$(command -v uv)}"
+UV_REQUIRED_VERSION="0.11.13"
+UV_BIN="${UV_BIN:-$(command -v uv || true)}"
 BUILD_DIR="$ROOT_DIR/.build"
 VENV_DIR="$BUILD_DIR/runtime-python311"
 DIST_DIR="$ROOT_DIR/dist/runtime"
-STAGED_SOURCE="/tmp/mac-face-lock-runtime-build"
+mkdir -p "$BUILD_DIR"
+STAGED_SOURCE="$(mktemp -d "${TMPDIR:-/tmp}/mac-face-lock-runtime-build.XXXXXX")"
+cleanup() {
+  rm -rf "$STAGED_SOURCE"
+}
+trap cleanup EXIT
+
+if [[ -z "$UV_BIN" || ! -x "$UV_BIN" ]]; then
+  echo "uv $UV_REQUIRED_VERSION is required; install the pinned uv prerequisite." >&2
+  exit 69
+fi
+ACTUAL_UV_VERSION="$("$UV_BIN" --version | awk '{ print $2 }')"
+if [[ "$ACTUAL_UV_VERSION" != "$UV_REQUIRED_VERSION" ]]; then
+  echo "uv $UV_REQUIRED_VERSION is required; found $ACTUAL_UV_VERSION." >&2
+  exit 69
+fi
 
 export PYTHONHASHSEED=0
 export MACOSX_DEPLOYMENT_TARGET=12.0
@@ -28,7 +44,6 @@ PY
 
 rm -rf "$DIST_DIR" "$BUILD_DIR/pyinstaller"
 mkdir -p "$DIST_DIR" "$BUILD_DIR/pyinstaller"
-rm -rf "$STAGED_SOURCE"
 mkdir -p "$STAGED_SOURCE/packaging"
 cp "$ROOT_DIR"/*.py "$STAGED_SOURCE/"
 cp "$ROOT_DIR/packaging/mac-face-lock-runtime.spec" "$STAGED_SOURCE/packaging/"

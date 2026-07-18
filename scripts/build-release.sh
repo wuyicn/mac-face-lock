@@ -4,13 +4,19 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="0.2.0-beta"
 RELEASE_DIR="$ROOT_DIR/dist/release"
-STAGING_DIR="$ROOT_DIR/.build/release-staging"
+mkdir -p "$ROOT_DIR/.build"
+BUILD_WORK_DIR="$(mktemp -d "$ROOT_DIR/.build/release.XXXXXX")"
+cleanup() {
+  rm -rf "$BUILD_WORK_DIR"
+}
+trap cleanup EXIT
+STAGING_DIR="$BUILD_WORK_DIR/staging"
 APP="$STAGING_DIR/Mac Face Lock.app"
 RESOURCES="$APP/Contents/Resources"
 ZIP="$RELEASE_DIR/Mac-Face-Lock-$VERSION-arm64.zip"
 CHECKSUM="$ZIP.sha256"
 
-rm -rf "$STAGING_DIR" "$RELEASE_DIR"
+rm -rf "$RELEASE_DIR"
 mkdir -p "$STAGING_DIR" "$RELEASE_DIR"
 
 "$ROOT_DIR/scripts/build-runtime.sh"
@@ -29,6 +35,9 @@ cp "$ROOT_DIR/LICENSE" "$RESOURCES/LICENSE"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$RESOURCES/THIRD_PARTY_NOTICES.md"
 cp "$ROOT_DIR/docs/legacy-install-resolution.md" \
   "$RESOURCES/help/legacy-install-resolution.md"
+"$ROOT_DIR/.build/runtime-python311/bin/python" \
+  "$ROOT_DIR/scripts/collect-release-licenses.py" \
+  "$RESOURCES/licenses"
 
 while IFS= read -r code_path; do
   codesign --sign - --force "$code_path" >/dev/null 2>&1
@@ -43,44 +52,14 @@ codesign --sign - --force --deep \
   "$APP/Contents/Library/LoginItems/Mac Face Lock Agent.app" >/dev/null
 
 MANIFEST="$RESOURCES/BuildManifest.json"
-"$ROOT_DIR/.build/runtime-python311/bin/python" - "$APP" "$MANIFEST" <<'PY'
-import hashlib
-import json
-import sys
-from pathlib import Path
-
-app = Path(sys.argv[1])
-manifest = Path(sys.argv[2])
-files = []
-for path in sorted(app.rglob("*")):
-    if not path.is_file() or path.is_symlink() or path == manifest:
-        continue
-    files.append(
-        {
-            "path": path.relative_to(app).as_posix(),
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        }
-    )
-manifest.write_text(
-    json.dumps(
-        {
-            "schema_version": 1,
-            "version": "0.2.0-beta",
-            "architecture": "arm64",
-            "minimum_macos": "12.0",
-            "files": files,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    + "\n",
-    encoding="utf-8",
-)
-PY
-
+# Establish every signature path before recording the exact exclusion set.
+codesign --sign - --force --deep "$APP" >/dev/null
+"$ROOT_DIR/.build/runtime-python311/bin/python" \
+  "$ROOT_DIR/scripts/release-manifest.py" generate "$APP" "$MANIFEST"
 codesign --sign - --force --deep "$APP" >/dev/null
 codesign --verify --deep --strict "$APP"
+"$ROOT_DIR/.build/runtime-python311/bin/python" \
+  "$ROOT_DIR/scripts/release-manifest.py" verify "$APP" "$MANIFEST"
 
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 (
@@ -92,8 +71,7 @@ ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
   shasum -a 256 -c "$(basename "$CHECKSUM")"
 )
 
-EXTRACTED="$ROOT_DIR/.build/release-extracted"
-rm -rf "$EXTRACTED"
+EXTRACTED="$BUILD_WORK_DIR/extracted"
 mkdir -p "$EXTRACTED"
 ditto -x -k "$ZIP" "$EXTRACTED"
 codesign --verify --deep --strict "$EXTRACTED/Mac Face Lock.app"

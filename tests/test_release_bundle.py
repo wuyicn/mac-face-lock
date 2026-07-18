@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import plistlib
@@ -20,12 +21,91 @@ BUILD_LOCK = PROJECT_DIR / "requirements-build-lock.txt"
 RUNTIME_SPEC = PROJECT_DIR / "packaging" / "mac-face-lock-runtime.spec"
 BUILD_RUNTIME = PROJECT_DIR / "scripts" / "build-runtime.sh"
 BUILD_RELEASE = PROJECT_DIR / "scripts" / "build-release.sh"
+MANIFEST_TOOL = PROJECT_DIR / "scripts" / "release-manifest.py"
+RELEASE_WORKFLOW = PROJECT_DIR / ".github/workflows/release-artifact.yml"
 RELEASE_ROOT = PROJECT_DIR / "dist" / "release"
 ZIP_PATH = RELEASE_ROOT / "Mac-Face-Lock-0.2.0-beta-arm64.zip"
 CHECKSUM_PATH = ZIP_PATH.with_suffix(ZIP_PATH.suffix + ".sha256")
+UV_ACTION_SHA = "08807647e7069bb48b6ef5acd8ec9567f424441b"
+UV_VERSION = "0.11.13"
+REQUIRED_LICENSES = (
+    "Python/LICENSE.txt",
+    "NumPy/LICENSE.txt",
+    "opencv-python/LICENSE.txt",
+    "opencv-python/LICENSE-3RD-PARTY.txt",
+    "pynput/COPYING.LGPL",
+    "six/LICENSE",
+    "PyObjC/LICENSE.txt",
+)
+
+
+def find_forbidden_token(path: Path, tokens: tuple[bytes, ...]) -> bytes | None:
+    longest = max((len(token) for token in tokens), default=1)
+    carry = b""
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            data = carry + chunk
+            for token in tokens:
+                if token in data:
+                    return token
+            carry = data[-(longest - 1):] if longest > 1 else b""
+    return None
 
 
 class ReleaseBundlePolicyTests(unittest.TestCase):
+    def test_manual_release_workflow_declares_pinned_uv(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            f"astral-sh/setup-uv@{UV_ACTION_SHA}",
+            workflow,
+        )
+        self.assertIn(f'version: "{UV_VERSION}"', workflow)
+        self.assertIn("contents: read", workflow)
+        self.assertNotIn("contents: write", workflow)
+
+    def test_build_runtime_fails_cleanly_when_uv_is_not_on_path(self) -> None:
+        environment = os.environ.copy()
+        environment.pop("UV_BIN", None)
+        environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        result = subprocess.run(
+            [str(BUILD_RUNTIME)],
+            cwd=PROJECT_DIR,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            f"uv {UV_VERSION} is required",
+            result.stderr,
+        )
+
+    def test_release_build_uses_ephemeral_cleaned_staging(self) -> None:
+        runtime = BUILD_RUNTIME.read_text(encoding="utf-8")
+        release = BUILD_RELEASE.read_text(encoding="utf-8")
+        self.assertNotIn('STAGED_SOURCE="/tmp/mac-face-lock-runtime-build"', runtime)
+        self.assertNotIn('STAGING_DIR="$ROOT_DIR/.build/release-staging"', release)
+        self.assertNotIn('EXTRACTED="$ROOT_DIR/.build/release-extracted"', release)
+        for script in (runtime, release):
+            self.assertIn("mktemp -d", script)
+            self.assertIn("trap ", script)
+
+    def test_path_scan_has_no_file_size_bypass(self) -> None:
+        source = inspect.getsource(
+            ExtractedReleaseBundleTests
+            .test_bundle_contains_no_developer_or_python_dependency_paths
+        )
+        self.assertNotIn("20_000_000", source)
+        with tempfile.TemporaryDirectory() as directory:
+            large = Path(directory) / "large.bin"
+            with large.open("wb") as handle:
+                handle.seek(21 * 1024 * 1024)
+                handle.write(b"/usr/bin/python")
+            self.assertEqual(
+                find_forbidden_token(large, (b"/usr/bin/python",)),
+                b"/usr/bin/python",
+            )
+
     def test_build_inputs_pin_python311_and_pyinstaller6210(self) -> None:
         self.assertEqual(
             BUILD_REQUIREMENTS.read_text(encoding="utf-8").strip(),
@@ -61,6 +141,66 @@ class ReleaseBundlePolicyTests(unittest.TestCase):
             "shasum",
         ):
             self.assertIn(token, release)
+        self.assertIn("release-manifest.py", release)
+        self.assertIn('"$RESOURCES/licenses"', release)
+
+    def test_third_party_notices_enumerate_bundled_license_files(self) -> None:
+        notices = (PROJECT_DIR / "THIRD_PARTY_NOTICES.md").read_text(
+            encoding="utf-8"
+        )
+        for relative in REQUIRED_LICENSES:
+            self.assertIn(f"`licenses/{relative}`", notices)
+        for component in (
+            "pyobjc-core",
+            "pyobjc-framework-ApplicationServices",
+            "pyobjc-framework-Cocoa",
+            "pyobjc-framework-CoreText",
+            "pyobjc-framework-Quartz",
+        ):
+            self.assertIn(component, notices)
+
+
+class ReleaseManifestToolTests(unittest.TestCase):
+    def run_tool(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["python3", str(MANIFEST_TOOL), *arguments],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_manifest_scope_is_non_cyclic_and_mutation_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory) / "Fixture.app"
+            payload = app / "Contents/Resources/defaults/config.json"
+            signature = app / "Contents/_CodeSignature/CodeResources"
+            executable = app / "Contents/MacOS/Fixture"
+            payload.parent.mkdir(parents=True)
+            signature.parent.mkdir(parents=True)
+            executable.parent.mkdir(parents=True)
+            payload.write_text('{"ok":true}\n', encoding="utf-8")
+            signature.write_text("signature\n", encoding="utf-8")
+            executable.write_bytes(bytes.fromhex("cffaedfe") + b"\0" * 64)
+            manifest = app / "Contents/Resources/BuildManifest.json"
+
+            generated = self.run_tool("generate", str(app), str(manifest))
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            verified = self.run_tool("verify", str(app), str(manifest))
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(document["schema_version"], 2)
+            self.assertEqual(document["scope"], "final_non_code_payload")
+            self.assertEqual(
+                {item["reason"] for item in document["excluded_files"]},
+                {"manifest_self", "code_signature", "mach_o_code"},
+            )
+            self.assertEqual(len(document["files"]), 1)
+
+            payload.write_text('{"ok":false}\n', encoding="utf-8")
+            mutated = self.run_tool("verify", str(app), str(manifest))
+            self.assertNotEqual(mutated.returncode, 0)
+            self.assertIn("digest mismatch", mutated.stderr)
 
 
 class ExtractedReleaseBundleTests(unittest.TestCase):
@@ -109,8 +249,14 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
         manifest = json.loads(
             (contents / "Resources/BuildManifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["scope"], "final_non_code_payload")
         self.assertTrue(manifest["files"])
+        licenses = contents / "Resources/licenses"
+        for relative in REQUIRED_LICENSES:
+            path = licenses / relative
+            self.assertTrue(path.is_file(), relative)
+            self.assertGreater(path.stat().st_size, 100, relative)
         plist = plistlib.loads(
             (
                 contents
@@ -128,11 +274,29 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
             b"/opt/homebrew/bin/python",
         )
         for path in self.app.rglob("*"):
-            if not path.is_file() or path.is_symlink() or path.stat().st_size > 20_000_000:
+            if not path.is_file() or path.is_symlink():
                 continue
-            data = path.read_bytes()
-            for token in forbidden:
-                self.assertNotIn(token, data, str(path.relative_to(self.app)))
+            found = find_forbidden_token(path, forbidden)
+            self.assertIsNone(
+                found,
+                f"{path.relative_to(self.app)} contains {found!r}",
+            )
+
+    def test_manifest_matches_every_final_scoped_digest(self) -> None:
+        manifest = self.app / "Contents/Resources/BuildManifest.json"
+        result = subprocess.run(
+            ["python3", str(MANIFEST_TOOL), "verify", str(self.app), str(manifest)],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertGreater(len(document["files"]), 50)
+        self.assertEqual(
+            {item["reason"] for item in document["excluded_files"]},
+            {"manifest_self", "code_signature", "mach_o_code"},
+        )
 
     def test_extracted_release_environment_launches_without_developer_tools(self) -> None:
         executable = self.app / "Contents/MacOS/MacFaceLock"

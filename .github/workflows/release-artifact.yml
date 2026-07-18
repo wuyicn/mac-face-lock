@@ -19,8 +19,13 @@ jobs:
           cache-dependency-path: |
             requirements-lock.txt
             requirements-build-lock.txt
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.13"
       - name: Verify pinned release builder
         run: |
+          uv --version | grep -Fx "uv 0.11.13"
           grep -Fx "PyInstaller==6.21.0" requirements-build.txt
           python -m pip install \
             -r requirements-lock.txt \
