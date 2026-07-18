@@ -22,6 +22,7 @@ RUNTIME_SPEC = PROJECT_DIR / "packaging" / "mac-face-lock-runtime.spec"
 BUILD_RUNTIME = PROJECT_DIR / "scripts" / "build-runtime.sh"
 BUILD_RELEASE = PROJECT_DIR / "scripts" / "build-release.sh"
 MANIFEST_TOOL = PROJECT_DIR / "scripts" / "release-manifest.py"
+MANUAL_ACCEPTANCE = PROJECT_DIR / "scripts" / "manual-release-acceptance.sh"
 RELEASE_WORKFLOW = PROJECT_DIR / ".github/workflows/release-artifact.yml"
 RELEASE_ROOT = PROJECT_DIR / "dist" / "release"
 ZIP_PATH = RELEASE_ROOT / "Mac-Face-Lock-0.2.0-beta-arm64.zip"
@@ -53,6 +54,43 @@ def find_forbidden_token(path: Path, tokens: tuple[bytes, ...]) -> bytes | None:
 
 
 class ReleaseBundlePolicyTests(unittest.TestCase):
+    def test_manual_acceptance_checklist_is_executable_and_non_mutating(self) -> None:
+        self.assertTrue(MANUAL_ACCEPTANCE.is_file())
+        self.assertTrue(os.access(MANUAL_ACCEPTANCE, os.X_OK))
+        source = MANUAL_ACCEPTANCE.read_text(encoding="utf-8")
+        for forbidden in (
+            "dscl",
+            "sysadminctl",
+            "tccutil",
+            "sudo",
+            "launchctl",
+            "open -a",
+            "MacFaceLock\"",
+        ):
+            self.assertNotIn(forbidden, source)
+
+        result = subprocess.run(
+            [str(MANUAL_ACCEPTANCE), "--print-only"],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for token in (
+            "新建的普通测试账户",
+            "Codex、Python、Xcode",
+            "Finder",
+            "右键",
+            "摄像头",
+            "录入本人",
+            "安全测试",
+            "重新登录",
+            "撤销并恢复",
+            "卸载后台服务并保留数据",
+            "PENDING",
+        ):
+            self.assertIn(token, result.stdout)
+
     def test_manual_release_workflow_declares_pinned_uv(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(
