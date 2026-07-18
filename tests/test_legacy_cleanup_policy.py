@@ -61,10 +61,20 @@ SWIFT_SENSITIVE_ANCHOR_BUDGETS = {
         f'Text("{NOTICE}")',
     ),
 }
+SECURE_FILE_TREE_SOURCE = "src/app/SecureFileTree.swift"
 DIRECTORY_ENUMERATION_CAPABILITIES = {
-    "contentsOfDirectory": re.compile(r"\bcontentsOfDirectory\s*\("),
-    "enumerator(": re.compile(r"\benumerator\s*\("),
-    "subpathsOfDirectory": re.compile(r"\bsubpathsOfDirectory\s*\("),
+    "contentsOfDirectory": (
+        re.compile(r"\bcontentsOfDirectory\s*\("),
+        frozenset(),
+    ),
+    "enumerator(": (
+        re.compile(r"\benumerator\s*\("),
+        frozenset(),
+    ),
+    "subpathsOfDirectory": (
+        re.compile(r"\bsubpathsOfDirectory\s*\("),
+        frozenset(),
+    ),
 }
 NORMALIZED_DIRECTORY_ENUMERATION_CAPABILITIES = {
     "subpaths(atPath:)": "subpathsatPath",
@@ -97,14 +107,34 @@ FILE_READ_CAPABILITIES = {
             r"(?:\b(?:Darwin|Glibc)\s*\.\s*open|(?<![\w.])open)"
             r"\s*\(\s*[^,\n]+,\s*(?:O_[A-Z0-9_| ]+|[0-9]+)"
         ),
-        frozenset(),
+        frozenset({SECURE_FILE_TREE_SOURCE}),
+    ),
+    "Darwin/POSIX openat": (
+        re.compile(r"(?<![\w.])openat\s*\("),
+        frozenset({SECURE_FILE_TREE_SOURCE}),
     ),
     "Darwin/POSIX read": (
         re.compile(
             r"(?:\b(?:Darwin|Glibc)\s*\.\s*read|(?<![\w.])read)"
             r"\s*\(\s*[^,\n]+,\s*[^,\n]+,\s*[^)\n]+\)"
         ),
-        frozenset(),
+        frozenset({SECURE_FILE_TREE_SOURCE}),
+    ),
+    "Darwin/POSIX fstatat": (
+        re.compile(r"(?<![\w.])fstatat\s*\("),
+        frozenset({SECURE_FILE_TREE_SOURCE}),
+    ),
+    "Darwin/POSIX fdopendir": (
+        re.compile(r"(?<![\w.])fdopendir\s*\("),
+        frozenset({SECURE_FILE_TREE_SOURCE}),
+    ),
+    "Darwin/POSIX readdir": (
+        re.compile(r"(?<![\w.])readdir\s*\("),
+        frozenset({SECURE_FILE_TREE_SOURCE}),
+    ),
+    "Darwin/POSIX unlinkat": (
+        re.compile(r"(?<![\w.])unlinkat\s*\("),
+        frozenset({SECURE_FILE_TREE_SOURCE}),
     ),
 }
 
@@ -141,8 +171,9 @@ def collect_policy_violations(sources: dict[str, str]) -> list[str]:
         )
         if is_swift:
             normalized_swift_sources[source_name] = searchable_content
-            for capability, expression in DIRECTORY_ENUMERATION_CAPABILITIES.items():
-                if expression.search(content):
+            for capability, policy in DIRECTORY_ENUMERATION_CAPABILITIES.items():
+                expression, allowed_sources = policy
+                if expression.search(content) and source_name not in allowed_sources:
                     violations.append(
                         f"{source_name}: directory-enumeration capability "
                         f"'{capability}' is forbidden"
@@ -210,7 +241,7 @@ def collect_policy_violations(sources: dict[str, str]) -> list[str]:
     return violations
 
 
-class LegacyMigrationDeferralTests(unittest.TestCase):
+class LegacyCleanupPolicyTests(unittest.TestCase):
     def test_directory_enumeration_rejects_whitespace_subpaths_at_path(
         self,
     ) -> None:
@@ -246,6 +277,30 @@ let legacyData = try Data(contentsOf: legacyPlist)
             "'Data(contentsOf:)' is not allowed; allowed only in "
             "src/app/LocalJSONStore.swift, src/app/ServiceManager.swift, "
             "src/app/SetupCoordinator.swift",
+            violations,
+        )
+
+    def test_posix_file_reader_is_allowed_only_in_secure_file_tree(self) -> None:
+        probe = """
+let descriptor = open(path, O_RDONLY | O_NOFOLLOW)
+var buffer = [UInt8](repeating: 0, count: 32)
+_ = read(descriptor, &buffer, buffer.count)
+"""
+        sources = load_policy_sources()
+        sources["src/app/LegacyProbe.swift"] = probe
+
+        violations = collect_policy_violations(sources)
+
+        self.assertIn(
+            "src/app/LegacyProbe.swift: direct file-read capability "
+            "'Darwin/POSIX open' is not allowed; allowed only in "
+            "src/app/SecureFileTree.swift",
+            violations,
+        )
+        self.assertIn(
+            "src/app/LegacyProbe.swift: direct file-read capability "
+            "'Darwin/POSIX read' is not allowed; allowed only in "
+            "src/app/SecureFileTree.swift",
             violations,
         )
 
