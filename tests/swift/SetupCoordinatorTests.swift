@@ -639,6 +639,7 @@ struct SetupCoordinatorTests {
         try await testHealthyCompletedRelaunchAndForegroundStayReadyWithoutRuntime()
         try await testFreshPreparationPassiveRefreshRunsNoRuntimeCommand()
         try await testFreshReleaseContinuesThroughRequiredEnrollment()
+        try await testFreshReleaseWithExistingOwnerStillRequiresEnrollment()
         try await testRuntimeDiagnosticsAreSerialized()
         try testStrictStaticOwnerProfileInspection()
         try testSharedNumpyHeaderCorpusMatchesSwiftInspector()
@@ -1382,6 +1383,44 @@ struct SetupCoordinatorTests {
         try require(
             coordinator.currentStep == .enrollment,
             "release onboarding skipped required enrollment"
+        )
+    }
+
+    private static func testFreshReleaseWithExistingOwnerStillRequiresEnrollment()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try Data().write(to: fixture.environment.runtimeExecutableURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fixture.environment.runtimeExecutableURL.path
+        )
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: FakeServiceManager(state: .notInstalled),
+            applicationURL: URL(fileURLWithPath: "/Applications/Mac Face Lock.app"),
+            ownerProfileInspector: FakeOwnerProfileInspector(
+                valid: true,
+                fingerprint: "legacy-owner"
+            )
+        )
+
+        let prepared = await coordinator.prepareForSetup()
+        try require(prepared, "fresh release preparation did not continue")
+        try require(
+            coordinator.currentStep == .permissions,
+            "fresh release preparation did not advance to permissions"
+        )
+
+        let continued = await coordinator.continueFromPermissions()
+        try require(continued, "granted camera permission did not continue")
+        try require(
+            coordinator.currentStep == .enrollment,
+            "existing owner template skipped required release enrollment"
         )
     }
 
