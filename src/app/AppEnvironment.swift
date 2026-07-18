@@ -208,7 +208,7 @@ struct AppEnvironment {
             dataURL: dataURL,
             logsURL: logsURL,
             runtimeExecutableURL: resourcesURL.appendingPathComponent(
-                "runtime/MacFaceLockRuntime"
+                "runtime/MacFaceLockRuntime/MacFaceLockRuntime"
             )
         )
     }

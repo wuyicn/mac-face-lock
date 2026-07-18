@@ -16,7 +16,13 @@ struct LaunchFailureDetails: Equatable {
     let exitCode: Int32
 }
 
-func resolveAgentLaunch(arguments: [String]) throws -> (python: String, agent: String) {
+struct AgentLaunchResolution: Equatable {
+    let python: String
+    let agent: String
+    let execArguments: [String]
+}
+
+func resolveAgentLaunch(arguments: [String]) throws -> AgentLaunchResolution {
     if arguments.count == 2 {
         let projectArgument = arguments[1]
         var isDirectory = ObjCBool(false)
@@ -41,7 +47,11 @@ func resolveAgentLaunch(arguments: [String]) throws -> (python: String, agent: S
         guard FileManager.default.fileExists(atPath: agent) else {
             throw AgentLaunchError.missingAgent(agent)
         }
-        return (python, agent)
+        return AgentLaunchResolution(
+            python: python,
+            agent: agent,
+            execArguments: [python, "-u", agent]
+        )
     }
 
     guard arguments.count == 6,
@@ -70,7 +80,18 @@ func resolveAgentLaunch(arguments: [String]) throws -> (python: String, agent: S
         throw AgentLaunchError.missingAgent(runtime.path)
     }
     _ = support
-    return (runtime.path, "agent")
+    return AgentLaunchResolution(
+        python: runtime.path,
+        agent: "agent",
+        execArguments: [
+            runtime.path,
+            "--resources-dir",
+            resources.path,
+            "--support-dir",
+            support.path,
+            "agent",
+        ]
+    )
 }
 
 private func canonicalReleaseDirectory(_ path: String) throws -> URL {
@@ -149,10 +170,7 @@ struct AgentLauncher {
     static func main() {
         do {
             let launch = try resolveAgentLaunch(arguments: CommandLine.arguments)
-            let values = launch.agent == "agent"
-                ? [launch.python, "agent"]
-                : [launch.python, "-u", launch.agent]
-            var pointers = try makeExecArguments(values: values)
+            var pointers = try makeExecArguments(values: launch.execArguments)
             defer {
                 for pointer in pointers where pointer != nil {
                     free(pointer)

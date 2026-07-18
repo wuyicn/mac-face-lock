@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+UV_BIN="${UV_BIN:-$(command -v uv)}"
+BUILD_DIR="$ROOT_DIR/.build"
+VENV_DIR="$BUILD_DIR/runtime-python311"
+DIST_DIR="$ROOT_DIR/dist/runtime"
+STAGED_SOURCE="/tmp/mac-face-lock-runtime-build"
+
+export PYTHONHASHSEED=0
+export MACOSX_DEPLOYMENT_TARGET=12.0
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$BUILD_DIR/uv-cache}"
+
+"$UV_BIN" python install 3.11
+"$UV_BIN" venv --clear --python 3.11 "$VENV_DIR"
+"$UV_BIN" pip install --python "$VENV_DIR/bin/python" \
+  -r "$ROOT_DIR/requirements-lock.txt" \
+  -r "$ROOT_DIR/requirements-build-lock.txt"
+
+"$VENV_DIR/bin/python" - <<'PY'
+import platform
+import sys
+
+assert sys.version_info[:2] == (3, 11), sys.version
+assert platform.machine() == "arm64", platform.machine()
+PY
+
+rm -rf "$DIST_DIR" "$BUILD_DIR/pyinstaller"
+mkdir -p "$DIST_DIR" "$BUILD_DIR/pyinstaller"
+rm -rf "$STAGED_SOURCE"
+mkdir -p "$STAGED_SOURCE/packaging"
+cp "$ROOT_DIR"/*.py "$STAGED_SOURCE/"
+cp "$ROOT_DIR/packaging/mac-face-lock-runtime.spec" "$STAGED_SOURCE/packaging/"
+"$VENV_DIR/bin/pyinstaller" \
+  --clean \
+  --noconfirm \
+  --distpath "$DIST_DIR" \
+  --workpath "$BUILD_DIR/pyinstaller" \
+  "$STAGED_SOURCE/packaging/mac-face-lock-runtime.spec"
+
+test -x "$DIST_DIR/MacFaceLockRuntime/MacFaceLockRuntime"
+RUNTIME_EXECUTABLE="$DIST_DIR/MacFaceLockRuntime/MacFaceLockRuntime"
+PATCHED_EXECUTABLE="$BUILD_DIR/MacFaceLockRuntime.minos12"
+xcrun vtool \
+  -set-build-version macos 12.0 15.5 \
+  -replace \
+  -output "$PATCHED_EXECUTABLE" \
+  "$RUNTIME_EXECUTABLE"
+chmod +x "$PATCHED_EXECUTABLE"
+mv "$PATCHED_EXECUTABLE" "$RUNTIME_EXECUTABLE"
+codesign --sign - --force "$RUNTIME_EXECUTABLE" >/dev/null
+xcrun vtool -show-build "$RUNTIME_EXECUTABLE" |
+  awk '$1 == "minos" { found = 1; if ($2 != "12.0") exit 1 } END { exit !found }'
+echo "$DIST_DIR/MacFaceLockRuntime"

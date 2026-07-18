@@ -120,7 +120,9 @@ struct AppEnvironmentTests {
         )
         try require(
             release.runtimeExecutableURL
-                == expectedResources.appendingPathComponent("runtime/MacFaceLockRuntime"),
+                == expectedResources.appendingPathComponent(
+                    "runtime/MacFaceLockRuntime/MacFaceLockRuntime"
+                ),
             "release runtime executable path is incorrect"
         )
     }

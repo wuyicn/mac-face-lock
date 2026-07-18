@@ -113,6 +113,18 @@ struct AgentLauncherPathTests {
 
         try expectEqual(launch.python, runtime.path, "release runtime path")
         try expectEqual(launch.agent, "agent", "release terminal verb")
+        try expectEqual(
+            launch.execArguments,
+            [
+                runtime.path,
+                "--resources-dir",
+                resources.path,
+                "--support-dir",
+                support.path,
+                "agent",
+            ],
+            "release executable arguments"
+        )
     }
 
     private static func testReleaseInvocationRejectsMalformedArguments() throws {
