@@ -4,7 +4,7 @@
 
 **Goal:** Deliver an Apple Silicon open-source Beta that a customer can download and configure without Codex, Python, Xcode Command Line Tools, or Terminal.
 
-**Architecture:** Keep the tested Python/OpenCV protection core, add explicit runtime paths and a structured command-line boundary, freeze it into an arm64 self-contained runtime with PyInstaller 6.21.0, and embed that runtime plus the hidden Agent inside the SwiftUI application. The visible application owns onboarding, permission status, service installation, migration, and settings; protection remains disabled until every required gate passes.
+**Architecture:** Keep the tested Python/OpenCV protection core, add explicit runtime paths and a structured command-line boundary, freeze it into an arm64 self-contained runtime with PyInstaller 6.21.0, and embed that runtime plus the hidden Agent inside the SwiftUI application. The visible application owns onboarding, permission status, service installation, service diagnostics, and settings; protection remains disabled until every required gate passes.
 
 **Tech Stack:** Swift 5 / SwiftUI / AppKit / AVFoundation / ApplicationServices / CoreGraphics, Python 3.11, PyInstaller 6.21.0, OpenCV 4.10.0.84, NumPy 1.26.4, unittest, LaunchAgent, ad-hoc codesigning.
 
@@ -32,7 +32,7 @@ New focused units:
 - `template_store.py`: validation and atomic owner-template replacement.
 - `src/app/AppEnvironment.swift`: source/release environment resolution.
 - `src/app/SetupModels.swift`: onboarding state, permission state, and readiness gates.
-- `src/app/SetupStore.swift`: persistent onboarding and migration state.
+- `src/app/SetupStore.swift`: persistent onboarding state.
 - `src/app/PermissionCenter.swift`: macOS permission probes, requests, and settings links.
 - `src/app/RuntimeCommandRunner.swift`: JSON-lines process runner for the frozen runtime.
 - `src/app/ServiceManager.swift`: user LaunchAgent install, verification, restart, and rollback.
@@ -472,7 +472,7 @@ Use `launchctl bootout`, `bootstrap`, `enable`, and `kickstart` through bounded 
 
 The coordinator must install and verify the service before making the final “开启保护” action available. A moved app path must produce `.needsRepair`.
 
-- [ ] **Step 5: Run service, packaging, and existing migration tests**
+- [ ] **Step 5: Run service, packaging, and existing onboarding tests**
 
 Expected: all pass.
 
