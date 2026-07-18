@@ -78,6 +78,8 @@ struct SecureFileTreeTests {
         try testReadLimitIsEnforced()
         try testIdentityReplacementBlocksRemoval()
         try testReplacementInsideFinalWindowIsNotDeleted()
+        try testFinalTombstoneChildReplacementSurvives()
+        try testFinalTombstoneRootReplacementSurvives()
         try testInterruptedTombstoneIsRecoveredSafely()
         try testInPlaceMutationBlocksRemoval()
         try testDescriptorBoundAtomicFileRoundTrip()
@@ -519,6 +521,103 @@ struct SecureFileTreeTests {
             ),
             "safe retry did not remove the verified tombstone"
         )
+    }
+
+    private static func testFinalTombstoneChildReplacementSurvives() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        try fixture.write("data/state.json", bytes: [1])
+        let tree = try makeTree(fixture)
+        let manifest = try tree.preflight(
+            relativeTargets: ["data"],
+            budget: .legacyCleanup
+        )
+        let tombstones = try tree.makeTombstones(
+            manifest: manifest,
+            relativeTargets: ["data"],
+            nonce: { "final-child" }
+        )
+        let movedChild = fixture.root.appendingPathComponent(
+            tombstones[0].tombstoneRelativePath + "/state.json"
+        )
+        do {
+            try tree.remove(
+                manifest,
+                tombstones: tombstones,
+                beforeFinalRemoval: { entry in
+                    guard entry.relativePath
+                        == tombstones[0].tombstoneRelativePath + "/state.json" else {
+                        return
+                    }
+                    try FileManager.default.removeItem(at: movedChild)
+                    try Data([9]).write(to: movedChild)
+                }
+            )
+            throw TestFailure.assertion(
+                "final child replacement was deleted"
+            )
+        } catch SecureFileTreeError.identityChanged {
+            try require(
+                FileManager.default.fileExists(atPath: movedChild.path),
+                "final child replacement did not survive"
+            )
+            let replacement = try Data(contentsOf: movedChild)
+            try require(
+                replacement == Data([9]),
+                "final child replacement contents changed"
+            )
+        }
+    }
+
+    private static func testFinalTombstoneRootReplacementSurvives() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        try fixture.makeDirectory("logs")
+        let tree = try makeTree(fixture)
+        let manifest = try tree.preflight(
+            relativeTargets: ["logs"],
+            budget: .legacyCleanup
+        )
+        let tombstones = try tree.makeTombstones(
+            manifest: manifest,
+            relativeTargets: ["logs"],
+            nonce: { "final-root" }
+        )
+        let movedRoot = fixture.root.appendingPathComponent(
+            tombstones[0].tombstoneRelativePath
+        )
+        let sentinel = movedRoot.appendingPathComponent("unmanifested.txt")
+        do {
+            try tree.remove(
+                manifest,
+                tombstones: tombstones,
+                beforeFinalRemoval: { entry in
+                    guard entry.relativePath
+                        == tombstones[0].tombstoneRelativePath else {
+                        return
+                    }
+                    try FileManager.default.removeItem(at: movedRoot)
+                    try FileManager.default.createDirectory(
+                        at: movedRoot,
+                        withIntermediateDirectories: false
+                    )
+                    try Data([7]).write(to: sentinel)
+                }
+            )
+            throw TestFailure.assertion(
+                "final root replacement was deleted"
+            )
+        } catch SecureFileTreeError.identityChanged {
+            try require(
+                FileManager.default.fileExists(atPath: sentinel.path),
+                "final root replacement did not survive"
+            )
+            let replacement = try Data(contentsOf: sentinel)
+            try require(
+                replacement == Data([7]),
+                "final root replacement contents changed"
+            )
+        }
     }
 
     private static func testInPlaceMutationBlocksRemoval() throws {

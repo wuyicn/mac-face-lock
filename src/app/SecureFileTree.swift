@@ -662,7 +662,9 @@ final class SecureFileTree {
         _ manifest: SecureTreeManifest,
         tombstones: [SecureTreeTombstone],
         beforeRename: ((SecureTreeTombstone) throws -> Void)? = nil,
-        afterRename: ((SecureTreeTombstone) throws -> Void)? = nil
+        afterRename: ((SecureTreeTombstone) throws -> Void)? = nil,
+        beforeFinalRemoval: ((SecureTreeEntry) throws -> Void)? = nil,
+        finalNonce: () -> String = { UUID().uuidString.lowercased() }
     ) throws {
         guard manifest.rootIdentity == rootIdentity else {
             throw SecureFileTreeError.identityChanged(rootPath)
@@ -689,7 +691,9 @@ final class SecureFileTree {
             )
             try deleteMovedTree(
                 manifest: manifest,
-                tombstone: tombstone
+                tombstone: tombstone,
+                beforeFinalRemoval: beforeFinalRemoval,
+                finalNonce: finalNonce
             )
         }
         try requireStableRoot()
@@ -699,7 +703,9 @@ final class SecureFileTree {
         _ tombstones: [SecureTreeTombstone],
         budget: SecureTreeBudget,
         beforeRename: ((SecureTreeTombstone) throws -> Void)? = nil,
-        afterRename: ((SecureTreeTombstone) throws -> Void)? = nil
+        afterRename: ((SecureTreeTombstone) throws -> Void)? = nil,
+        beforeFinalRemoval: ((SecureTreeEntry) throws -> Void)? = nil,
+        finalNonce: () -> String = { UUID().uuidString.lowercased() }
     ) throws {
         try requireStableRoot()
         for tombstone in tombstones {
@@ -739,7 +745,11 @@ final class SecureFileTree {
                     tombstone.tombstoneRelativePath
                 )
             }
-            try deleteManifestEntries(movedManifest.entriesDeepestFirst)
+            try deleteManifestEntries(
+                movedManifest.entriesDeepestFirst,
+                beforeFinalRemoval: beforeFinalRemoval,
+                finalNonce: finalNonce
+            )
         }
         try requireStableRoot()
     }
@@ -832,7 +842,9 @@ final class SecureFileTree {
 
     private func deleteMovedTree(
         manifest: SecureTreeManifest,
-        tombstone: SecureTreeTombstone
+        tombstone: SecureTreeTombstone,
+        beforeFinalRemoval: ((SecureTreeEntry) throws -> Void)?,
+        finalNonce: () -> String
     ) throws {
         let movedEntries = manifest.entriesDeepestFirst.compactMap { entry
             -> SecureTreeEntry? in
@@ -852,7 +864,9 @@ final class SecureFileTree {
         do {
             try deleteManifestEntries(
                 movedEntries,
-                renamedRootPath: tombstone.tombstoneRelativePath
+                renamedRootPath: tombstone.tombstoneRelativePath,
+                beforeFinalRemoval: beforeFinalRemoval,
+                finalNonce: finalNonce
             )
         } catch SecureFileTreeError.identityChanged(let path) {
             guard path == tombstone.tombstoneRelativePath
@@ -872,7 +886,9 @@ final class SecureFileTree {
 
     private func deleteManifestEntries(
         _ entries: [SecureTreeEntry],
-        renamedRootPath: String? = nil
+        renamedRootPath: String? = nil,
+        beforeFinalRemoval: ((SecureTreeEntry) throws -> Void)? = nil,
+        finalNonce: () -> String = { UUID().uuidString.lowercased() }
     ) throws {
         for entry in entries {
             let components = try validatedComponents(entry.relativePath)
@@ -890,7 +906,9 @@ final class SecureFileTree {
                 name: name,
                 entry: entry,
                 allowRenameCtimeChange:
-                    entry.relativePath == renamedRootPath
+                    entry.relativePath == renamedRootPath,
+                beforeFinalRemoval: beforeFinalRemoval,
+                finalNonce: finalNonce
             )
         }
     }
@@ -1449,7 +1467,9 @@ final class SecureFileTree {
         parentFD: Int32,
         name: String,
         entry: SecureTreeEntry,
-        allowRenameCtimeChange: Bool = false
+        allowRenameCtimeChange: Bool = false,
+        beforeFinalRemoval: ((SecureTreeEntry) throws -> Void)? = nil,
+        finalNonce: () -> String = { UUID().uuidString.lowercased() }
     ) throws {
         var current = stat()
         guard fstatat(parentFD, name, &current, AT_SYMLINK_NOFOLLOW) == 0 else {
@@ -1479,9 +1499,118 @@ final class SecureFileTree {
                     != entry.fileVersion {
             throw SecureFileTreeError.identityChanged(entry.relativePath)
         }
-        let flags = entry.kind == .directory ? AT_REMOVEDIR : 0
-        guard unlinkat(parentFD, name, flags) == 0 else {
-            throw SecureFileTreeError.systemCall("unlinkat", entry.relativePath, errno)
+        try beforeFinalRemoval?(entry)
+
+        // Darwin has no unlink-by-inode/fd operation. Move the pathname through
+        // one more exclusive, unpredictable name and verify the moved inode.
+        // This closes the auditable public-name check/delete window. The final
+        // unlink remains pathname-based, so the security model also relies on
+        // this private name not being disclosed to a concurrent same-UID actor.
+        let purgeName = ".mac-face-lock-purge-\(finalNonce())"
+        _ = try validatedSingleComponent(purgeName)
+        guard renameatx_np(
+            parentFD,
+            name,
+            parentFD,
+            purgeName,
+            UInt32(RENAME_EXCL)
+        ) == 0 else {
+            throw SecureFileTreeError.systemCall(
+                "renameatx_np",
+                entry.relativePath,
+                errno
+            )
+        }
+        guard fsync(parentFD) == 0 else {
+            let savedErrno = errno
+            _ = renameatx_np(
+                parentFD,
+                purgeName,
+                parentFD,
+                name,
+                UInt32(RENAME_EXCL)
+            )
+            throw SecureFileTreeError.systemCall(
+                "fsync",
+                entry.relativePath,
+                savedErrno
+            )
+        }
+
+        do {
+            var quarantined = stat()
+            guard fstatat(
+                parentFD,
+                purgeName,
+                &quarantined,
+                AT_SYMLINK_NOFOLLOW
+            ) == 0 else {
+                throw SecureFileTreeError.systemCall(
+                    "fstatat",
+                    entry.relativePath,
+                    errno
+                )
+            }
+            try validateMovedEntryStat(quarantined, entry: entry)
+        } catch {
+            try restoreFinalQuarantine(
+                parentFD: parentFD,
+                purgeName: purgeName,
+                originalName: name,
+                path: entry.relativePath
+            )
+            throw error
+        }
+
+        var flags = entry.kind == .directory ? AT_REMOVEDIR : 0
+        flags |= AT_NODELETEBUSY
+        if entry.kind == .file {
+            flags |= AT_UNIQUE
+        }
+        guard unlinkat(parentFD, purgeName, flags) == 0 else {
+            let savedErrno = errno
+            try restoreFinalQuarantine(
+                parentFD: parentFD,
+                purgeName: purgeName,
+                originalName: name,
+                path: entry.relativePath
+            )
+            throw SecureFileTreeError.systemCall(
+                "unlinkat",
+                entry.relativePath,
+                savedErrno
+            )
+        }
+        guard fsync(parentFD) == 0 else {
+            throw SecureFileTreeError.systemCall(
+                "fsync",
+                entry.relativePath,
+                errno
+            )
+        }
+    }
+
+    private func restoreFinalQuarantine(
+        parentFD: Int32,
+        purgeName: String,
+        originalName: String,
+        path: String
+    ) throws {
+        guard renameatx_np(
+            parentFD,
+            purgeName,
+            parentFD,
+            originalName,
+            UInt32(RENAME_EXCL)
+        ) == 0 else {
+            throw SecureFileTreeError.systemCall(
+                "renameatx_np restore",
+                path,
+                errno
+            )
+        }
+        guard fsync(parentFD) == 0 else {
+            throw SecureFileTreeError.systemCall("fsync", path, errno)
         }
     }
 

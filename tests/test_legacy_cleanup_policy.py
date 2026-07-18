@@ -317,6 +317,21 @@ def collect_policy_violations(sources: dict[str, str]) -> list[str]:
 
 
 class LegacyCleanupPolicyTests(unittest.TestCase):
+    def test_cleanup_security_model_states_final_pathname_limit(self) -> None:
+        model = (
+            PROJECT_DIR / "docs/legacy-cleanup-security-model.md"
+        ).read_text(encoding="utf-8")
+        for token in (
+            "unlinkat",
+            "按路径名",
+            "不存在按 inode 或文件描述符删除",
+            "RENAME_EXCL",
+            "AT_UNIQUE",
+            "同一用户",
+            "不宣称",
+        ):
+            self.assertIn(token, model)
+
     def test_directory_enumeration_rejects_whitespace_subpaths_at_path(
         self,
     ) -> None:
