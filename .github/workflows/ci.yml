@@ -25,6 +25,13 @@ jobs:
         run: python -m pip install -r requirements-lock.txt
       - name: Run full Python suite
         run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Validate frozen-runtime build lock
+        run: |
+          grep -Fx "PyInstaller==6.21.0" requirements-build.txt
+          python -m pip install -r requirements-build-lock.txt
+          python -m PyInstaller --version | grep -Fx "6.21.0"
+          python -m unittest \
+            tests.test_release_bundle.ReleaseBundlePolicyTests -v
       - name: Compile Python sources
         run: python -m compileall -q -x '/\.git/|/\.venv/|/dist/' .
       - name: Parse all shell entry points

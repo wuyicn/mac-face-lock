@@ -15,6 +15,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 REQUIREMENTS = PROJECT_DIR / "requirements.txt"
 LOCK_REQUIREMENTS = PROJECT_DIR / "requirements-lock.txt"
 CI_WORKFLOW = PROJECT_DIR / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = PROJECT_DIR / ".github" / "workflows" / "release-artifact.yml"
 BOOTSTRAP = PROJECT_DIR / "scripts" / "bootstrap.sh"
 README = PROJECT_DIR / "README.md"
 THIRD_PARTY_NOTICES = PROJECT_DIR / "THIRD_PARTY_NOTICES.md"
@@ -355,6 +356,67 @@ def dangerous_ci_command(command):
 
 
 class OpenSourcePolicyTests(unittest.TestCase):
+    def test_manual_release_artifact_workflow_is_safe_and_reviewable(self):
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        for token in (
+            "workflow_dispatch",
+            "macos-15",
+            'python-version: "3.11"',
+            "PyInstaller==6.21.0",
+            "scripts/build-release.sh",
+            "Mac-Face-Lock-0.2.0-beta-arm64.zip",
+            "actions/upload-artifact@v6",
+            "contents: read",
+        ):
+            self.assertIn(token, workflow)
+        for forbidden in (
+            "softprops/action-gh-release",
+            "gh release create",
+            "GITHUB_TOKEN:",
+            "contents: write",
+        ):
+            self.assertNotIn(forbidden, workflow)
+
+    def test_customer_release_documentation_is_complete(self):
+        readme = README.read_text(encoding="utf-8")
+        customer = (
+            PROJECT_DIR / "docs" / "customer-installation.md"
+        ).read_text(encoding="utf-8")
+        self.assertLess(
+            readme.index("普通客户"),
+            readme.index("源码开发"),
+        )
+        for token in (
+            "GitHub Releases",
+            "无需 Codex、Python、Xcode、终端或源码仓库",
+            "右键",
+            "SHA-256",
+            "摄像头",
+            "输入监控",
+            "辅助功能",
+            "重新录入本人",
+            "fail-open",
+            "没有活体检测",
+            "卸载",
+            "彻底删除",
+            "scripts/build-release.sh",
+            "docs/design-references/mac-face-lock-onboarding-permissions.png",
+            "docs/design-references/mac-face-lock-onboarding-enrollment.png",
+        ):
+            self.assertIn(token, readme)
+        for token in (
+            "Finder",
+            "右键",
+            "校验",
+            "权限中心",
+            "录入本人",
+            "安全测试",
+            "修复",
+            "保留数据",
+            "彻底删除",
+        ):
+            self.assertIn(token, customer)
+
     def _read_required_document(self, name):
         path = PROJECT_DIR / name
         self.assertTrue(path.is_file(), f"{name} is missing")
