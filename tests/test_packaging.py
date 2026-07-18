@@ -315,7 +315,7 @@ class UnifiedPackagingTests(unittest.TestCase):
             ".venv",
             "dist/",
             "Library/LaunchAgents",
-            "/Users/",
+            "/" + "Users/",
             "~/Library",
         ):
             with self.subTest(onboarding_technical_copy=technical_copy):
