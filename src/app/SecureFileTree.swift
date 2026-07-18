@@ -25,6 +25,35 @@ struct SecureTreeEntry: Codable, Equatable, Sendable {
     let relativePath: String
     let identity: SecureFileIdentity
     let kind: Kind
+    let fileVersion: SecureRegularFileVersion?
+}
+
+struct SecureRegularFileVersion: Codable, Equatable, Sendable {
+    let logicalSize: UInt64
+    let modificationSeconds: Int64
+    let modificationNanoseconds: Int64
+    let changeSeconds: Int64
+    let changeNanoseconds: Int64
+}
+
+private struct SecureFileFingerprint: Equatable {
+    let identity: SecureFileIdentity
+    let owner: uid_t
+    let mode: mode_t
+    let linkCount: UInt64
+    let version: SecureRegularFileVersion
+}
+
+private struct SecureDirectoryVersion: Equatable {
+    let modificationSeconds: Int64
+    let modificationNanoseconds: Int64
+    let changeSeconds: Int64
+    let changeNanoseconds: Int64
+}
+
+private struct SecureDirectoryBinding: Equatable {
+    let identity: SecureFileIdentity
+    let version: SecureDirectoryVersion?
 }
 
 struct SecureTreeManifest: Codable, Equatable, Sendable {
@@ -252,6 +281,259 @@ final class SecureFileTree {
         }
     }
 
+    func loadValidatedFile(
+        _ relativePath: String,
+        maximumBytes: Int,
+        requiredMode: mode_t,
+        afterOpen: (() throws -> Void)? = nil
+    ) throws -> Data {
+        let name = try validatedSingleComponent(relativePath)
+        guard maximumBytes >= 0 else {
+            throw SecureFileTreeError.byteBudgetExceeded
+        }
+        try requireStableRoot()
+        let bindingBefore = try capturePathBinding(includeRootVersion: true)
+
+        var pathStat = stat()
+        guard fstatat(rootFD, name, &pathStat, AT_SYMLINK_NOFOLLOW) == 0 else {
+            throw SecureFileTreeError.systemCall("fstatat", relativePath, errno)
+        }
+        let initial = try validatedFileFingerprint(
+            pathStat,
+            path: relativePath,
+            maximumBytes: maximumBytes,
+            requiredMode: requiredMode
+        )
+
+        let fileDescriptor = openat(
+            rootFD,
+            name,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard fileDescriptor >= 0 else {
+            if errno == ELOOP {
+                throw SecureFileTreeError.symbolicLink(relativePath)
+            }
+            throw SecureFileTreeError.systemCall("openat", relativePath, errno)
+        }
+        defer { Darwin.close(fileDescriptor) }
+
+        var openedStat = stat()
+        guard fstat(fileDescriptor, &openedStat) == 0 else {
+            throw SecureFileTreeError.systemCall("fstat", relativePath, errno)
+        }
+        guard try validatedFileFingerprint(
+            openedStat,
+            path: relativePath,
+            maximumBytes: maximumBytes,
+            requiredMode: requiredMode
+        ) == initial else {
+            throw SecureFileTreeError.identityChanged(relativePath)
+        }
+
+        try afterOpen?()
+        let data = try readAll(
+            fileDescriptor,
+            path: relativePath,
+            maximumBytes: maximumBytes
+        )
+
+        var finalOpenedStat = stat()
+        guard fstat(fileDescriptor, &finalOpenedStat) == 0 else {
+            throw SecureFileTreeError.systemCall("fstat", relativePath, errno)
+        }
+        guard try validatedFileFingerprint(
+            finalOpenedStat,
+            path: relativePath,
+            maximumBytes: maximumBytes,
+            requiredMode: requiredMode
+        ) == initial else {
+            throw SecureFileTreeError.identityChanged(relativePath)
+        }
+
+        var finalPathStat = stat()
+        guard fstatat(
+            rootFD,
+            name,
+            &finalPathStat,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0 else {
+            if errno == ENOENT {
+                throw SecureFileTreeError.identityChanged(relativePath)
+            }
+            throw SecureFileTreeError.systemCall("fstatat", relativePath, errno)
+        }
+        guard try validatedFileFingerprint(
+            finalPathStat,
+            path: relativePath,
+            maximumBytes: maximumBytes,
+            requiredMode: requiredMode
+        ) == initial else {
+            throw SecureFileTreeError.identityChanged(relativePath)
+        }
+        let bindingAfter = try capturePathBinding(includeRootVersion: true)
+        guard bindingAfter == bindingBefore else {
+            throw SecureFileTreeError.identityChanged(relativePath)
+        }
+        try requireStableRoot()
+        return data
+    }
+
+    func replaceFileAtomically(
+        _ relativePath: String,
+        temporaryName: String,
+        data: Data,
+        maximumBytes: Int,
+        mode: mode_t,
+        beforeRename: (() throws -> Void)? = nil
+    ) throws {
+        let name = try validatedSingleComponent(relativePath)
+        let temporary = try validatedSingleComponent(temporaryName)
+        guard name != temporary else {
+            throw SecureFileTreeError.invalidRelativePath(temporaryName)
+        }
+        guard maximumBytes >= 0, data.count <= maximumBytes else {
+            throw SecureFileTreeError.byteBudgetExceeded
+        }
+        try requireStableRoot()
+        let bindingBefore = try capturePathBinding(includeRootVersion: false)
+        let initialDestination = try fileFingerprintIfPresent(
+            name,
+            path: relativePath,
+            maximumBytes: maximumBytes,
+            requiredMode: mode
+        )
+
+        let flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC
+        let fileDescriptor = openat(rootFD, temporary, flags, mode)
+        guard fileDescriptor >= 0 else {
+            throw SecureFileTreeError.systemCall("openat", temporaryName, errno)
+        }
+        var published = false
+        defer {
+            Darwin.close(fileDescriptor)
+            if !published {
+                _ = unlinkat(rootFD, temporary, 0)
+            }
+        }
+
+        guard fchmod(fileDescriptor, mode) == 0 else {
+            throw SecureFileTreeError.systemCall("fchmod", temporaryName, errno)
+        }
+        var initialTemporaryStat = stat()
+        guard fstat(fileDescriptor, &initialTemporaryStat) == 0 else {
+            throw SecureFileTreeError.systemCall("fstat", temporaryName, errno)
+        }
+        let initialTemporary = try validatedFileFingerprint(
+            initialTemporaryStat,
+            path: temporaryName,
+            maximumBytes: maximumBytes,
+            requiredMode: mode
+        )
+
+        try writeAll(fileDescriptor, data: data, path: temporaryName)
+        guard fsync(fileDescriptor) == 0 else {
+            throw SecureFileTreeError.systemCall("fsync", temporaryName, errno)
+        }
+        var writtenTemporaryStat = stat()
+        guard fstat(fileDescriptor, &writtenTemporaryStat) == 0 else {
+            throw SecureFileTreeError.systemCall("fstat", temporaryName, errno)
+        }
+        let writtenTemporary = try validatedFileFingerprint(
+            writtenTemporaryStat,
+            path: temporaryName,
+            maximumBytes: maximumBytes,
+            requiredMode: mode
+        )
+        guard
+            writtenTemporary.identity == initialTemporary.identity,
+            writtenTemporary.version.logicalSize == UInt64(data.count)
+        else {
+            throw SecureFileTreeError.identityChanged(temporaryName)
+        }
+
+        let publicationBinding = try capturePathBinding(
+            includeRootVersion: true
+        )
+        try beforeRename?()
+        try requireStableRoot()
+        guard try capturePathBinding(includeRootVersion: false) == bindingBefore else {
+            throw SecureFileTreeError.identityChanged(rootPath)
+        }
+        guard try fileFingerprintIfPresent(
+            temporary,
+            path: temporaryName,
+            maximumBytes: maximumBytes,
+            requiredMode: mode
+        ) == writtenTemporary else {
+            throw SecureFileTreeError.identityChanged(temporaryName)
+        }
+        guard try fileFingerprintIfPresent(
+            name,
+            path: relativePath,
+            maximumBytes: maximumBytes,
+            requiredMode: mode
+        ) == initialDestination else {
+            throw SecureFileTreeError.identityChanged(relativePath)
+        }
+        guard try capturePathBinding(
+            includeRootVersion: true
+        ) == publicationBinding else {
+            throw SecureFileTreeError.identityChanged(rootPath)
+        }
+
+        guard renameat(rootFD, temporary, rootFD, name) == 0 else {
+            throw SecureFileTreeError.systemCall("renameat", relativePath, errno)
+        }
+        published = true
+        guard fsync(rootFD) == 0 else {
+            throw SecureFileTreeError.systemCall("fsync", rootPath, errno)
+        }
+        try requireStableRoot()
+        guard try capturePathBinding(includeRootVersion: false) == bindingBefore else {
+            throw SecureFileTreeError.identityChanged(rootPath)
+        }
+
+        let destination = try fileFingerprintIfPresent(
+            name,
+            path: relativePath,
+            maximumBytes: maximumBytes,
+            requiredMode: mode
+        )
+        guard
+            let destination,
+            destination.identity == writtenTemporary.identity,
+            destination.owner == writtenTemporary.owner,
+            destination.mode == writtenTemporary.mode,
+            destination.linkCount == writtenTemporary.linkCount,
+            destination.version.logicalSize
+                == writtenTemporary.version.logicalSize,
+            destination.version.modificationSeconds
+                == writtenTemporary.version.modificationSeconds,
+            destination.version.modificationNanoseconds
+                == writtenTemporary.version.modificationNanoseconds
+        else {
+            throw SecureFileTreeError.identityChanged(relativePath)
+        }
+        var removedTemporary = stat()
+        guard fstatat(
+            rootFD,
+            temporary,
+            &removedTemporary,
+            AT_SYMLINK_NOFOLLOW
+        ) != 0, errno == ENOENT else {
+            throw SecureFileTreeError.identityChanged(temporaryName)
+        }
+        let verified = try loadValidatedFile(
+            relativePath,
+            maximumBytes: maximumBytes,
+            requiredMode: mode
+        )
+        guard verified == data else {
+            throw SecureFileTreeError.identityChanged(relativePath)
+        }
+    }
+
     func preflight(
         relativeTargets: [String],
         budget: SecureTreeBudget
@@ -394,6 +676,196 @@ final class SecureFileTree {
         return components
     }
 
+    private func validatedSingleComponent(_ relativePath: String) throws -> String {
+        let components = try validatedComponents(relativePath)
+        guard components.count == 1, let name = components.first else {
+            throw SecureFileTreeError.invalidRelativePath(relativePath)
+        }
+        return name
+    }
+
+    private func validatedFileFingerprint(
+        _ statValue: stat,
+        path: String,
+        maximumBytes: Int,
+        requiredMode: mode_t
+    ) throws -> SecureFileFingerprint {
+        let (identity, kind) = try Self.checkedIdentity(
+            statValue,
+            path: path,
+            requiredOwner: requiredOwner
+        )
+        guard kind == .file else {
+            throw SecureFileTreeError.specialFile(path)
+        }
+        guard statValue.st_mode & 0o7777 == requiredMode else {
+            throw SecureFileTreeError.specialFile(path)
+        }
+        guard
+            statValue.st_size >= 0,
+            UInt64(statValue.st_size) <= UInt64(maximumBytes),
+            let version = Self.fileVersion(statValue, kind: .file)
+        else {
+            throw SecureFileTreeError.byteBudgetExceeded
+        }
+        return SecureFileFingerprint(
+            identity: identity,
+            owner: statValue.st_uid,
+            mode: statValue.st_mode & 0o7777,
+            linkCount: UInt64(statValue.st_nlink),
+            version: version
+        )
+    }
+
+    private func fileFingerprintIfPresent(
+        _ name: String,
+        path: String,
+        maximumBytes: Int,
+        requiredMode: mode_t
+    ) throws -> SecureFileFingerprint? {
+        var result = stat()
+        guard fstatat(rootFD, name, &result, AT_SYMLINK_NOFOLLOW) == 0 else {
+            if errno == ENOENT {
+                return nil
+            }
+            throw SecureFileTreeError.systemCall("fstatat", path, errno)
+        }
+        return try validatedFileFingerprint(
+            result,
+            path: path,
+            maximumBytes: maximumBytes,
+            requiredMode: requiredMode
+        )
+    }
+
+    private func readAll(
+        _ fileDescriptor: Int32,
+        path: String,
+        maximumBytes: Int
+    ) throws -> Data {
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let count = Darwin.read(fileDescriptor, &buffer, buffer.count)
+            if count == 0 {
+                return result
+            }
+            if count < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                throw SecureFileTreeError.systemCall("read", path, errno)
+            }
+            let (newCount, overflow) = result.count.addingReportingOverflow(
+                Int(count)
+            )
+            guard !overflow, newCount <= maximumBytes else {
+                throw SecureFileTreeError.byteBudgetExceeded
+            }
+            result.append(contentsOf: buffer.prefix(Int(count)))
+        }
+    }
+
+    private func writeAll(
+        _ fileDescriptor: Int32,
+        data: Data,
+        path: String
+    ) throws {
+        try data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else {
+                return
+            }
+            var offset = 0
+            while offset < rawBuffer.count {
+                let written = Darwin.write(
+                    fileDescriptor,
+                    baseAddress.advanced(by: offset),
+                    rawBuffer.count - offset
+                )
+                if written < 0 {
+                    if errno == EINTR {
+                        continue
+                    }
+                    throw SecureFileTreeError.systemCall("write", path, errno)
+                }
+                guard written > 0 else {
+                    throw SecureFileTreeError.systemCall("write", path, EIO)
+                }
+                offset += written
+            }
+        }
+    }
+
+    private func capturePathBinding(
+        includeRootVersion: Bool
+    ) throws -> [SecureDirectoryBinding] {
+        var currentFD = dup(ancestorFD)
+        guard currentFD >= 0 else {
+            throw SecureFileTreeError.systemCall("dup", rootPath, errno)
+        }
+        defer { Darwin.close(currentFD) }
+
+        var bindings: [SecureDirectoryBinding] = []
+        var ancestorStat = stat()
+        guard fstat(currentFD, &ancestorStat) == 0 else {
+            throw SecureFileTreeError.systemCall("fstat", rootPath, errno)
+        }
+        bindings.append(
+            Self.directoryBinding(ancestorStat, includeVersion: true)
+        )
+
+        for (index, component) in rootComponents.enumerated() {
+            let nextFD = openat(
+                currentFD,
+                component,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+            guard nextFD >= 0 else {
+                throw SecureFileTreeError.identityChanged(rootPath)
+            }
+            var entryStat = stat()
+            guard fstat(nextFD, &entryStat) == 0 else {
+                let savedErrno = errno
+                Darwin.close(nextFD)
+                throw SecureFileTreeError.systemCall(
+                    "fstat",
+                    component,
+                    savedErrno
+                )
+            }
+            bindings.append(
+                Self.directoryBinding(
+                    entryStat,
+                    includeVersion: includeRootVersion
+                        || index < rootComponents.count - 1
+                )
+            )
+            Darwin.close(currentFD)
+            currentFD = nextFD
+        }
+        return bindings
+    }
+
+    private static func directoryBinding(
+        _ statValue: stat,
+        includeVersion: Bool
+    ) -> SecureDirectoryBinding {
+        SecureDirectoryBinding(
+            identity: SecureFileIdentity(
+                device: UInt64(statValue.st_dev),
+                inode: UInt64(statValue.st_ino)
+            ),
+            version: includeVersion
+                ? SecureDirectoryVersion(
+                    modificationSeconds: Int64(statValue.st_mtimespec.tv_sec),
+                    modificationNanoseconds: Int64(statValue.st_mtimespec.tv_nsec),
+                    changeSeconds: Int64(statValue.st_ctimespec.tv_sec),
+                    changeNanoseconds: Int64(statValue.st_ctimespec.tv_nsec)
+                )
+                : nil
+        )
+    }
+
     private func openParent(
         _ components: [String],
         path: String,
@@ -506,7 +978,8 @@ final class SecureFileTree {
             entriesByPath[relativePath] = SecureTreeEntry(
                 relativePath: relativePath,
                 identity: identity,
-                kind: kind
+                kind: kind,
+                fileVersion: Self.fileVersion(initialStat, kind: kind)
             )
         }
 
@@ -676,16 +1149,37 @@ final class SecureFileTree {
             }
             throw SecureFileTreeError.systemCall("fstatat", entry.relativePath, errno)
         }
-        let currentIdentity = SecureFileIdentity(
-            device: UInt64(current.st_dev),
-            inode: UInt64(current.st_ino)
+        let (currentIdentity, currentKind) = try Self.checkedIdentity(
+            current,
+            path: entry.relativePath,
+            requiredOwner: requiredOwner
         )
-        guard currentIdentity == entry.identity else {
+        guard
+            currentIdentity == entry.identity,
+            currentKind == entry.kind,
+            Self.fileVersion(current, kind: currentKind) == entry.fileVersion
+        else {
             throw SecureFileTreeError.identityChanged(entry.relativePath)
         }
         let flags = entry.kind == .directory ? AT_REMOVEDIR : 0
         guard unlinkat(parentFD, name, flags) == 0 else {
             throw SecureFileTreeError.systemCall("unlinkat", entry.relativePath, errno)
         }
+    }
+
+    private static func fileVersion(
+        _ statValue: stat,
+        kind: SecureTreeEntry.Kind
+    ) -> SecureRegularFileVersion? {
+        guard kind == .file, statValue.st_size >= 0 else {
+            return nil
+        }
+        return SecureRegularFileVersion(
+            logicalSize: UInt64(statValue.st_size),
+            modificationSeconds: Int64(statValue.st_mtimespec.tv_sec),
+            modificationNanoseconds: Int64(statValue.st_mtimespec.tv_nsec),
+            changeSeconds: Int64(statValue.st_ctimespec.tv_sec),
+            changeNanoseconds: Int64(statValue.st_ctimespec.tv_nsec)
+        )
     }
 }

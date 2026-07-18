@@ -28,6 +28,42 @@ private struct RecordedServiceCommand {
     let timeout: TimeInterval
 }
 
+private func absentServiceResult(
+    arguments: [String],
+    bootoutExitCode: Int32 = 0
+) -> ServiceCommandResult {
+    let service = arguments.last ?? ""
+    if arguments.first == "print" {
+        return ServiceCommandResult(
+            exitCode: 113,
+            stdout: "",
+            stderr: "Bad request.\nCould not find service \"\(service)\""
+        )
+    }
+    return ServiceCommandResult(
+        exitCode: bootoutExitCode,
+        stdout: "",
+        stderr: bootoutExitCode == 0 ? "" : "No such process"
+    )
+}
+
+private func plistData(_ dictionary: [String: Any]) throws -> Data {
+    try PropertyListSerialization.data(
+        fromPropertyList: dictionary,
+        format: .xml,
+        options: 0
+    )
+}
+
+private func replaceFileAtomically(at url: URL, with data: Data) throws {
+    let temporary = url.deletingLastPathComponent().appendingPathComponent(
+        ".replacement-\(UUID().uuidString)"
+    )
+    try data.write(to: temporary)
+    try FileManager.default.removeItem(at: url)
+    try FileManager.default.moveItem(at: temporary, to: url)
+}
+
 private final class RecordingServiceCommandRunner: ServiceCommandRunning {
     private(set) var calls: [RecordedServiceCommand] = []
     var resultProvider: ((Int, [String]) throws -> ServiceCommandResult)?
@@ -47,11 +83,7 @@ private final class RecordingServiceCommandRunner: ServiceCommandRunning {
         if let resultProvider {
             return try resultProvider(calls.count, arguments)
         }
-        return ServiceCommandResult(
-            exitCode: arguments.first == "print" ? 1 : 0,
-            stdout: "",
-            stderr: ""
-        )
+        return absentServiceResult(arguments: arguments)
     }
 }
 
@@ -71,7 +103,11 @@ private struct LegacyCleanerFixture {
     let commandRunner: RecordingServiceCommandRunner
     let cleaner: LegacyInstallCleaner
 
-    init(appURLInsideLegacyRoot: Bool = false) throws {
+    init(
+        appURLInsideLegacyRoot: Bool = false,
+        supportRelativeToLegacyRoot: String? = nil,
+        testEventHandler: ((String) throws -> Void)? = nil
+    ) throws {
         container = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "mac-face-lock-legacy-cleaner-\(UUID().uuidString)",
@@ -90,10 +126,19 @@ private struct LegacyCleanerFixture {
                 isDirectory: true
             )
             : container.appendingPathComponent("Mac Face Lock.app", isDirectory: true)
-        supportURL = home.appendingPathComponent(
-            "Library/Application Support/Mac Face Lock",
-            isDirectory: true
-        )
+        if let supportRelativeToLegacyRoot {
+            supportURL = supportRelativeToLegacyRoot.isEmpty
+                ? legacyRoot
+                : legacyRoot.appendingPathComponent(
+                    supportRelativeToLegacyRoot,
+                    isDirectory: true
+                )
+        } else {
+            supportURL = home.appendingPathComponent(
+                "Library/Application Support/Mac Face Lock",
+                isDirectory: true
+            )
+        }
         launchAgentsURL = home.appendingPathComponent(
             "Library/LaunchAgents",
             isDirectory: true
@@ -119,7 +164,8 @@ private struct LegacyCleanerFixture {
             appURL: appURL,
             supportURL: supportURL,
             commandRunner: commandRunner,
-            userID: getuid()
+            userID: getuid(),
+            testEventHandler: testEventHandler
         )
     }
 
@@ -426,14 +472,22 @@ private struct LegacyCleanerFixture {
 struct LegacyInstallCleanerTests {
     static func main() async throws {
         try testInspectHasNoExecutionSideEffects()
+        try await testSupportOverlapBlocksBeforeMutation()
+        try await testSupportRootABABlocksBeforeMutation()
         try await testFullPreflightFailureHasNoMutation()
         try await testUnconfirmedCandidateCannotCreateJournal()
         try await testNonLoadedServicesAreAccepted()
+        try await testRejectsNonAbsentPrintFailures()
+        try await testFinalVerificationRejectsNonAbsentPrintFailure()
         try await testCommandFailureBlocksDeletion()
         try await testLoadedServiceBlocksDeletion()
         try await testSourceDeletionFailurePreservesPlists()
         try await testFailureAfterSourceDeletionIsIncomplete()
+        try await testInitialPlistReplacementBlocksDeletion()
+        try await testInitialInPlacePlistMutationBlocksDeletion()
+        try await testRetryPlistReplacementBlocksDeletion()
         try await testRetryIsIdempotentWithAbsentTargets()
+        try await testRetryCompletesWithoutLaunchAgentsDirectory()
         try await testRetryRejectsInvalidJournalMetadata()
         try await testRetryRejectsTamperedJournalFields()
         try await testRetryRejectsChangedRootIdentity()
@@ -480,6 +534,39 @@ struct LegacyInstallCleanerTests {
         try fixture.requirePreserved("logs/agent.out.log")
     }
 
+    private static func testSupportOverlapBlocksBeforeMutation() async throws {
+        for relativeSupport in ["", "data", "data/release-support", "dist"] {
+            let fixture = try LegacyCleanerFixture(
+                supportRelativeToLegacyRoot: relativeSupport
+            )
+            defer { fixture.remove() }
+            try fixture.writeCurrentAgentPlist()
+            try fixture.writeUnifiedStatusPlist()
+            try fixture.write("README.md", "preserve")
+            let candidate = try fixture.confirmedCandidate()
+
+            guard case .ambiguous = await fixture.cleaner.clean(candidate) else {
+                throw TestFailure.assertion(
+                    "overlapping support path was accepted: \(relativeSupport)"
+                )
+            }
+            try require(
+                fixture.commandRunner.calls.isEmpty,
+                "support overlap ran launchctl: \(relativeSupport)"
+            )
+            try require(
+                !FileManager.default.fileExists(atPath: fixture.journalURL.path),
+                "support overlap created a journal: \(relativeSupport)"
+            )
+            try fixture.requirePreserved("README.md")
+            try require(
+                FileManager.default.fileExists(atPath: fixture.agentURL.path)
+                    && FileManager.default.fileExists(atPath: fixture.statusURL.path),
+                "support overlap deleted a plist: \(relativeSupport)"
+            )
+        }
+    }
+
     private static func testFullPreflightFailureHasNoMutation() async throws {
         let fixture = try LegacyCleanerFixture()
         defer { fixture.remove() }
@@ -511,6 +598,61 @@ struct LegacyInstallCleanerTests {
             FileManager.default.fileExists(atPath: fixture.agentURL.path)
                 && FileManager.default.fileExists(atPath: fixture.statusURL.path),
             "preflight failure deleted a plist"
+        )
+    }
+
+    private static func testSupportRootABABlocksBeforeMutation() async throws {
+        var replacement: (() throws -> Void)?
+        let fixture = try LegacyCleanerFixture(testEventHandler: { event in
+            if event == "beforeJournalRename" {
+                try replacement?()
+            }
+        })
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        try fixture.writeSupport("release.json", #"{"release":true}"#)
+        let candidate = try fixture.confirmedCandidate()
+        let displaced = fixture.supportURL.deletingLastPathComponent()
+            .appendingPathComponent(
+                "Mac Face Lock.displaced-\(UUID().uuidString)",
+                isDirectory: true
+            )
+
+        replacement = {
+            try FileManager.default.moveItem(
+                at: fixture.supportURL,
+                to: displaced
+            )
+            try FileManager.default.createDirectory(
+                at: fixture.supportURL,
+                withIntermediateDirectories: false
+            )
+            try FileManager.default.removeItem(at: fixture.supportURL)
+            try FileManager.default.moveItem(
+                at: displaced,
+                to: fixture.supportURL
+            )
+        }
+
+        guard case .ambiguous = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion(
+                "support root A-B-A replacement was accepted"
+            )
+        }
+        try require(
+            fixture.commandRunner.calls.isEmpty,
+            "support root replacement ran launchctl"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: fixture.journalURL.path),
+            "support root replacement created a journal"
+        )
+        try fixture.requireSupportPreserved("release.json")
+        try fixture.requirePreserved("data/face-template.bin")
+        try require(
+            FileManager.default.fileExists(atPath: fixture.agentURL.path)
+                && FileManager.default.fileExists(atPath: fixture.statusURL.path),
+            "support root replacement deleted a plist"
         )
     }
 
@@ -551,10 +693,9 @@ struct LegacyInstallCleanerTests {
         defer { fixture.remove() }
         try fixture.installKnownLegacyPairAndData()
         fixture.commandRunner.resultProvider = { _, arguments in
-            ServiceCommandResult(
-                exitCode: arguments.first == "bootout" ? 3 : 113,
-                stdout: "",
-                stderr: "service not found"
+            absentServiceResult(
+                arguments: arguments,
+                bootoutExitCode: 3
             )
         }
         let candidate = try fixture.confirmedCandidate()
@@ -567,6 +708,77 @@ struct LegacyInstallCleanerTests {
         try fixture.requireAllowlistedTargetsAbsent()
     }
 
+    private static func testRejectsNonAbsentPrintFailures() async throws {
+        let failures: [(Int32, String)] = [
+            (1, ""),
+            (77, "Permission denied"),
+            (113, "Bad request.\nCould not find service in another domain"),
+            (5, "Internal launchctl error"),
+        ]
+        for (exitCode, stderr) in failures {
+            let fixture = try LegacyCleanerFixture()
+            defer { fixture.remove() }
+            try fixture.installKnownLegacyPairAndData()
+            fixture.commandRunner.resultProvider = { _, arguments in
+                if arguments.first == "print" {
+                    return ServiceCommandResult(
+                        exitCode: exitCode,
+                        stdout: "",
+                        stderr: stderr
+                    )
+                }
+                return absentServiceResult(arguments: arguments)
+            }
+            let candidate = try fixture.confirmedCandidate()
+
+            guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {
+                throw TestFailure.assertion(
+                    "non-absent print failure was accepted: \(exitCode), \(stderr)"
+                )
+            }
+            try require(
+                fixture.fileExists("data/face-template.bin"),
+                "non-absent print failure deleted source data"
+            )
+            try require(
+                FileManager.default.fileExists(atPath: fixture.agentURL.path)
+                    && FileManager.default.fileExists(atPath: fixture.statusURL.path),
+                "non-absent print failure deleted a plist"
+            )
+        }
+    }
+
+    private static func testFinalVerificationRejectsNonAbsentPrintFailure()
+        async throws
+    {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        fixture.commandRunner.resultProvider = { callIndex, arguments in
+            if callIndex == 5 {
+                return ServiceCommandResult(
+                    exitCode: 77,
+                    stdout: "",
+                    stderr: "Permission denied"
+                )
+            }
+            return absentServiceResult(arguments: arguments)
+        }
+        let candidate = try fixture.confirmedCandidate()
+
+        guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion(
+                "final non-absent print failure was accepted"
+            )
+        }
+        try fixture.requireAllowlistedTargetsAbsent()
+        let journal = try fixture.journalObject()
+        try require(
+            journal["phase"] as? String == "plistsRemoved",
+            "final print failure did not retain retry phase"
+        )
+    }
+
     private static func testCommandFailureBlocksDeletion() async throws {
         let fixture = try LegacyCleanerFixture()
         defer { fixture.remove() }
@@ -575,11 +787,7 @@ struct LegacyInstallCleanerTests {
             if callIndex == 1 {
                 throw TestCommandError.injected
             }
-            return ServiceCommandResult(
-                exitCode: arguments.first == "print" ? 1 : 0,
-                stdout: "",
-                stderr: ""
-            )
+            return absentServiceResult(arguments: arguments)
         }
         let candidate = try fixture.confirmedCandidate()
 
@@ -620,12 +828,16 @@ struct LegacyInstallCleanerTests {
         defer { fixture.remove() }
         try fixture.installKnownLegacyPairAndData()
         fixture.commandRunner.resultProvider = { callIndex, arguments in
-            ServiceCommandResult(
-                exitCode: callIndex == 2 ? 0 : (
-                    arguments.first == "print" ? 1 : 5
-                ),
-                stdout: "",
-                stderr: ""
+            if callIndex == 2 {
+                return ServiceCommandResult(
+                    exitCode: 0,
+                    stdout: "",
+                    stderr: ""
+                )
+            }
+            return absentServiceResult(
+                arguments: arguments,
+                bootoutExitCode: 5
             )
         }
         let candidate = try fixture.confirmedCandidate()
@@ -679,13 +891,14 @@ struct LegacyInstallCleanerTests {
         defer { fixture.remove() }
         try fixture.installKnownLegacyPairAndData()
         fixture.commandRunner.resultProvider = { callIndex, arguments in
-            ServiceCommandResult(
-                exitCode: callIndex == 5 ? 0 : (
-                    arguments.first == "print" ? 1 : 0
-                ),
-                stdout: "",
-                stderr: ""
-            )
+            if callIndex == 5 {
+                return ServiceCommandResult(
+                    exitCode: 0,
+                    stdout: "",
+                    stderr: ""
+                )
+            }
+            return absentServiceResult(arguments: arguments)
         }
         let candidate = try fixture.confirmedCandidate()
 
@@ -703,6 +916,101 @@ struct LegacyInstallCleanerTests {
         try require(
             journal["root_path"] as? String == fixture.legacyRoot.path,
             "incomplete journal lost the root needed for retry"
+        )
+    }
+
+    private static func testInitialPlistReplacementBlocksDeletion() async throws {
+        var replacement: (() throws -> Void)?
+        let fixture = try LegacyCleanerFixture(testEventHandler: { event in
+            if event == "beforeInitialPlistRemoval" {
+                try replacement?()
+            }
+        })
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        let replacementData = try plistData(fixture.releaseAgentDictionary())
+        let agentURL = fixture.agentURL
+        replacement = {
+            try replaceFileAtomically(at: agentURL, with: replacementData)
+        }
+        let candidate = try fixture.confirmedCandidate()
+
+        guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion("initial Agent replacement was deleted")
+        }
+        try require(
+            FileManager.default.fileExists(atPath: agentURL.path),
+            "replacement release Agent plist was removed"
+        )
+        let persistedAgent = try Data(contentsOf: agentURL)
+        try require(
+            persistedAgent == replacementData,
+            "replacement release Agent plist was changed"
+        )
+    }
+
+    private static func testInitialInPlacePlistMutationBlocksDeletion() async throws {
+        var mutation: (() throws -> Void)?
+        let fixture = try LegacyCleanerFixture(testEventHandler: { event in
+            if event == "beforeInitialPlistRemoval" {
+                try mutation?()
+            }
+        })
+        defer { fixture.remove() }
+        try fixture.installKnownLegacyPairAndData()
+        let unrelatedData = try plistData([
+            "Label": "com.example.unrelated-status",
+        ])
+        let statusURL = fixture.statusURL
+        mutation = {
+            try unrelatedData.write(to: statusURL)
+        }
+        let candidate = try fixture.confirmedCandidate()
+
+        guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {
+            throw TestFailure.assertion("in-place Status mutation was deleted")
+        }
+        try require(
+            FileManager.default.fileExists(atPath: statusURL.path),
+            "in-place unrelated Status plist was removed"
+        )
+        let persistedStatus = try Data(contentsOf: statusURL)
+        try require(
+            persistedStatus == unrelatedData,
+            "in-place unrelated Status plist was changed"
+        )
+        try require(
+            FileManager.default.fileExists(atPath: fixture.agentURL.path),
+            "Agent plist was removed after Status mutation"
+        )
+    }
+
+    private static func testRetryPlistReplacementBlocksDeletion() async throws {
+        var replacement: (() throws -> Void)?
+        let fixture = try LegacyCleanerFixture(testEventHandler: { event in
+            if event == "beforeRetryPlistRemoval" {
+                try replacement?()
+            }
+        })
+        defer { fixture.remove() }
+        try await prepareConfirmedJournal(fixture)
+        let replacementData = try plistData(fixture.releaseAgentDictionary())
+        let agentURL = fixture.agentURL
+        replacement = {
+            try replaceFileAtomically(at: agentURL, with: replacementData)
+        }
+
+        guard case .cleanupIncomplete = await fixture.cleaner.retry() else {
+            throw TestFailure.assertion("retry Agent replacement was deleted")
+        }
+        try require(
+            FileManager.default.fileExists(atPath: agentURL.path),
+            "retry replacement release Agent plist was removed"
+        )
+        let persistedAgent = try Data(contentsOf: agentURL)
+        try require(
+            persistedAgent == replacementData,
+            "retry replacement release Agent plist was changed"
         )
     }
 
@@ -748,6 +1056,27 @@ struct LegacyInstallCleanerTests {
         )
     }
 
+    private static func testRetryCompletesWithoutLaunchAgentsDirectory()
+        async throws
+    {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try await prepareConfirmedJournal(fixture)
+        try FileManager.default.removeItem(at: fixture.launchAgentsURL)
+
+        let result = await fixture.cleaner.retry()
+
+        try require(
+            result == .notFound,
+            "retry did not accept an absent LaunchAgents directory: \(result)"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: fixture.launchAgentsURL.path),
+            "retry recreated the absent LaunchAgents directory"
+        )
+        try fixture.requireAllowlistedTargetsAbsent()
+    }
+
     private static func testRetryRejectsInvalidJournalMetadata() async throws {
         try await assertInvalidJournalBlocked("mode") { fixture in
             guard chmod(fixture.journalURL.path, 0o644) == 0 else {
@@ -765,6 +1094,18 @@ struct LegacyInstallCleanerTests {
             guard link(fixture.journalURL.path, sibling.path) == 0 else {
                 throw TestFailure.assertion("could not hard-link journal fixture")
             }
+            return fixture.cleaner
+        }
+        try await assertInvalidJournalBlocked("symlink") { fixture in
+            let external = fixture.container.appendingPathComponent(
+                "external-journal.json"
+            )
+            try Data("outside".utf8).write(to: external)
+            try FileManager.default.removeItem(at: fixture.journalURL)
+            try FileManager.default.createSymbolicLink(
+                at: fixture.journalURL,
+                withDestinationURL: external
+            )
             return fixture.cleaner
         }
         try await assertInvalidJournalBlocked("oversized") { fixture in
@@ -798,6 +1139,46 @@ struct LegacyInstallCleanerTests {
             }
             let inode = identity["inode"] as? NSNumber
             identity["inode"] = NSNumber(value: (inode?.uint64Value ?? 0) &+ 1)
+            journal["root_identity"] = identity
+            try fixture.writeJournalObject(journal)
+            return fixture.cleaner
+        }
+        try await assertInvalidJournalBlocked("root identity extra key") { fixture in
+            var journal = try fixture.journalObject()
+            guard var identity = journal["root_identity"] as? [String: Any] else {
+                throw TestFailure.assertion("journal root identity is missing")
+            }
+            identity["unexpected"] = 1
+            journal["root_identity"] = identity
+            try fixture.writeJournalObject(journal)
+            return fixture.cleaner
+        }
+        try await assertInvalidJournalBlocked("root identity string") { fixture in
+            var journal = try fixture.journalObject()
+            guard var identity = journal["root_identity"] as? [String: Any] else {
+                throw TestFailure.assertion("journal root identity is missing")
+            }
+            identity["device"] = "1"
+            journal["root_identity"] = identity
+            try fixture.writeJournalObject(journal)
+            return fixture.cleaner
+        }
+        try await assertInvalidJournalBlocked("root identity boolean") { fixture in
+            var journal = try fixture.journalObject()
+            guard var identity = journal["root_identity"] as? [String: Any] else {
+                throw TestFailure.assertion("journal root identity is missing")
+            }
+            identity["inode"] = true
+            journal["root_identity"] = identity
+            try fixture.writeJournalObject(journal)
+            return fixture.cleaner
+        }
+        try await assertInvalidJournalBlocked("root identity fractional") { fixture in
+            var journal = try fixture.journalObject()
+            guard var identity = journal["root_identity"] as? [String: Any] else {
+                throw TestFailure.assertion("journal root identity is missing")
+            }
+            identity["inode"] = 1.5
             journal["root_identity"] = identity
             try fixture.writeJournalObject(journal)
             return fixture.cleaner
@@ -886,11 +1267,7 @@ struct LegacyInstallCleanerTests {
             if callIndex == 1 {
                 throw TestCommandError.injected
             }
-            return ServiceCommandResult(
-                exitCode: arguments.first == "print" ? 1 : 0,
-                stdout: "",
-                stderr: ""
-            )
+            return absentServiceResult(arguments: arguments)
         }
         let candidate = try fixture.confirmedCandidate()
         guard case .cleanupIncomplete = await fixture.cleaner.clean(candidate) else {

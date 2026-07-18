@@ -77,6 +77,12 @@ struct SecureFileTreeTests {
         try testEnforcesEntryAndByteBudgets()
         try testReadLimitIsEnforced()
         try testIdentityReplacementBlocksRemoval()
+        try testInPlaceMutationBlocksRemoval()
+        try testDescriptorBoundAtomicFileRoundTrip()
+        try testDescriptorBoundWriteRejectsUnsafeNames()
+        try testDescriptorBoundWriteRejectsDestinationReplacement()
+        try testDescriptorBoundWriteRejectsRootReplacement()
+        try testDescriptorBoundReadRejectsABASwap()
         try testRootPathReplacementBlocksRemoval()
         try testRootIdentityMismatchBlocksRemoval()
         print("Secure file tree tests passed")
@@ -407,6 +413,329 @@ struct SecureFileTreeTests {
                     atPath: fixture.root.appendingPathComponent("data/state.json").path
                 ),
                 "replacement was removed after identity mismatch"
+            )
+        }
+    }
+
+    private static func testInPlaceMutationBlocksRemoval() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        try fixture.write("data/state.json", bytes: [0x7B, 0x7D])
+        let tree = try makeTree(fixture)
+        let manifest = try tree.preflight(
+            relativeTargets: ["data/state.json"],
+            budget: .legacyCleanup
+        )
+        try fixture.write(
+            "data/state.json",
+            bytes: Array(repeating: 0x41, count: 37)
+        )
+
+        do {
+            try tree.remove(manifest)
+            throw TestFailure.assertion("in-place replacement was deleted")
+        } catch SecureFileTreeError.identityChanged("data/state.json") {
+            try require(
+                FileManager.default.fileExists(
+                    atPath: fixture.root.appendingPathComponent(
+                        "data/state.json"
+                    ).path
+                ),
+                "in-place replacement was removed after metadata mismatch"
+            )
+        }
+    }
+
+    private static func testDescriptorBoundAtomicFileRoundTrip() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        let tree = try makeTree(fixture)
+        let first = Data(#"{"phase":"confirmed"}"#.utf8)
+        try tree.replaceFileAtomically(
+            "journal.json",
+            temporaryName: ".journal-first.tmp",
+            data: first,
+            maximumBytes: 64 * 1_024,
+            mode: 0o600
+        )
+        let firstPersisted = try tree.loadValidatedFile(
+            "journal.json",
+            maximumBytes: 64 * 1_024,
+            requiredMode: 0o600
+        )
+        try require(
+            firstPersisted == first,
+            "descriptor-bound file round trip changed bytes"
+        )
+
+        let second = Data(#"{"completed":true}"#.utf8)
+        try tree.replaceFileAtomically(
+            "journal.json",
+            temporaryName: ".journal-second.tmp",
+            data: second,
+            maximumBytes: 64 * 1_024,
+            mode: 0o600
+        )
+        let persisted = try tree.loadValidatedFile(
+            "journal.json",
+            maximumBytes: 64 * 1_024,
+            requiredMode: 0o600
+        )
+        try require(persisted == second, "atomic replacement kept stale bytes")
+        var metadata = stat()
+        try require(
+            lstat(fixture.root.appendingPathComponent("journal.json").path, &metadata) == 0
+                && metadata.st_uid == getuid()
+                && metadata.st_nlink == 1
+                && metadata.st_mode & 0o777 == 0o600,
+            "atomic destination metadata was unsafe"
+        )
+    }
+
+    private static func testDescriptorBoundWriteRejectsUnsafeNames() throws {
+        do {
+            let fixture = try SecureTreeFixture()
+            defer { fixture.remove() }
+            let external = fixture.outside.appendingPathComponent("journal")
+            try Data("outside".utf8).write(to: external)
+            try FileManager.default.createSymbolicLink(
+                at: fixture.root.appendingPathComponent("journal.json"),
+                withDestinationURL: external
+            )
+            let tree = try makeTree(fixture)
+
+            do {
+                try tree.replaceFileAtomically(
+                    "journal.json",
+                    temporaryName: ".journal.tmp",
+                    data: Data("new".utf8),
+                    maximumBytes: 64 * 1_024,
+                    mode: 0o600
+                )
+                throw TestFailure.assertion("symlink destination was replaced")
+            } catch is SecureFileTreeError {
+                let externalContents = try String(
+                    contentsOf: external,
+                    encoding: .utf8
+                )
+                try require(
+                    externalContents == "outside",
+                    "symlink destination escaped the retained directory"
+                )
+            }
+        }
+
+        do {
+            let fixture = try SecureTreeFixture()
+            defer { fixture.remove() }
+            try fixture.write("journal.json", bytes: [1])
+            let alias = fixture.root.appendingPathComponent("journal.alias")
+            guard link(
+                fixture.root.appendingPathComponent("journal.json").path,
+                alias.path
+            ) == 0 else {
+                throw TestFailure.assertion("could not create journal hard link")
+            }
+            let tree = try makeTree(fixture)
+            do {
+                try tree.replaceFileAtomically(
+                    "journal.json",
+                    temporaryName: ".journal.tmp",
+                    data: Data([2]),
+                    maximumBytes: 64 * 1_024,
+                    mode: 0o600
+                )
+                throw TestFailure.assertion("hard-link destination was replaced")
+            } catch SecureFileTreeError.hardLink("journal.json") {
+                let aliasContents = try Data(contentsOf: alias)
+                try require(
+                    aliasContents == Data([1]),
+                    "hard-linked destination was changed"
+                )
+            }
+        }
+
+        do {
+            let fixture = try SecureTreeFixture()
+            defer { fixture.remove() }
+            try fixture.write(".journal.tmp", bytes: [7])
+            let tree = try makeTree(fixture)
+            do {
+                try tree.replaceFileAtomically(
+                    "journal.json",
+                    temporaryName: ".journal.tmp",
+                    data: Data([8]),
+                    maximumBytes: 64 * 1_024,
+                    mode: 0o600
+                )
+                throw TestFailure.assertion("pre-existing temporary file was reused")
+            } catch SecureFileTreeError.systemCall("openat", ".journal.tmp", EEXIST) {
+                let temporaryContents = try Data(
+                    contentsOf: fixture.root.appendingPathComponent(".journal.tmp")
+                )
+                try require(
+                    temporaryContents == Data([7]),
+                    "pre-existing temporary file was changed"
+                )
+            }
+        }
+    }
+
+    private static func testDescriptorBoundWriteRejectsRootReplacement() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        let tree = try makeTree(fixture)
+        let displaced = fixture.home.appendingPathComponent(
+            "displaced-support",
+            isDirectory: true
+        )
+
+        do {
+            try tree.replaceFileAtomically(
+                "journal.json",
+                temporaryName: ".journal.tmp",
+                data: Data("secret".utf8),
+                maximumBytes: 64 * 1_024,
+                mode: 0o600,
+                beforeRename: {
+                    try FileManager.default.moveItem(
+                        at: fixture.root,
+                        to: displaced
+                    )
+                    try FileManager.default.createDirectory(
+                        at: fixture.root,
+                        withIntermediateDirectories: false
+                    )
+                    try FileManager.default.removeItem(at: fixture.root)
+                    try FileManager.default.moveItem(
+                        at: displaced,
+                        to: fixture.root
+                    )
+                }
+            )
+            throw TestFailure.assertion("support root A-B-A replacement was accepted")
+        } catch SecureFileTreeError.identityChanged {
+            try require(
+                !FileManager.default.fileExists(
+                    atPath: fixture.root.appendingPathComponent("journal.json").path
+                ),
+                "root replacement published the journal"
+            )
+        }
+    }
+
+    private static func testDescriptorBoundWriteRejectsDestinationReplacement()
+        throws
+    {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        let tree = try makeTree(fixture)
+        let journal = fixture.root.appendingPathComponent("journal.json")
+        let attacker = fixture.root.appendingPathComponent("attacker.json")
+        try tree.replaceFileAtomically(
+            "journal.json",
+            temporaryName: ".journal-first.tmp",
+            data: Data("trusted".utf8),
+            maximumBytes: 64 * 1_024,
+            mode: 0o600
+        )
+
+        do {
+            try tree.replaceFileAtomically(
+                "journal.json",
+                temporaryName: ".journal-second.tmp",
+                data: Data("new".utf8),
+                maximumBytes: 64 * 1_024,
+                mode: 0o600,
+                beforeRename: {
+                    try Data("attacker".utf8).write(to: attacker)
+                    guard chmod(attacker.path, 0o600) == 0 else {
+                        throw TestFailure.assertion(
+                            "could not set attacker journal mode"
+                        )
+                    }
+                    try FileManager.default.removeItem(at: journal)
+                    try FileManager.default.moveItem(at: attacker, to: journal)
+                }
+            )
+            throw TestFailure.assertion(
+                "destination replacement before rename was accepted"
+            )
+        } catch SecureFileTreeError.identityChanged("journal.json") {
+            let persisted = try String(contentsOf: journal, encoding: .utf8)
+            try require(
+                persisted == "attacker",
+                "destination replacement fixture was not preserved"
+            )
+        }
+
+        try tree.replaceFileAtomically(
+            "journal.json",
+            temporaryName: ".journal-third.tmp",
+            data: Data("trusted-again".utf8),
+            maximumBytes: 64 * 1_024,
+            mode: 0o600
+        )
+        let saved = fixture.root.appendingPathComponent("journal.saved")
+        do {
+            try tree.replaceFileAtomically(
+                "journal.json",
+                temporaryName: ".journal-fourth.tmp",
+                data: Data("new-again".utf8),
+                maximumBytes: 64 * 1_024,
+                mode: 0o600,
+                beforeRename: {
+                    try FileManager.default.moveItem(at: journal, to: saved)
+                    try Data("transient-attacker".utf8).write(to: journal)
+                    try FileManager.default.removeItem(at: journal)
+                    try FileManager.default.moveItem(at: saved, to: journal)
+                }
+            )
+            throw TestFailure.assertion(
+                "destination A-B-A replacement before rename was accepted"
+            )
+        } catch SecureFileTreeError.identityChanged(let path) {
+            try require(
+                path == "journal.json" || path == fixture.root.path,
+                "destination A-B-A error named unexpected path \(path)"
+            )
+            let persisted = try String(contentsOf: journal, encoding: .utf8)
+            try require(
+                persisted == "trusted-again",
+                "destination A-B-A fixture did not restore trusted bytes"
+            )
+        }
+    }
+
+    private static func testDescriptorBoundReadRejectsABASwap() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        let journal = fixture.root.appendingPathComponent("journal.json")
+        try Data("trusted".utf8).write(to: journal)
+        guard chmod(journal.path, 0o600) == 0 else {
+            throw TestFailure.assertion("could not set journal mode")
+        }
+        let tree = try makeTree(fixture)
+        let saved = fixture.root.appendingPathComponent("journal.saved")
+
+        do {
+            _ = try tree.loadValidatedFile(
+                "journal.json",
+                maximumBytes: 64 * 1_024,
+                requiredMode: 0o600,
+                afterOpen: {
+                    try FileManager.default.moveItem(at: journal, to: saved)
+                    try Data("attacker".utf8).write(to: journal)
+                    try FileManager.default.removeItem(at: journal)
+                    try FileManager.default.moveItem(at: saved, to: journal)
+                }
+            )
+            throw TestFailure.assertion("journal A-B-A read swap was accepted")
+        } catch SecureFileTreeError.identityChanged("journal.json") {
+            let restored = try String(contentsOf: journal, encoding: .utf8)
+            try require(
+                restored == "trusted",
+                "A-B-A fixture did not restore the original file"
             )
         }
     }

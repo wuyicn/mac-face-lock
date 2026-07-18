@@ -91,19 +91,25 @@ private final class LegacyCleanupJournalStore {
     private static let completionData = Data(
         #"{"schema_version":1,"completed":true}"#.utf8
     )
+    private static let journalName = "legacy-cleanup-v1.json"
 
     private let homeURL: URL
-    private let supportURL: URL
-    private let journalURL: URL
-    private let userID: uid_t
+    private let supportTree: SecureFileTree?
+    private let testEventHandler: ((String) throws -> Void)?
 
-    init(homeURL: URL, supportURL: URL, userID: uid_t) {
+    init(
+        homeURL: URL,
+        supportURL: URL,
+        userID: uid_t,
+        testEventHandler: ((String) throws -> Void)?
+    ) {
         self.homeURL = homeURL
-        self.supportURL = supportURL
-        self.journalURL = supportURL.appendingPathComponent(
-            "legacy-cleanup-v1.json"
+        self.supportTree = try? SecureFileTree(
+            rootURL: supportURL,
+            requiredAncestorURL: homeURL,
+            requiredOwner: userID
         )
-        self.userID = userID
+        self.testEventHandler = testEventHandler
     }
 
     func save(
@@ -134,17 +140,17 @@ private final class LegacyCleanupJournalStore {
     }
 
     func load() throws -> LegacyCleanupRecord {
-        let initialStat = try validatedJournalStat()
-        let tree = try validatedSupportTree()
-        let data = try readSecureData(
-            tree: tree,
-            name: journalURL.lastPathComponent
-        )
-        let finalStat = try validatedJournalStat()
-        guard
-            initialStat.st_dev == finalStat.st_dev,
-            initialStat.st_ino == finalStat.st_ino
-        else {
+        guard let supportTree else {
+            throw LegacyCleanupError.invalidJournal
+        }
+        let data: Data
+        do {
+            data = try supportTree.loadValidatedFile(
+                Self.journalName,
+                maximumBytes: Self.maximumBytes,
+                requiredMode: 0o600
+            )
+        } catch {
             throw LegacyCleanupError.invalidJournal
         }
 
@@ -165,16 +171,7 @@ private final class LegacyCleanupJournalStore {
                 LegacyCleanupJournal.self,
                 from: data
             ),
-            hasExactKeys(
-                data,
-                expected: [
-                    "schema_version",
-                    "root_path",
-                    "root_identity",
-                    "relative_targets",
-                    "phase",
-                ]
-            ),
+            hasExactJournalShape(data),
             journal.schemaVersion == LegacyCleanupJournal.currentSchemaVersion,
             journal.relativeTargets == LegacyIdentity.targets,
             validatedRootURL(journal.rootPath) != nil
@@ -197,104 +194,24 @@ private final class LegacyCleanupJournalStore {
         guard data.count <= Self.maximumBytes else {
             throw LegacyCleanupError.couldNotWriteJournal
         }
-        _ = try validatedSupportTree()
-
-        let temporaryURL = supportURL.appendingPathComponent(
-            ".legacy-cleanup-\(UUID().uuidString).tmp"
-        )
-        let flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC
-        let fileDescriptor = Darwin.open(
-            temporaryURL.path,
-            flags,
-            S_IRUSR | S_IWUSR
-        )
-        guard fileDescriptor >= 0 else {
+        guard let supportTree else {
             throw LegacyCleanupError.couldNotWriteJournal
         }
 
-        var shouldClose = true
-        var shouldRemoveTemporary = true
-        defer {
-            if shouldClose {
-                Darwin.close(fileDescriptor)
-            }
-            if shouldRemoveTemporary {
-                _ = Darwin.unlink(temporaryURL.path)
-            }
-        }
-
         do {
-            try data.withUnsafeBytes { rawBuffer in
-                guard let baseAddress = rawBuffer.baseAddress else {
-                    return
+            try supportTree.replaceFileAtomically(
+                Self.journalName,
+                temporaryName: ".legacy-cleanup-\(UUID().uuidString).tmp",
+                data: data,
+                maximumBytes: Self.maximumBytes,
+                mode: 0o600,
+                beforeRename: {
+                    try self.testEventHandler?("beforeJournalRename")
                 }
-                var offset = 0
-                while offset < rawBuffer.count {
-                    let written = Darwin.write(
-                        fileDescriptor,
-                        baseAddress.advanced(by: offset),
-                        rawBuffer.count - offset
-                    )
-                    if written < 0 {
-                        if errno == EINTR {
-                            continue
-                        }
-                        throw LegacyCleanupError.couldNotWriteJournal
-                    }
-                    guard written > 0 else {
-                        throw LegacyCleanupError.couldNotWriteJournal
-                    }
-                    offset += written
-                }
-            }
-            guard Darwin.fchmod(fileDescriptor, S_IRUSR | S_IWUSR) == 0 else {
-                throw LegacyCleanupError.couldNotWriteJournal
-            }
-            guard Darwin.fsync(fileDescriptor) == 0 else {
-                throw LegacyCleanupError.couldNotWriteJournal
-            }
-            let closeResult = Darwin.close(fileDescriptor)
-            shouldClose = false
-            guard closeResult == 0 else {
-                throw LegacyCleanupError.couldNotWriteJournal
-            }
-            guard Darwin.rename(temporaryURL.path, journalURL.path) == 0 else {
-                throw LegacyCleanupError.couldNotWriteJournal
-            }
-            shouldRemoveTemporary = false
-        } catch {
-            throw LegacyCleanupError.couldNotWriteJournal
-        }
-    }
-
-    private func validatedSupportTree() throws -> SecureFileTree {
-        do {
-            return try SecureFileTree(
-                rootURL: supportURL,
-                requiredAncestorURL: homeURL,
-                requiredOwner: userID
             )
         } catch {
-            throw LegacyCleanupError.invalidJournal
+            throw LegacyCleanupError.couldNotWriteJournal
         }
-    }
-
-    private func validatedJournalStat() throws -> stat {
-        var result = stat()
-        guard lstat(journalURL.path, &result) == 0 else {
-            throw LegacyCleanupError.invalidJournal
-        }
-        guard
-            result.st_uid == userID,
-            result.st_mode & S_IFMT == S_IFREG,
-            result.st_nlink == 1,
-            result.st_mode & 0o777 == 0o600,
-            result.st_size >= 0,
-            result.st_size <= Self.maximumBytes
-        else {
-            throw LegacyCleanupError.invalidJournal
-        }
-        return result
     }
 
     private func validatedRootURL(_ path: String) -> URL? {
@@ -324,11 +241,46 @@ private final class LegacyCleanupJournalStore {
         }
         return Set(dictionary.keys) == expected
     }
+
+    private func hasExactJournalShape(_ data: Data) -> Bool {
+        guard
+            let dictionary = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+            Set(dictionary.keys) == [
+                "schema_version",
+                "root_path",
+                "root_identity",
+                "relative_targets",
+                "phase",
+            ],
+            let identity = dictionary["root_identity"] as? [String: Any],
+            Set(identity.keys) == ["device", "inode"],
+            isExactUnsignedInteger(identity["device"]),
+            isExactUnsignedInteger(identity["inode"])
+        else {
+            return false
+        }
+        return true
+    }
+
+    private func isExactUnsignedInteger(_ value: Any?) -> Bool {
+        guard let number = value as? NSNumber else {
+            return false
+        }
+        let object = number as CFTypeRef
+        guard CFGetTypeID(object) != CFBooleanGetTypeID() else {
+            return false
+        }
+        let encoding = String(cString: number.objCType)
+        return ["c", "C", "s", "S", "i", "I", "l", "L", "q", "Q"]
+            .contains(encoding)
+    }
 }
 
 private struct LegacyPlistSnapshot {
     let dataByName: [String: Data]
     let identityByName: [String: SecureFileIdentity]
+    let manifest: SecureTreeManifest
 }
 
 private enum LegacyAgentKind {
@@ -349,6 +301,7 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
     private let commandRunner: ServiceCommandRunning
     private let userID: uid_t
     private let journalStore: LegacyCleanupJournalStore
+    private let testEventHandler: ((String) throws -> Void)?
 
     private var launchAgentsURL: URL {
         homeURL.appendingPathComponent(
@@ -362,17 +315,20 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
         appURL: URL = Bundle.main.bundleURL,
         supportURL: URL,
         commandRunner: ServiceCommandRunning = BoundedServiceCommandRunner(),
-        userID: uid_t = getuid()
+        userID: uid_t = getuid(),
+        testEventHandler: ((String) throws -> Void)? = nil
     ) {
         self.homeURL = homeURL.standardizedFileURL
         self.appURL = appURL.standardizedFileURL
         self.supportURL = supportURL.standardizedFileURL
         self.commandRunner = commandRunner
         self.userID = userID
+        self.testEventHandler = testEventHandler
         self.journalStore = LegacyCleanupJournalStore(
             homeURL: self.homeURL,
             supportURL: self.supportURL,
-            userID: userID
+            userID: userID,
+            testEventHandler: testEventHandler
         )
     }
 
@@ -572,6 +528,7 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
     private func preflightAllTargetsWithoutMutation(
         _ candidate: LegacyCleanupCandidate
     ) throws {
+        try validateNoReleaseSupportOverlap(candidate)
         guard inspect() == .confirmed(candidate) else {
             throw LegacyCleanupError.verificationFailed("candidate")
         }
@@ -581,6 +538,24 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             budget: .legacyCleanup
         )
         try verifyLegacyPlistIdentities(candidate)
+    }
+
+    private func validateNoReleaseSupportOverlap(
+        _ candidate: LegacyCleanupCandidate
+    ) throws {
+        for target in LegacyIdentity.targets {
+            let targetURL = candidate.rootURL.appendingPathComponent(
+                target
+            ).standardizedFileURL
+            guard
+                !isEqualOrDescendant(supportURL, of: targetURL),
+                !isEqualOrDescendant(targetURL, of: supportURL)
+            else {
+                throw LegacyCleanupError.verificationFailed(
+                    "release support overlap"
+                )
+            }
+        }
     }
 
     private func preflightAllRemainingTargetsWithoutMutation(
@@ -621,27 +596,21 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
     private func removeLegacyPlists(
         _ candidate: LegacyCleanupCandidate
     ) throws {
-        let tree = try launchAgentsTree()
-        try verifyLegacyPlistIdentities(candidate, tree: tree)
-        for name in [LegacyIdentity.statusPlist, LegacyIdentity.agentPlist] {
-            let manifest = try tree.preflight(
-                relativeTargets: [name],
-                budget: plistBudget
-            )
-            try tree.remove(manifest)
-        }
+        let snapshot = try validatedInitialPlistSnapshot(candidate)
+        try testEventHandler?("beforeInitialPlistRemoval")
+        try removePlistsBoundToSnapshot(
+            snapshot,
+            requireBoth: true
+        )
     }
 
     private func removeLegacyPlistsForRetry(rootURL: URL) throws {
-        try validateRemainingLegacyPlists(rootURL: rootURL)
-        let tree = try launchAgentsTree()
-        for name in [LegacyIdentity.statusPlist, LegacyIdentity.agentPlist] {
-            let manifest = try tree.preflight(
-                relativeTargets: [name],
-                budget: plistBudget
-            )
-            try tree.remove(manifest)
-        }
+        let snapshot = try validatedRemainingLegacyPlists(rootURL: rootURL)
+        try testEventHandler?("beforeRetryPlistRemoval")
+        try removePlistsBoundToSnapshot(
+            snapshot,
+            requireBoth: false
+        )
     }
 
     private func verifyEverythingAbsent(
@@ -671,14 +640,8 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             throw LegacyCleanupError.verificationFailed("source targets")
         }
 
-        let plistManifest = try launchAgentsTree().preflight(
-            relativeTargets: [
-                LegacyIdentity.agentPlist,
-                LegacyIdentity.statusPlist,
-            ],
-            budget: plistBudget
-        )
-        guard plistManifest.entriesDeepestFirst.isEmpty else {
+        if let snapshot = try readLegacyPlists(),
+           !snapshot.dataByName.isEmpty {
             throw LegacyCleanupError.verificationFailed("legacy plists")
         }
     }
@@ -715,6 +678,14 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
         )
     }
 
+    private func launchAgentsTreeIfPresent() throws -> SecureFileTree? {
+        do {
+            return try launchAgentsTree()
+        } catch SecureFileTreeError.systemCall(_, _, let code) where code == ENOENT {
+            return nil
+        }
+    }
+
     private var plistBudget: SecureTreeBudget {
         SecureTreeBudget(
             maximumEntries: 2,
@@ -723,35 +694,39 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
     }
 
     private func verifyLegacyPlistIdentities(
-        _ candidate: LegacyCleanupCandidate,
-        tree: SecureFileTree? = nil
+        _ candidate: LegacyCleanupCandidate
     ) throws {
-        let tree = try tree ?? launchAgentsTree()
-        let manifest = try tree.preflight(
-            relativeTargets: [
-                LegacyIdentity.agentPlist,
-                LegacyIdentity.statusPlist,
-            ],
-            budget: plistBudget
-        )
-        let identities = Dictionary(
-            uniqueKeysWithValues: manifest.entriesDeepestFirst.map {
-                ($0.relativePath, $0.identity)
-            }
-        )
+        _ = try validatedInitialPlistSnapshot(candidate)
+    }
+
+    private func validatedInitialPlistSnapshot(
+        _ candidate: LegacyCleanupCandidate
+    ) throws -> LegacyPlistSnapshot {
+        guard let snapshot = try readLegacyPlists() else {
+            throw LegacyCleanupError.verificationFailed("legacy plists")
+        }
         guard
-            identities[LegacyIdentity.agentPlist]
+            snapshot.identityByName[LegacyIdentity.agentPlist]
                 == candidate.agentPlistIdentity,
-            identities[LegacyIdentity.statusPlist]
-                == candidate.statusPlistIdentity
+            snapshot.identityByName[LegacyIdentity.statusPlist]
+                == candidate.statusPlistIdentity,
+            let agentData = snapshot.dataByName[LegacyIdentity.agentPlist],
+            let statusData = snapshot.dataByName[LegacyIdentity.statusPlist],
+            case .source(let agentRoot) = parseAgent(agentData),
+            case .source(let statusRoot) = parseStatus(statusData),
+            agentRoot == candidate.rootURL,
+            statusRoot == candidate.rootURL
         else {
             throw LegacyCleanupError.verificationFailed("legacy plists")
         }
+        return snapshot
     }
 
-    private func validateRemainingLegacyPlists(rootURL: URL) throws {
+    private func validatedRemainingLegacyPlists(
+        rootURL: URL
+    ) throws -> LegacyPlistSnapshot? {
         guard let snapshot = try readLegacyPlists() else {
-            return
+            return nil
         }
         if let agentData = snapshot.dataByName[LegacyIdentity.agentPlist] {
             guard case .source(let sourceRoot) = parseAgent(agentData),
@@ -764,6 +739,46 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
                   sourceRoot == rootURL else {
                 throw LegacyCleanupError.verificationFailed("legacy Status plist")
             }
+        }
+        return snapshot
+    }
+
+    private func validateRemainingLegacyPlists(rootURL: URL) throws {
+        _ = try validatedRemainingLegacyPlists(rootURL: rootURL)
+    }
+
+    private func removePlistsBoundToSnapshot(
+        _ snapshot: LegacyPlistSnapshot?,
+        requireBoth: Bool
+    ) throws {
+        let entries = Dictionary(
+            uniqueKeysWithValues: (snapshot?.manifest.entriesDeepestFirst ?? [])
+                .map { ($0.relativePath, $0) }
+        )
+        if requireBoth {
+            guard
+                entries[LegacyIdentity.agentPlist] != nil,
+                entries[LegacyIdentity.statusPlist] != nil
+            else {
+                throw LegacyCleanupError.verificationFailed("legacy plists")
+            }
+        }
+        guard let tree = try launchAgentsTreeIfPresent() else {
+            guard entries.isEmpty else {
+                throw LegacyCleanupError.verificationFailed("legacy plists")
+            }
+            return
+        }
+        for name in [LegacyIdentity.statusPlist, LegacyIdentity.agentPlist] {
+            guard let entry = entries[name] else {
+                continue
+            }
+            try tree.remove(
+                SecureTreeManifest(
+                    rootIdentity: snapshot!.manifest.rootIdentity,
+                    entriesDeepestFirst: [entry]
+                )
+            )
         }
     }
 
@@ -780,11 +795,20 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             arguments: ["print", service],
             timeout: 5
         )
-        guard printResult.exitCode != 0 else {
+        if printResult.exitCode == 0 {
             let suffix = bootout.exitCode == 0
                 ? ""
                 : "（停止命令代码 \(bootout.exitCode)）"
             throw LegacyCleanupError.serviceStillLoaded(label + suffix)
+        }
+        guard isExactServiceAbsent(
+            printResult,
+            service: service,
+            label: label
+        ) else {
+            throw LegacyCleanupError.verificationFailed(
+                "launchctl print \(label)"
+            )
         }
     }
 
@@ -795,9 +819,36 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             arguments: ["print", service],
             timeout: 5
         )
-        guard result.exitCode != 0 else {
+        if result.exitCode == 0 {
             throw LegacyCleanupError.serviceStillLoaded(label)
         }
+        guard isExactServiceAbsent(
+            result,
+            service: service,
+            label: label
+        ) else {
+            throw LegacyCleanupError.verificationFailed(
+                "launchctl print \(label)"
+            )
+        }
+    }
+
+    private func isExactServiceAbsent(
+        _ result: ServiceCommandResult,
+        service: String,
+        label: String
+    ) -> Bool {
+        guard result.exitCode == 113 else {
+            return false
+        }
+        let lines = result.stderr
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+        let direct = "Could not find service \"\(service)\""
+        let domain = "Could not find service \"\(label)\" "
+            + "in domain for user gui: \(userID)"
+        return lines == ["Bad request.", direct]
+            || lines == ["Bad request.", domain]
     }
 
     private func readLegacyPlists() throws -> LegacyPlistSnapshot? {
@@ -847,7 +898,8 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
                 uniqueKeysWithValues: finalManifest.entriesDeepestFirst.map {
                     ($0.relativePath, $0.identity)
                 }
-            )
+            ),
+            manifest: finalManifest
         )
     }
 
