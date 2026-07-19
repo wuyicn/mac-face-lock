@@ -24,7 +24,11 @@ EXIT_INVALID_ARGUMENTS = 2
 EXIT_PERMISSION_OR_CAMERA = 10
 EXIT_OWNER_PROFILE_INVALID = 11
 EXIT_OWNER_VERIFICATION_FAILED = 12
+EXIT_ENROLLMENT_TIMEOUT = 13
 EXIT_RUNTIME_FAILURE = 20
+ENROLLMENT_TIMEOUT_MESSAGE = (
+    "Enrollment timed out before every configured pose was completed."
+)
 
 
 def emit(event: str, status: str, message: str, **fields: object) -> None:
@@ -159,6 +163,10 @@ def _is_camera_error(exc: Exception) -> bool:
     return "camera" in message or "摄像头" in message
 
 
+def _is_enrollment_timeout(error: RuntimeError) -> bool:
+    return str(error) == ENROLLMENT_TIMEOUT_MESSAGE
+
+
 def _run_verify_owner_command(paths: RuntimePaths) -> int:
     config = _load_config(paths)
     try:
@@ -216,6 +224,9 @@ def main(
         if _is_camera_error(exc):
             emit("camera_unavailable", "error", str(exc))
             return EXIT_PERMISSION_OR_CAMERA
+        if _is_enrollment_timeout(exc):
+            emit("enrollment_timeout", "error", str(exc))
+            return EXIT_ENROLLMENT_TIMEOUT
         emit("runtime_failure", "error", str(exc))
         return EXIT_RUNTIME_FAILURE
     except Exception as exc:

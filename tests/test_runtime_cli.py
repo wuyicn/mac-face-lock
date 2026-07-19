@@ -360,6 +360,18 @@ class RuntimeCLITests(unittest.TestCase):
         self.assertEqual(result.returncode, runtime_cli.EXIT_PERMISSION_OR_CAMERA)
         self.assertEqual(self.events(result)[-1]["event"], "camera_unavailable")
 
+    def test_enrollment_timeout_uses_dedicated_repair_event(self):
+        with patch(
+            "runtime_cli.enroll_owner",
+            side_effect=RuntimeError(
+                "Enrollment timed out before every configured pose was completed."
+            ),
+        ):
+            result = self.run_cli("enroll")
+
+        self.assertEqual(result.returncode, 13)
+        self.assertEqual(self.events(result)[-1]["event"], "enrollment_timeout")
+
     def test_readable_frames_without_faces_remain_verification_failure(self):
         capture = SimpleNamespace(
             isOpened=lambda: True,
