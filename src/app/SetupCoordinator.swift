@@ -2145,6 +2145,8 @@ final class SetupCoordinator: ObservableObject {
             return "本人人脸资料无效，请重新录入本人。"
         case 12:
             return "未能确认当前使用者是本人，请调整光线和姿势后重试。"
+        case 13:
+            return "录入超时，请保持脸部居中并按照当前动作重试。"
         case 20:
             return "运行组件发生错误，请重新运行诊断；若仍失败，请重新安装应用。"
         default:

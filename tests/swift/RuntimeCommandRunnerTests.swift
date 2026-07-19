@@ -335,6 +335,11 @@ struct RuntimeCommandRunnerTests {
             ),
             (
                 .enroll,
+                [#"{"schema_version":1,"event":"enrollment_timeout","status":"error","message":"timeout"}"#],
+                13
+            ),
+            (
+                .enroll,
                 [#"{"schema_version":1,"event":"runtime_failure","status":"error","message":"runtime"}"#],
                 20
             ),

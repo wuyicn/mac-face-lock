@@ -14,7 +14,12 @@ enum RuntimeCommand: String, CaseIterable, Hashable {
             return Set(["agent_started", "agent_stopped"] + failures)
         case .enroll:
             return Set(
-                ["enrollment_started", "enrollment_progress", "enrollment_complete"] + failures
+                [
+                    "enrollment_started",
+                    "enrollment_progress",
+                    "enrollment_complete",
+                    "enrollment_timeout",
+                ] + failures
             )
         case .diagnose:
             return Set(["diagnosis_check", "diagnosis_complete"] + failures)
@@ -31,7 +36,7 @@ enum RuntimeCommand: String, CaseIterable, Hashable {
         case .agent:
             return Set(["agent_stopped"] + failures)
         case .enroll:
-            return Set(["enrollment_complete"] + failures)
+            return Set(["enrollment_complete", "enrollment_timeout"] + failures)
         case .diagnose:
             return Set(["diagnosis_complete"] + failures)
         case .verifyOwner:
@@ -139,6 +144,7 @@ enum RuntimeTerminalCompatibility {
         case .enroll:
             switch (terminalEvent.event, terminalEvent.status, exitCode) {
             case ("enrollment_complete", "success", 0),
+                 ("enrollment_timeout", "error", 13),
                  ("camera_unavailable", "error", 10),
                  ("runtime_failure", "error", 20):
                 return true
