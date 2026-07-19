@@ -1,6 +1,6 @@
 # Mac Face Lock 0.2.0-beta 发行交接
 
-更新时间：2026-07-18（Asia/Shanghai）
+更新时间：2026-07-19（Asia/Shanghai）
 
 ## 结论
 
@@ -10,7 +10,7 @@
 
 ## 已验证版本
 
-- 已验证实现提交：`6366a44633a3fe74df896115d6d7303189b155cc`
+- 已验证实现提交：`d7fa27e22316df4a8d21e46638c31d5e66c9cf98`
 - 分支：`codex/self-contained-onboarding`
 - 应用营销版本：`0.2.0`
 - build：`1`
@@ -23,8 +23,8 @@
 ## 最终发行构件
 
 - ZIP：`dist/release/Mac-Face-Lock-0.2.0-beta-arm64.zip`
-- 大小：`63,392,660` bytes
-- SHA-256：`6975694b4ce59195f08913bab0bb86ac98910410b498f151d97e42f5628c7a9b`
+- 大小：`63,393,729` bytes
+- SHA-256：`18b4afdeddef9f0aeb40208d0f9cfd15b74c3ff588063d2b34699f53421f9d9a`
 - 校验文件：`dist/release/Mac-Face-Lock-0.2.0-beta-arm64.zip.sha256`
 
 ZIP 与校验文件已用 `shasum -a 256 -c` 核对通过。解压后的外层应用、内嵌 Agent 和冻结运行时均为 arm64，最低系统版本为 macOS `12.0`；外层应用和内嵌代码的临时签名已通过严格深度验证。
