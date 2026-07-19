@@ -29,9 +29,11 @@ Mac Face Lock 只清理已精确识别、用户明确确认且预检清单覆盖
    猜测可能的 purge 文件。
 6. 若最终移动得到的 inode 不匹配，代码尝试把该对象原子恢复到原名称；
    恢复失败时也不会删除它。
-7. 普通文件的最终 `unlinkat` 同时使用 `AT_UNIQUE` 与
-   `AT_NODELETEBUSY`，目录使用 `AT_NODELETEBUSY`。这会拒绝多硬链接文件
-   和仍被打开的对象。
+7. macOS 26 及以上版本中，普通文件的最终 `unlinkat` 同时使用
+   `AT_UNIQUE` 与 `AT_NODELETEBUSY`，目录使用 `AT_NODELETEBUSY`，从而
+   拒绝多硬链接文件和仍被打开的对象。macOS 12–15 的 SDK 与内核没有这两个
+   标志，因此这些系统使用标准 `unlinkat` 标志；两层隔离、移动后身份验证、
+   精确日志和失败关闭边界保持不变。
 
 ## 不宣称的保证
 

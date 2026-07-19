@@ -65,6 +65,7 @@ private struct SecureTreeFixture {
 @main
 struct SecureFileTreeTests {
     static func main() throws {
+        try testUnlinkFlagsRemainCompatibleWithOlderDarwinSDKs()
         try testReadsPreflightsAndRemovesOrdinaryTree()
         try testEmptyAndMissingTargets()
         try testRejectsInvalidRelativePaths()
@@ -94,6 +95,37 @@ struct SecureFileTreeTests {
         try testRootPathReplacementBlocksRemoval()
         try testRootIdentityMismatchBlocksRemoval()
         print("Secure file tree tests passed")
+    }
+
+    private static func testUnlinkFlagsRemainCompatibleWithOlderDarwinSDKs() throws {
+        try require(
+            SecureRemovalFlags.unlinkFlags(
+                kind: .file,
+                operatingSystemMajorVersion: 15
+            ) == 0,
+            "older macOS file removal used unsupported unlinkat flags"
+        )
+        try require(
+            SecureRemovalFlags.unlinkFlags(
+                kind: .directory,
+                operatingSystemMajorVersion: 15
+            ) == AT_REMOVEDIR,
+            "older macOS directory removal lost AT_REMOVEDIR compatibility"
+        )
+        try require(
+            SecureRemovalFlags.unlinkFlags(
+                kind: .file,
+                operatingSystemMajorVersion: 26
+            ) == 0xC000,
+            "macOS 26 file removal lost busy/link-count defenses"
+        )
+        try require(
+            SecureRemovalFlags.unlinkFlags(
+                kind: .directory,
+                operatingSystemMajorVersion: 26
+            ) == (AT_REMOVEDIR | 0x4000),
+            "macOS 26 directory removal used the wrong defense flags"
+        )
     }
 
     private static func makeTree(_ fixture: SecureTreeFixture) throws -> SecureFileTree {

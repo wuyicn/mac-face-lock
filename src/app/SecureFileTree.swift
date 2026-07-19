@@ -91,6 +91,29 @@ enum SecureFileTreeError: Error, Equatable {
     case systemCall(String, String, Int32)
 }
 
+enum SecureRemovalFlags {
+    // These Darwin flags first appear in the macOS 26 SDK and kernel. Keep
+    // older supported systems on the portable unlinkat flag set.
+    private static let noDeleteBusy: Int32 = 0x4000
+    private static let unique: Int32 = 0x8000
+
+    static func unlinkFlags(
+        kind: SecureTreeEntry.Kind,
+        operatingSystemMajorVersion: Int =
+            ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+    ) -> Int32 {
+        var flags: Int32 = kind == .directory ? AT_REMOVEDIR : 0
+        guard operatingSystemMajorVersion >= 26 else {
+            return flags
+        }
+        flags |= noDeleteBusy
+        if kind == .file {
+            flags |= unique
+        }
+        return flags
+    }
+}
+
 private enum SecurePurgeState: Equatable {
     case absent
     case original
@@ -1037,11 +1060,7 @@ final class SecureFileTree {
             at: purge.purgeRelativePath,
             allowRenameCtimeChange: true
         )
-        var flags = purge.kind == .directory ? AT_REMOVEDIR : 0
-        flags |= AT_NODELETEBUSY
-        if purge.kind == .file {
-            flags |= AT_UNIQUE
-        }
+        let flags = SecureRemovalFlags.unlinkFlags(kind: purge.kind)
         guard unlinkat(parentFD, name, flags) == 0 else {
             throw SecureFileTreeError.systemCall(
                 "unlinkat",
@@ -1899,11 +1918,7 @@ final class SecureFileTree {
             throw error
         }
 
-        var flags = entry.kind == .directory ? AT_REMOVEDIR : 0
-        flags |= AT_NODELETEBUSY
-        if entry.kind == .file {
-            flags |= AT_UNIQUE
-        }
+        let flags = SecureRemovalFlags.unlinkFlags(kind: entry.kind)
         guard unlinkat(parentFD, purgeName, flags) == 0 else {
             let savedErrno = errno
             try restoreFinalQuarantine(
