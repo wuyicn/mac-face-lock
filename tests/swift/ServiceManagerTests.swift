@@ -292,6 +292,8 @@ struct ServiceManagerTests {
         try await testInstallReadsOnlyCurrentManagedFiles()
         try await testStatusReadsOnlyCurrentManagedFiles()
         try await testRestartReadsNoFiles()
+        try await testInstallBootstrapDoesNotKickstart()
+        try await testLoadedRollbackBootstrapDoesNotKickstart()
         try await testUninstallReadsNoFiles()
         try await testInstallRendersOnlyApplicationAndSupportPaths()
         try await testFailedStableHealthRestoresPreviousPlistAndJob()
@@ -368,10 +370,91 @@ struct ServiceManagerTests {
 
         try await fixture.manager().restart()
 
+        try require(
+            fixture.runner.calls.map(\.arguments) == [
+                ["enable", "gui/501/com.wuyi.mac-face-lock-agent"],
+                ["kickstart", "-k", "gui/501/com.wuyi.mac-face-lock-agent"],
+            ],
+            "explicit restart did not preserve enable followed by kickstart"
+        )
         try requireReadBoundary(
             fixture,
             operation: "restart",
             allowedReadPaths: []
+        )
+    }
+
+    private static func testInstallBootstrapDoesNotKickstart() async throws {
+        let fixture = try ServiceFixture(printPIDs: [42, 42, 42])
+        try fixture.seedHealthyStateSequence(sequences: [1, 2, 3])
+
+        try await fixture.manager().install(
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+
+        let mutationCalls = fixture.runner.calls.map(\.arguments).filter {
+            ["bootout", "bootstrap", "enable", "kickstart"].contains($0.first)
+        }
+        try require(
+            mutationCalls == [
+                ["bootout", "gui/501/com.wuyi.mac-face-lock-agent"],
+                [
+                    "bootstrap",
+                    "gui/501",
+                    fixture.plistURL.standardizedFileURL.path,
+                ],
+                ["enable", "gui/501/com.wuyi.mac-face-lock-agent"],
+            ],
+            "successful install kickstarted a RunAtLoad job after bootstrap"
+        )
+    }
+
+    private static func testLoadedRollbackBootstrapDoesNotKickstart() async throws {
+        let fixture = try ServiceFixture(
+            loaded: true,
+            printPIDs: [99, 41, 42, 42]
+        )
+        let previous: [String: Any] = [
+            "Label": "com.wuyi.mac-face-lock-agent",
+            "ProgramArguments": ["/previous/MacFaceLockAgent", "/previous/project"],
+            "RunAtLoad": true,
+            "KeepAlive": true,
+        ]
+        fixture.fileSystem.seed(
+            try PropertyListSerialization.data(
+                fromPropertyList: previous,
+                format: .xml,
+                options: 0
+            ),
+            at: fixture.plistURL
+        )
+        try fixture.seedHealthyStateSequence(pid: 42, sequences: [1, 2, 3])
+
+        do {
+            try await fixture.manager(pollAttempts: 3).install(
+                appURL: fixture.appURL,
+                supportURL: fixture.supportURL
+            )
+            throw TestFailure.assertion("unstable service install unexpectedly succeeded")
+        } catch is ServiceManagerError {
+            // Expected.
+        }
+
+        let mutationCalls = fixture.runner.calls.map(\.arguments).filter {
+            ["bootout", "bootstrap", "enable", "kickstart"].contains($0.first)
+        }
+        try require(
+            Array(mutationCalls.suffix(3)) == [
+                ["bootout", "gui/501/com.wuyi.mac-face-lock-agent"],
+                [
+                    "bootstrap",
+                    "gui/501",
+                    fixture.plistURL.standardizedFileURL.path,
+                ],
+                ["enable", "gui/501/com.wuyi.mac-face-lock-agent"],
+            ],
+            "loaded rollback kickstarted a RunAtLoad job after bootstrap"
         )
     }
 

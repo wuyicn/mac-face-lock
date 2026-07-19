@@ -331,7 +331,6 @@ final class ServiceManager: ServiceManaging {
                 ["bootstrap", userDomain, destinationURL.path]
             )
             try await runRequiredLaunchctl(["enable", serviceTarget])
-            try await runRequiredLaunchctl(["kickstart", "-k", serviceTarget])
             try await requireStableHealth()
             if fileSystem.fileExists(at: backupURL) {
                 try fileSystem.removeItem(at: backupURL)
@@ -613,7 +612,6 @@ final class ServiceManager: ServiceManaging {
                     ["bootstrap", userDomain, plistURL.path]
                 )
                 try await runRequiredLaunchctl(["enable", serviceTarget])
-                try await runRequiredLaunchctl(["kickstart", "-k", serviceTarget])
             }
         } else if fileSystem.fileExists(at: plistURL) {
             try fileSystem.removeItem(at: plistURL)
