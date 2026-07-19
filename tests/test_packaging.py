@@ -300,6 +300,17 @@ class UnifiedPackagingTests(unittest.TestCase):
         self.assertIn("Mac Face Lock Agent 权限", settings)
         self.assertIn("enrollmentLifecycle", onboarding)
 
+        for guidance in (
+            "EnrollmentPoseGuide",
+            "正脸 · 左转约 30° · 右转约 30° · 轻微抬头 · 轻微低头",
+            "正对摄像头，脸部保持居中",
+            "只转动头部约 30°，身体保持不动",
+            "轻抬下巴约 15–20°，不要后仰身体",
+            "轻收下巴约 15–20°，不要弯腰或把脸完全低下去",
+        ):
+            with self.subTest(enrollment_guidance=guidance):
+                self.assertIn(guidance, onboarding)
+
         user_facing_sources = onboarding + settings
         for shell_copy in (
             "launchctl ",

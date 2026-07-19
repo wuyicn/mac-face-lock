@@ -384,7 +384,7 @@ struct OnboardingView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text("采样动作")
                     .font(.headline)
-                Text("正脸 · 左转约 30° · 右转约 30° · 轻微低头 · 轻微抬头")
+                Text("正脸 · 左转约 30° · 右转约 30° · 轻微抬头 · 轻微低头")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let pose = setupCoordinator.enrollmentPose {
@@ -393,6 +393,7 @@ struct OnboardingView: View {
                         systemImage: "person.crop.rectangle"
                     )
                     .font(.callout.weight(.semibold))
+                    EnrollmentPoseGuide(pose: pose)
                 }
                 if setupCoordinator.enrollmentQuality == "rejected",
                    let reason = setupCoordinator.enrollmentRejectionReason {
@@ -834,6 +835,75 @@ private struct OnboardingCard<Content: View>: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(Color.white.opacity(0.12), lineWidth: 1)
         }
+    }
+}
+
+private struct EnrollmentPoseGuide: View {
+    let pose: String
+
+    private var symbol: String {
+        switch pose {
+        case "left": return "arrow.left"
+        case "right": return "arrow.right"
+        case "up": return "arrow.up"
+        case "down": return "arrow.down"
+        default: return "viewfinder"
+        }
+    }
+
+    private var title: String {
+        switch pose {
+        case "left": return "向左转头"
+        case "right": return "向右转头"
+        case "up": return "轻微抬头"
+        case "down": return "轻微低头"
+        default: return "保持正脸"
+        }
+    }
+
+    private var instruction: String {
+        switch pose {
+        case "left", "right":
+            return "只转动头部约 30°，身体保持不动"
+        case "up":
+            return "轻抬下巴约 15–20°，不要后仰身体"
+        case "down":
+            return "轻收下巴约 15–20°，不要弯腰或把脸完全低下去"
+        default:
+            return "正对摄像头，脸部保持居中"
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 16) {
+            ZStack {
+                Circle()
+                    .fill(Color.accentColor.opacity(0.12))
+                Image(systemName: "person.crop.circle")
+                    .font(.system(size: 36, weight: .medium))
+                Image(systemName: symbol)
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(.tint)
+                    .offset(x: 28, y: -28)
+            }
+            .frame(width: 76, height: 76)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("动作示例 · \(title)")
+                    .font(.callout.weight(.semibold))
+                Text(instruction)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            Color.accentColor.opacity(0.07),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .accessibilityElement(children: .combine)
     }
 }
 
