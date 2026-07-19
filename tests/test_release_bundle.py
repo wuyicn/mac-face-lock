@@ -278,6 +278,8 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
             "Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent",
             "Resources/defaults/config.json",
             "Resources/runtime/MacFaceLockRuntime/MacFaceLockRuntime",
+            "Resources/runtime/MacFaceLockRuntime/_internal/cv2/data/"
+            "haarcascade_frontalface_default.xml",
             "Resources/LICENSE",
             "Resources/THIRD_PARTY_NOTICES.md",
             "Resources/BuildManifest.json",
@@ -343,7 +345,7 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
             "Contents/Resources/launchd/com.wuyi.mac-face-lock-release.plist",
             "Contents/Resources/runtime/MacFaceLockRuntime/_internal/base_library.zip",
             "Contents/Resources/runtime/MacFaceLockRuntime/_internal/cv2/data/"
-            "haarcascades/haarcascade_frontalface_default.xml",
+            "haarcascade_frontalface_default.xml",
         }
         required_manifest_paths.update(
             f"Contents/Resources/licenses/{relative}"

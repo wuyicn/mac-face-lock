@@ -30,7 +30,7 @@ analysis = Analysis(
     pathex=[str(project)],
     binaries=[],
     datas=[
-        (str(path), "cv2/data/haarcascades")
+        (str(path), "cv2/data")
         for path in sorted(Path(cv2.data.haarcascades).glob("*.xml"))
     ],
     hiddenimports=sorted(set(hidden_imports)),
