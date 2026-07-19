@@ -215,12 +215,18 @@ class UnifiedPackagingTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS build tools")
     def test_built_ui_matches_declared_minimum_system_version(self) -> None:
-        subprocess.run(
+        build = subprocess.run(
             [str(UI_BUILD_SCRIPT)],
             cwd=PROJECT_DIR,
-            check=True,
             capture_output=True,
             text=True,
+        )
+        self.assertEqual(
+            build.returncode,
+            0,
+            "UI build failed.\n"
+            f"stdout:\n{build.stdout}\n"
+            f"stderr:\n{build.stderr}",
         )
         info_path = UNIFIED_APP / "Contents" / "Info.plist"
         executable = UNIFIED_APP / "Contents" / "MacOS" / "MacFaceLock"
