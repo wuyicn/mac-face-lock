@@ -1427,11 +1427,15 @@ final class LegacyInstallCleaner: LegacyInstallCleaning {
             ).path,
             candidateRoot.path,
         ]
-        if arguments == unifiedArguments,
-           let keepAlive = dictionary["KeepAlive"] as? [String: Any],
-           Set(keepAlive.keys) == ["SuccessfulExit"],
-           exactBoolean(keepAlive["SuccessfulExit"], equals: false) {
-            return .source(candidateRoot)
+        if arguments == unifiedArguments {
+            if exactBoolean(dictionary["KeepAlive"], equals: true) {
+                return .source(candidateRoot)
+            }
+            if let keepAlive = dictionary["KeepAlive"] as? [String: Any],
+               Set(keepAlive.keys) == ["SuccessfulExit"],
+               exactBoolean(keepAlive["SuccessfulExit"], equals: false) {
+                return .source(candidateRoot)
+            }
         }
 
         let historicalArguments = [

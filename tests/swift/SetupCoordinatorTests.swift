@@ -759,6 +759,7 @@ struct SetupCoordinatorTests {
         try await testCoordinatesProgressDiagnosisAndNoLockOwnerVerification()
         try await testMapsRuntimeExitCodesToChineseRepairs()
         try await testFailedReenrollmentPreservesExistingOwnerProfile()
+        try await testForegroundRefreshPreservesEnrollmentFailureBeforeServiceInstall()
         try await testSuccessfulEnrollmentRequiresSuccessfulTerminalStatus()
         try await testCancellationIgnoresLateProgress()
         try await testCancellationInvalidatesCallbacksBeforeRuntimeEOF()
@@ -3346,6 +3347,54 @@ struct SetupCoordinatorTests {
         try require(
             coordinator.checks[.ownerProfile] == true,
             "failed re-enrollment discarded the still-valid existing owner profile"
+        )
+    }
+
+    private static func testForegroundRefreshPreservesEnrollmentFailureBeforeServiceInstall()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try fixture.setupStore.save(
+            OnboardingRecord(
+                currentStep: .enrollment,
+                completedSteps: [.preparation, .permissions],
+                completedAt: nil,
+                appVersion: "test"
+            )
+        )
+        let runner = FakeRuntimeRunner()
+        runner.results[.enroll] = RuntimeResult(
+            exitCode: 10,
+            events: [
+                event("camera_unavailable", status: "error"),
+            ],
+            stderr: "",
+            stderrTruncated: false
+        )
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: FakeServiceManager(state: .notInstalled),
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            ownerProfileInspector: FakeOwnerProfileInspector(valid: false)
+        )
+
+        await coordinator.inspectLegacyInstall()
+        await coordinator.startEnrollment()
+        let enrollmentError = coordinator.currentError
+        try require(
+            enrollmentError?.contains("摄像头") == true,
+            "fixture did not publish the enrollment camera failure"
+        )
+
+        await coordinator.refreshLiveReadiness()
+
+        try require(
+            coordinator.currentError == enrollmentError,
+            "foreground refresh replaced the enrollment failure before service install"
         )
     }
 

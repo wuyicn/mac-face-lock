@@ -545,6 +545,7 @@ struct LegacyInstallCleanerTests {
         try testRecognizesInstalledCurrentPair()
         try testRecognizesInstalledHistoricalPair()
         try testRecognizesHistoricalStatusSchema()
+        try testRecognizesUnifiedStatusWithHistoricalKeepAlive()
         try testNoPlistsIsNotFound()
         try testCurrentReleaseAgentWithoutStatusIsNotFound()
         try testOnlyOneSourcePlistIsAmbiguous()
@@ -1893,6 +1894,21 @@ struct LegacyInstallCleanerTests {
 
         guard case .confirmed = fixture.cleaner.inspect() else {
             throw TestFailure.assertion("historical status schema was not confirmed")
+        }
+    }
+
+    private static func testRecognizesUnifiedStatusWithHistoricalKeepAlive() throws {
+        let fixture = try LegacyCleanerFixture()
+        defer { fixture.remove() }
+        try fixture.writeHistoricalAgentPlist()
+        var status = fixture.unifiedStatusDictionary(root: fixture.legacyRoot)
+        status["KeepAlive"] = true
+        try fixture.writePlist(status, to: fixture.statusURL)
+
+        guard case .confirmed = fixture.cleaner.inspect() else {
+            throw TestFailure.assertion(
+                "known unified status transition schema was not confirmed"
+            )
         }
     }
 

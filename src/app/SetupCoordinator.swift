@@ -2058,11 +2058,17 @@ final class SetupCoordinator: ObservableObject {
             case .healthy:
                 break
             case .needsRepair:
-                currentError = "应用位置已变化，请重新安装后台服务后再开启保护。"
+                if shouldPublishServiceRepair {
+                    currentError = "应用位置已变化，请重新安装后台服务后再开启保护。"
+                }
             case .notInstalled:
-                currentError = "后台服务尚未安装，请重新运行诊断。"
+                if shouldPublishServiceRepair {
+                    currentError = "后台服务尚未安装，请重新运行诊断。"
+                }
             case .unhealthy:
-                currentError = "后台 Agent 权限或运行状态未就绪，请完成授权并重新运行诊断。"
+                if shouldPublishServiceRepair {
+                    currentError = "后台 Agent 权限或运行状态未就绪，请完成授权并重新运行诊断。"
+                }
             }
         } else {
             serviceHealthy = await serviceHealthProvider.isServiceHealthy()
@@ -2121,6 +2127,12 @@ final class SetupCoordinator: ObservableObject {
             recordDiagnosticError(error, operation: "install_service")
             currentError = localizedRuntimeError(error)
         }
+    }
+
+    private var shouldPublishServiceRepair: Bool {
+        hasCompletedOnboarding
+            || currentStep == .safetyTest
+            || currentStep == .completion
     }
 
     private static func repairInstruction(for exitCode: Int32) -> String {
