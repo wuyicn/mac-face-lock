@@ -51,5 +51,11 @@ final class DesktopWindowController {
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        UIEventTraceRecorder.shared.record(
+            .desktopWindowShow(
+                windowNumber: window.windowNumber,
+                isKey: window.isKeyWindow
+            )
+        )
     }
 }

@@ -476,9 +476,20 @@ struct OnboardingView: View {
                 backButton
                 Spacer()
                 Button("运行安全测试") {
+                    UIEventTraceRecorder.shared.record(.securityTestActionEntered)
                     actionState = .working("正在执行不锁屏安全测试…")
+                    UIEventTraceRecorder.shared.record(
+                        .securityTestWorkingStateAssigned
+                    )
                     Task {
-                        if await setupCoordinator.runSafetyTest() {
+                        UIEventTraceRecorder.shared.record(
+                            .securityTestCoordinatorBefore
+                        )
+                        let passed = await setupCoordinator.runSafetyTest()
+                        UIEventTraceRecorder.shared.record(
+                            .securityTestCoordinatorAfter(passed: passed)
+                        )
+                        if passed {
                             actionState = .success("所有安全测试已通过")
                         } else {
                             actionState = .failure(

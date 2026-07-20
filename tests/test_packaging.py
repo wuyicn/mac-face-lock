@@ -541,6 +541,44 @@ class UnifiedPackagingTests(unittest.TestCase):
         local_store_source = (PROJECT_DIR / "src/app/LocalJSONStore.swift").read_text()
         self.assertIn("init(resourcesURL: URL, dataURL: URL)", local_store_source)
 
+    def test_safety_test_click_diagnostic_markers_are_wired(self) -> None:
+        delegate = (PROJECT_DIR / "src/app/AppDelegate.swift").read_text()
+        window_controller = (
+            PROJECT_DIR / "src/app/DesktopWindowController.swift"
+        ).read_text()
+        onboarding = (PROJECT_DIR / "src/app/OnboardingView.swift").read_text()
+
+        for marker in (
+            ".appActivation",
+            ".leftMouseDown(",
+            ".leftMouseUp(",
+            "startLocalMouseMonitoring()",
+            "stopLocalMouseMonitoring()",
+        ):
+            with self.subTest(delegate_marker=marker):
+                self.assertIn(marker, delegate)
+
+        self.assertIn(".desktopWindowShow(", window_controller)
+
+        ordered_markers = (
+            ".securityTestActionEntered",
+            '.working("正在执行不锁屏安全测试…")',
+            ".securityTestWorkingStateAssigned",
+            ".securityTestCoordinatorBefore",
+            "await setupCoordinator.runSafetyTest()",
+            ".securityTestCoordinatorAfter(",
+        )
+        offsets = [onboarding.find(marker) for marker in ordered_markers]
+        self.assertTrue(
+            all(offset >= 0 for offset in offsets),
+            f"missing safety-test diagnostic marker: {dict(zip(ordered_markers, offsets))}",
+        )
+        self.assertEqual(
+            offsets,
+            sorted(offsets),
+            "safety-test diagnostic markers are not ordered around the action boundary",
+        )
+
     def test_status_names_the_combined_ui(self) -> None:
         status_script = (PROJECT_DIR / "scripts" / "status.sh").read_text()
         self.assertIn("融合界面", status_script)
