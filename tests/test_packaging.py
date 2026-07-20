@@ -82,6 +82,36 @@ class UnifiedPackagingTests(unittest.TestCase):
         self.assertIn("NSApp.setActivationPolicy(.regular)", delegate)
         self.assertNotIn("NSApp.setActivationPolicy(.accessory)", delegate)
 
+    def test_control_center_packages_the_project_owned_icon(self) -> None:
+        info_path = PROJECT_DIR / "src" / "app" / "Info.plist"
+        icon_path = PROJECT_DIR / "src" / "app" / "AppIcon.icns"
+        builder = UI_BUILD_SCRIPT.read_text(encoding="utf-8")
+        with info_path.open("rb") as handle:
+            info = plistlib.load(handle)
+
+        self.assertEqual(info["CFBundleIconFile"], "AppIcon")
+        self.assertTrue(icon_path.is_file())
+        self.assertGreater(icon_path.stat().st_size, 10_000)
+        self.assertIn(
+            'cp "$ROOT_DIR/src/app/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"',
+            builder,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(
+                [
+                    "iconutil",
+                    "-c",
+                    "iconset",
+                    "-o",
+                    str(Path(directory) / "AppIcon.iconset"),
+                    str(icon_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
     def test_interactive_cards_use_non_hit_testing_decorative_borders(self) -> None:
         border_path = PROJECT_DIR / "src" / "app" / "DecorativeCardBorder.swift"
         self.assertTrue(border_path.is_file())

@@ -98,6 +98,7 @@ fi
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" \
   "$(dirname "$EMBEDDED_AGENT")" "$RELEASE_LAUNCHD_DIR"
 cp "$ROOT_DIR/src/app/Info.plist" "$CONTENTS_DIR/Info.plist"
+cp "$ROOT_DIR/src/app/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 cp -R "$AGENT_APP" "$EMBEDDED_AGENT"
 cp "$ROOT_DIR/launchd/com.wuyi.mac-face-lock-release.plist" \
   "$RELEASE_LAUNCHD_DIR/com.wuyi.mac-face-lock-release.plist"
