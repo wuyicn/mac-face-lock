@@ -35,11 +35,12 @@ private func fixedDate() throws -> Date {
 
 @main
 struct UIEventTraceRecorderTests {
-    static func main() throws {
+    static func main() async throws {
         try testRecorderUsesApplicationSupportTracePath()
-        try testLineFormatIsDeterministic()
-        try testRecordAppendsCompleteLinesWithoutOverwriting()
-        try testRecordToleratesUnwritableTracePath()
+        try await testLineFormatIsDeterministic()
+        try await testRecordAppendsCompleteLinesWithoutOverwriting()
+        try await testConcurrentSubmissionsRemainCompleteAndOrdered()
+        try await testRecordToleratesUnwritableTracePath()
         print("UI event trace recorder tests passed")
     }
 
@@ -59,9 +60,13 @@ struct UIEventTraceRecorderTests {
         )
     }
 
-    private static func testLineFormatIsDeterministic() throws {
-        let line = UIEventTraceRecorder.line(
-            for: .leftMouseDown(
+    private static func testLineFormatIsDeterministic() async throws {
+        let root = try makeTemporaryDirectory(named: "mac-face-lock-ui-trace-format")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recorder = UIEventTraceRecorder(applicationSupportURL: root)
+
+        recorder.record(
+            .leftMouseDown(
                 windowNumber: 17,
                 locationX: 12.25,
                 locationY: 98.5,
@@ -69,16 +74,18 @@ struct UIEventTraceRecorderTests {
             ),
             at: try fixedDate()
         )
+        await recorder.flushForTesting()
+        let line = try String(contentsOf: recorder.traceURL, encoding: .utf8)
 
         try require(
             line == "timestamp=2026-07-20T01:02:03.456Z event=left_mouse_down "
                 + "window_number=17 location_x=12.250 location_y=98.500 "
-                + "key_window_number=17",
+                + "key_window_number=17\n",
             "trace line format or field order changed: \(line)"
         )
     }
 
-    private static func testRecordAppendsCompleteLinesWithoutOverwriting() throws {
+    private static func testRecordAppendsCompleteLinesWithoutOverwriting() async throws {
         let root = try makeTemporaryDirectory(named: "mac-face-lock-ui-trace")
         defer { try? FileManager.default.removeItem(at: root) }
         let recorder = UIEventTraceRecorder(applicationSupportURL: root)
@@ -94,6 +101,7 @@ struct UIEventTraceRecorderTests {
             .desktopWindowShow(windowNumber: 23, isKey: true),
             at: date
         )
+        await recorder.flushForTesting()
 
         let contents = try String(contentsOf: recorder.traceURL, encoding: .utf8)
         let expected = """
@@ -108,7 +116,43 @@ struct UIEventTraceRecorderTests {
         )
     }
 
-    private static func testRecordToleratesUnwritableTracePath() throws {
+    private static func testConcurrentSubmissionsRemainCompleteAndOrdered() async throws {
+        let root = try makeTemporaryDirectory(named: "mac-face-lock-ui-trace-order")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recorder = UIEventTraceRecorder(applicationSupportURL: root)
+        let submissionLock = NSLock()
+        var submittedWindowNumbers: [Int] = []
+        let date = try fixedDate()
+
+        DispatchQueue.concurrentPerform(iterations: 100) { windowNumber in
+            submissionLock.lock()
+            submittedWindowNumbers.append(windowNumber)
+            recorder.record(
+                .desktopWindowShow(windowNumber: windowNumber, isKey: false),
+                at: date
+            )
+            submissionLock.unlock()
+        }
+        await recorder.flushForTesting()
+
+        let contents = try String(contentsOf: recorder.traceURL, encoding: .utf8)
+        let lines = contents.split(separator: "\n").map(String.init)
+        let writtenWindowNumbers = try lines.map { line in
+            guard let field = line.split(separator: " ").first(
+                where: { $0.hasPrefix("window_number=") }
+            ), let value = Int(field.dropFirst("window_number=".count)) else {
+                throw TestFailure.assertion("ordered trace line is malformed: \(line)")
+            }
+            return value
+        }
+        try require(lines.count == 100, "concurrent submissions lost or split trace lines")
+        try require(
+            writtenWindowNumbers == submittedWindowNumbers,
+            "serial writer changed concurrent submission order"
+        )
+    }
+
+    private static func testRecordToleratesUnwritableTracePath() async throws {
         let root = try makeTemporaryDirectory(named: "mac-face-lock-ui-trace-failure")
         defer { try? FileManager.default.removeItem(at: root) }
         let applicationSupportFile = root.appendingPathComponent("not-a-directory")
@@ -119,6 +163,7 @@ struct UIEventTraceRecorderTests {
         )
 
         recorder.record(.securityTestActionEntered, at: try fixedDate())
+        await recorder.flushForTesting()
 
         let preservedData = try Data(contentsOf: applicationSupportFile)
         try require(

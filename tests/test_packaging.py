@@ -548,16 +548,10 @@ class UnifiedPackagingTests(unittest.TestCase):
         ).read_text()
         onboarding = (PROJECT_DIR / "src/app/OnboardingView.swift").read_text()
 
-        for marker in (
-            ".appActivation",
-            ".leftMouseDown(",
-            ".leftMouseUp(",
-            "startLocalMouseMonitoring()",
-            "stopLocalMouseMonitoring()",
-        ):
-            with self.subTest(delegate_marker=marker):
-                self.assertIn(marker, delegate)
-
+        self.assertIn("LocalMouseEventMonitor(", delegate)
+        self.assertIn("localMouseMonitor?.start()", delegate)
+        self.assertIn("localMouseMonitor?.stop()", delegate)
+        self.assertIn(".appActivation", delegate)
         self.assertIn(".desktopWindowShow(", window_controller)
 
         ordered_markers = (
@@ -568,7 +562,10 @@ class UnifiedPackagingTests(unittest.TestCase):
             "await setupCoordinator.runSafetyTest()",
             ".securityTestCoordinatorAfter(",
         )
-        offsets = [onboarding.find(marker) for marker in ordered_markers]
+        button_start = onboarding.index('Button("运行安全测试")')
+        button_end = onboarding.index(".buttonStyle(.borderedProminent)", button_start)
+        safety_test_button = onboarding[button_start:button_end]
+        offsets = [safety_test_button.find(marker) for marker in ordered_markers]
         self.assertTrue(
             all(offset >= 0 for offset in offsets),
             f"missing safety-test diagnostic marker: {dict(zip(ordered_markers, offsets))}",

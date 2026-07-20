@@ -1,6 +1,6 @@
 import Foundation
 
-enum UIEventTraceEvent {
+enum UIEventTraceEvent: Equatable, Sendable {
     case appActivation
     case desktopWindowShow(windowNumber: Int, isKey: Bool)
     case leftMouseDown(
@@ -21,40 +21,82 @@ enum UIEventTraceEvent {
     case securityTestCoordinatorAfter(passed: Bool)
 }
 
-final class UIEventTraceRecorder {
+private enum UIEventTraceWorkItem: Sendable {
+    case record(UIEventTraceEvent, Date)
+    case flush(CheckedContinuation<Void, Never>)
+}
+
+final class UIEventTraceRecorder: Sendable {
     static let shared: UIEventTraceRecorder = {
         let fileManager = FileManager.default
         let applicationSupportURL = fileManager.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first ?? URL(fileURLWithPath: "/dev/null", isDirectory: true)
-        return UIEventTraceRecorder(
-            applicationSupportURL: applicationSupportURL,
-            fileManager: fileManager
-        )
+        return UIEventTraceRecorder(applicationSupportURL: applicationSupportURL)
     }()
 
     let traceURL: URL
 
-    private let fileManager: FileManager
-    private let lock = NSLock()
+    private let continuation: AsyncStream<UIEventTraceWorkItem>.Continuation
+    private let writerTask: Task<Void, Never>
 
-    init(
-        applicationSupportURL: URL,
-        fileManager: FileManager = .default
-    ) {
-        self.traceURL = applicationSupportURL
+    init(applicationSupportURL: URL) {
+        let traceURL = applicationSupportURL
             .appendingPathComponent("Mac Face Lock", isDirectory: true)
             .appendingPathComponent("logs", isDirectory: true)
             .appendingPathComponent("ui-event-trace.log")
-        self.fileManager = fileManager
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: UIEventTraceWorkItem.self,
+            bufferingPolicy: .bufferingNewest(4_096)
+        )
+
+        self.traceURL = traceURL
+        self.continuation = continuation
+        self.writerTask = Task.detached(priority: .utility) {
+            let writer = UIEventTraceWriter(traceURL: traceURL)
+            for await workItem in stream {
+                switch workItem {
+                case .record(let event, let date):
+                    writer.record(event, at: date)
+                case .flush(let continuation):
+                    continuation.resume()
+                }
+            }
+        }
     }
 
     func record(_ event: UIEventTraceEvent, at date: Date = Date()) {
-        let data = Data((Self.line(for: event, at: date) + "\n").utf8)
-        lock.lock()
-        defer { lock.unlock() }
+        continuation.yield(.record(event, date))
+    }
 
+    func flushForTesting() async {
+        await withCheckedContinuation { flushContinuation in
+            continuation.yield(.flush(flushContinuation))
+        }
+    }
+
+    deinit {
+        continuation.finish()
+        writerTask.cancel()
+    }
+}
+
+private final class UIEventTraceWriter {
+    private let traceURL: URL
+    private let fileManager = FileManager.default
+    private let timestampFormatter: ISO8601DateFormatter
+
+    init(traceURL: URL) {
+        self.traceURL = traceURL
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        self.timestampFormatter = formatter
+    }
+
+    func record(_ event: UIEventTraceEvent, at date: Date) {
+        let data = Data((line(for: event, at: date) + "\n").utf8)
         do {
             try fileManager.createDirectory(
                 at: traceURL.deletingLastPathComponent(),
@@ -81,7 +123,7 @@ final class UIEventTraceRecorder {
         }
     }
 
-    static func line(for event: UIEventTraceEvent, at date: Date) -> String {
+    private func line(for event: UIEventTraceEvent, at date: Date) -> String {
         var fields = [
             "timestamp=\(timestampFormatter.string(from: date))",
         ]
@@ -133,14 +175,7 @@ final class UIEventTraceRecorder {
         return fields.joined(separator: " ")
     }
 
-    private static let timestampFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        return formatter
-    }()
-
-    private static func appendMouseFields(
+    private func appendMouseFields(
         eventName: String,
         windowNumber: Int,
         locationX: Double,
@@ -155,7 +190,7 @@ final class UIEventTraceRecorder {
         fields.append("key_window_number=\(keyWindowNumber.map(String.init) ?? "none")")
     }
 
-    private static func decimal(_ value: Double) -> String {
+    private func decimal(_ value: Double) -> String {
         String(
             format: "%.3f",
             locale: Locale(identifier: "en_US_POSIX"),

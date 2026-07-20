@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var themeStore: ThemeStore?
     private var desktopWindowController: DesktopWindowController?
     private var statusMenuController: StatusMenuController?
-    private var localMouseMonitor: Any?
+    private var localMouseMonitor: LocalMouseEventMonitor?
 
     override init() {
         self.permissionCenter = PermissionCenter()
@@ -41,7 +41,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        startLocalMouseMonitoring()
+        localMouseMonitor = LocalMouseEventMonitor(
+            recorder: UIEventTraceRecorder.shared
+        )
+        localMouseMonitor?.start()
 
         guard case .success(let environment) = environment else {
             guard case .failure(let error) = environment else {
@@ -147,51 +150,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        stopLocalMouseMonitoring()
+        localMouseMonitor?.stop()
+        localMouseMonitor = nil
         faceLockStore?.stopPolling()
         statusMenuController?.stopRefreshing()
-    }
-
-    private func startLocalMouseMonitoring() {
-        guard localMouseMonitor == nil else {
-            return
-        }
-        localMouseMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.leftMouseDown, .leftMouseUp]
-        ) { event in
-            let location = event.locationInWindow
-            let keyWindowNumber = NSApp.keyWindow?.windowNumber
-            switch event.type {
-            case .leftMouseDown:
-                UIEventTraceRecorder.shared.record(
-                    .leftMouseDown(
-                        windowNumber: event.windowNumber,
-                        locationX: location.x,
-                        locationY: location.y,
-                        keyWindowNumber: keyWindowNumber
-                    )
-                )
-            case .leftMouseUp:
-                UIEventTraceRecorder.shared.record(
-                    .leftMouseUp(
-                        windowNumber: event.windowNumber,
-                        locationX: location.x,
-                        locationY: location.y,
-                        keyWindowNumber: keyWindowNumber
-                    )
-                )
-            default:
-                break
-            }
-            return event
-        }
-    }
-
-    private func stopLocalMouseMonitoring() {
-        guard let localMouseMonitor else {
-            return
-        }
-        NSEvent.removeMonitor(localMouseMonitor)
-        self.localMouseMonitor = nil
     }
 }
