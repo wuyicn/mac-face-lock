@@ -115,6 +115,10 @@ class BuildRecoveryTests(unittest.TestCase):
             PROJECT_DIR / "src" / "app" / "Info.plist",
             self.root / "src" / "app" / "Info.plist",
         )
+        shutil.copy2(
+            PROJECT_DIR / "src" / "app" / "AppIcon.icns",
+            self.root / "src" / "app" / "AppIcon.icns",
+        )
         (self.root / "src" / "app" / "main.swift").write_text(
             "@main enum App { static func main() {} }\n", encoding="utf-8"
         )
