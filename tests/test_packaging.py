@@ -576,6 +576,34 @@ class UnifiedPackagingTests(unittest.TestCase):
             "safety-test diagnostic markers are not ordered around the action boundary",
         )
 
+    def test_onboarding_action_feedback_resets_only_on_real_step_changes(
+        self,
+    ) -> None:
+        onboarding = (
+            PROJECT_DIR / "src/app/OnboardingView.swift"
+        ).read_text(encoding="utf-8")
+        lifecycle_start = onboarding.index("        .onAppear {")
+        lifecycle_end = onboarding.index(
+            "        .confirmationDialog(",
+            lifecycle_start,
+        )
+        lifecycle = onboarding[lifecycle_start:lifecycle_end]
+
+        self.assertIn(
+            "updatePermissionPolling(for: setupCoordinator.currentStep)",
+            lifecycle,
+        )
+        self.assertNotIn(
+            ".onReceive(setupCoordinator.$currentStep",
+            lifecycle,
+        )
+        change_start = lifecycle.index(
+            ".onChange(of: setupCoordinator.currentStep) { newStep in"
+        )
+        change = lifecycle[change_start:]
+        self.assertEqual(change.count("actionState = .idle"), 1)
+        self.assertIn("updatePermissionPolling(for: newStep)", change)
+
     def test_status_names_the_combined_ui(self) -> None:
         status_script = (PROJECT_DIR / "scripts" / "status.sh").read_text()
         self.assertIn("融合界面", status_script)

@@ -78,7 +78,7 @@ struct OnboardingView: View {
         .onDisappear {
             setupCoordinator.setPermissionStepVisible(false)
         }
-        .onReceive(setupCoordinator.$currentStep.removeDuplicates()) { newStep in
+        .onChange(of: setupCoordinator.currentStep) { newStep in
             actionState = .idle
             updatePermissionPolling(for: newStep)
         }
