@@ -523,8 +523,11 @@ private struct SettingsSection<Content: View>: View {
         .padding(24)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(Color.white.opacity(0.10), lineWidth: 1)
+            DecorativeCardBorder(
+                cornerRadius: 18,
+                color: Color.white.opacity(0.10),
+                lineWidth: 1
+            )
         }
     }
 }

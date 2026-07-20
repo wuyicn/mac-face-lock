@@ -22,6 +22,6 @@
   <key>NSCameraUsageDescription</key>
   <string>Mac Face Lock 使用摄像头在本机验证当前使用者是否为本人。</string>
   <key>LSUIElement</key>
-  <true/>
+  <false/>
 </dict>
 </plist>

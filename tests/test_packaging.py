@@ -70,7 +70,32 @@ class UnifiedPackagingTests(unittest.TestCase):
         self.assertEqual(info["CFBundleExecutable"], "MacFaceLock")
         self.assertEqual(info["CFBundlePackageType"], "APPL")
         self.assertEqual(info["LSMinimumSystemVersion"], "12.0")
-        self.assertIs(info["LSUIElement"], True)
+
+    def test_control_center_runs_as_an_activatable_desktop_application(self) -> None:
+        info_path = PROJECT_DIR / "src" / "app" / "Info.plist"
+        delegate_path = PROJECT_DIR / "src" / "app" / "AppDelegate.swift"
+        with info_path.open("rb") as handle:
+            info = plistlib.load(handle)
+
+        self.assertIs(info["LSUIElement"], False)
+        delegate = delegate_path.read_text(encoding="utf-8")
+        self.assertIn("NSApp.setActivationPolicy(.regular)", delegate)
+        self.assertNotIn("NSApp.setActivationPolicy(.accessory)", delegate)
+
+    def test_interactive_cards_use_non_hit_testing_decorative_borders(self) -> None:
+        border_path = PROJECT_DIR / "src" / "app" / "DecorativeCardBorder.swift"
+        self.assertTrue(border_path.is_file())
+        border = border_path.read_text(encoding="utf-8")
+        onboarding = (
+            PROJECT_DIR / "src" / "app" / "OnboardingView.swift"
+        ).read_text(encoding="utf-8")
+        settings = (
+            PROJECT_DIR / "src" / "app" / "SettingsView.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(".allowsHitTesting(false)", border)
+        self.assertIn("DecorativeCardBorder(", onboarding)
+        self.assertIn("DecorativeCardBorder(", settings)
 
     def test_ui_launchagent_keeps_label_and_targets_only_unified_app(self) -> None:
         plist_path = (

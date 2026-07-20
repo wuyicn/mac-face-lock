@@ -832,8 +832,11 @@ private struct OnboardingCard<Content: View>: View {
         .padding(30)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            DecorativeCardBorder(
+                cornerRadius: 20,
+                color: Color.white.opacity(0.12),
+                lineWidth: 1
+            )
         }
     }
 }
