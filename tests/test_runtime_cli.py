@@ -335,7 +335,10 @@ class RuntimeCLITests(unittest.TestCase):
             read=lambda: (False, None),
             release=lambda: None,
         )
-        fake_cv2 = SimpleNamespace(VideoCapture=lambda _index: capture)
+        fake_cv2 = SimpleNamespace(
+            CAP_AVFOUNDATION=1_200,
+            VideoCapture=lambda _index, *_backend: capture,
+        )
         config_path = self.support_dir / "config" / "config.json"
         config_path.write_text(
             json.dumps(
@@ -378,7 +381,10 @@ class RuntimeCLITests(unittest.TestCase):
             read=lambda: (True, np.zeros((8, 8, 3), dtype="uint8")),
             release=lambda: None,
         )
-        fake_cv2 = SimpleNamespace(VideoCapture=lambda _index: capture)
+        fake_cv2 = SimpleNamespace(
+            CAP_AVFOUNDATION=1_200,
+            VideoCapture=lambda _index, *_backend: capture,
+        )
         config_path = self.support_dir / "config" / "config.json"
         config_path.write_text(
             json.dumps(

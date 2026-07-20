@@ -26,7 +26,10 @@ class FaceEnrollmentIntegrationTests(unittest.TestCase):
             read=lambda: (True, queue.pop(0)) if queue else (False, None),
             release=lambda: None,
         )
-        return SimpleNamespace(VideoCapture=lambda _index: capture)
+        return SimpleNamespace(
+            CAP_AVFOUNDATION=1_200,
+            VideoCapture=lambda _index, *_backend: capture,
+        )
 
     def test_capture_replaces_template_only_after_all_five_poses(self) -> None:
         poses = [pose for pose in EnrollmentPose for _ in range(2)]

@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from camera_backend import open_camera
 from runtime_paths import RuntimePaths
 from state_store import now_iso
 
@@ -55,7 +56,7 @@ def capture_camera_evidence(
     filename = f"{timestamp}-{_safe_token(reason)}-camera.jpg"
     output_path = evidence_dir / filename
 
-    cap = cv2.VideoCapture(camera_index)
+    cap = open_camera(cv2, camera_index)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera index {camera_index}")
 

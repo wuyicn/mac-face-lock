@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 
+from camera_backend import open_camera
 from face_verifier import (
     CameraUnavailableError,
     RuntimeDependencyError,
@@ -71,7 +72,7 @@ class RuntimeDiagnosticProbe:
     def check_camera(self, config: dict[str, Any]) -> dict[str, object]:
         cv2 = _load_runtime_modules()
         camera_index = int(config.get("camera_index", 0))
-        cap = cv2.VideoCapture(camera_index)
+        cap = open_camera(cv2, camera_index)
         if not cap.isOpened():
             raise CameraUnavailableError(
                 f"Could not open camera index {camera_index}"
@@ -171,7 +172,7 @@ def main(paths: RuntimePaths = RUNTIME_PATHS) -> int:
     paths.evidence_dir.mkdir(parents=True, exist_ok=True)
     output_path = paths.evidence_dir / f"camera-diagnostic-{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}.png"
 
-    cap = cv2.VideoCapture(0)
+    cap = open_camera(cv2, 0)
     if not cap.isOpened():
         raise RuntimeError("摄像头打开失败。请确认 Terminal 已允许摄像头权限，且没有其它应用占用摄像头。")
 

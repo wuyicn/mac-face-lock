@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from camera_backend import open_camera
 from enrollment_state_machine import (
     EnrollmentPose,
     EnrollmentProgressEvent,
@@ -233,7 +234,7 @@ def capture_owner_profile(
         )
     )
 
-    cap = cv2.VideoCapture(camera_index)
+    cap = open_camera(cv2, camera_index)
     if not cap.isOpened():
         raise CameraUnavailableError(f"Could not open camera index {camera_index}")
 
@@ -375,7 +376,7 @@ def verify_current_user(config: dict[str, Any], owner_encoding: np.ndarray) -> V
     stranger_threshold = int(config.get("stranger_lock_threshold", 3))
     no_face_threshold = int(config.get("no_face_lock_threshold", 5))
 
-    cap = cv2.VideoCapture(camera_index)
+    cap = open_camera(cv2, camera_index)
     if not cap.isOpened():
         raise CameraUnavailableError(f"Could not open camera index {camera_index}")
 
