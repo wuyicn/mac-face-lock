@@ -126,6 +126,26 @@ jobs:
             src/agent-launcher/main.swift tests/swift/AgentLauncherPathTests.swift \
             -o "$RUNNER_TEMP/mac-face-lock-agent-launcher-tests"
           "$RUNNER_TEMP/mac-face-lock-agent-launcher-tests"
+      - name: Run Swift UI-event trace recorder tests
+        run: |
+          xcrun swiftc -parse-as-library \
+            -target arm64-apple-macosx12.0 \
+            -strict-concurrency=complete -warn-concurrency -warnings-as-errors \
+            src/app/UIEventTraceRecorder.swift \
+            tests/swift/UIEventTraceRecorderTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-ui-event-trace-tests"
+          "$RUNNER_TEMP/mac-face-lock-ui-event-trace-tests"
+      - name: Run Swift local-mouse monitor tests
+        run: |
+          xcrun swiftc -parse-as-library \
+            -target arm64-apple-macosx12.0 \
+            -strict-concurrency=complete -warn-concurrency -warnings-as-errors \
+            src/app/UIEventTraceRecorder.swift \
+            src/app/LocalMouseEventMonitor.swift \
+            tests/swift/LocalMouseEventMonitorTests.swift \
+            -framework AppKit \
+            -o "$RUNNER_TEMP/mac-face-lock-mouse-monitor-tests"
+          "$RUNNER_TEMP/mac-face-lock-mouse-monitor-tests"
       - name: Run Swift secure-file-tree tests
         run: |
           xcrun swiftc -parse-as-library -DTESTING \

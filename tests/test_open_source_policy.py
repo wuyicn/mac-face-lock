@@ -520,12 +520,33 @@ scripts/install-launchagent.sh"""
             "tests/swift/LocalStoreSmokeTests.swift",
             "tests/swift/ProjectLocatorTests.swift",
             "tests/swift/AgentLauncherPathTests.swift",
+            "tests/swift/UIEventTraceRecorderTests.swift",
+            "tests/swift/LocalMouseEventMonitorTests.swift",
         )
         for document in (README, PROJECT_DIR / "CONTRIBUTING.md"):
             text = document.read_text(encoding="utf-8")
             for suite in expected_suites:
                 with self.subTest(document=document.name, suite=suite):
                     self.assertIn(suite, text)
+
+    def test_trace_diagnostic_verification_uses_strict_swift_concurrency(self):
+        suites = (
+            "tests/swift/UIEventTraceRecorderTests.swift",
+            "tests/swift/LocalMouseEventMonitorTests.swift",
+        )
+        for document in (README, PROJECT_DIR / "CONTRIBUTING.md"):
+            text = document.read_text(encoding="utf-8")
+            for suite in suites:
+                with self.subTest(document=document.name, suite=suite):
+                    self.assertIn(suite, text)
+                    suite_offset = text.index(suite)
+                    command_start = text.rfind("xcrun swiftc", 0, suite_offset)
+                    command_end = text.find("\n", suite_offset)
+                    command = text[command_start:command_end]
+                    self.assertIn("-target arm64-apple-macosx12.0", command)
+                    self.assertIn("-strict-concurrency=complete", command)
+                    self.assertIn("-warn-concurrency", command)
+                    self.assertIn("-warnings-as-errors", command)
 
     def test_changelog_records_initial_source_beta_scope(self):
         changelog = self._read_required_document("CHANGELOG.md")
@@ -875,6 +896,8 @@ scripts/bootstrap.sh
             r"^xcrun swiftc\b.*\btests/swift/LocalStoreSmokeTests\.swift\b",
             r"^xcrun swiftc\b.*\btests/swift/ProjectLocatorTests\.swift\b",
             r"^xcrun swiftc\b.*\btests/swift/AgentLauncherPathTests\.swift\b",
+            r"^xcrun swiftc\b.*-target arm64-apple-macosx12\.0\b.*-strict-concurrency=complete\b.*-warn-concurrency\b.*-warnings-as-errors\b.*\btests/swift/UIEventTraceRecorderTests\.swift\b",
+            r"^xcrun swiftc\b.*-target arm64-apple-macosx12\.0\b.*-strict-concurrency=complete\b.*-warn-concurrency\b.*-warnings-as-errors\b.*\btests/swift/LocalMouseEventMonitorTests\.swift\b",
             r"^xcrun swiftc -parse-as-library -typecheck\b",
             r"^scripts/build-app\.sh$",
             r"^scripts/build-status-app\.sh$",

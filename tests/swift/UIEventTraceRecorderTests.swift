@@ -33,6 +33,26 @@ private func fixedDate() throws -> Date {
     return date
 }
 
+private actor SynchronizedSubmissionOrder {
+    private var values: [Int] = []
+
+    func record(
+        _ value: Int,
+        with recorder: UIEventTraceRecorder,
+        at date: Date
+    ) {
+        values.append(value)
+        recorder.record(
+            .desktopWindowShow(windowNumber: value, isKey: false),
+            at: date
+        )
+    }
+
+    func snapshot() -> [Int] {
+        values
+    }
+}
+
 @main
 struct UIEventTraceRecorderTests {
     static func main() async throws {
@@ -120,21 +140,23 @@ struct UIEventTraceRecorderTests {
         let root = try makeTemporaryDirectory(named: "mac-face-lock-ui-trace-order")
         defer { try? FileManager.default.removeItem(at: root) }
         let recorder = UIEventTraceRecorder(applicationSupportURL: root)
-        let submissionLock = NSLock()
-        var submittedWindowNumbers: [Int] = []
+        let submissionOrder = SynchronizedSubmissionOrder()
         let date = try fixedDate()
 
-        DispatchQueue.concurrentPerform(iterations: 100) { windowNumber in
-            submissionLock.lock()
-            submittedWindowNumbers.append(windowNumber)
-            recorder.record(
-                .desktopWindowShow(windowNumber: windowNumber, isKey: false),
-                at: date
-            )
-            submissionLock.unlock()
+        await withTaskGroup(of: Void.self) { group in
+            for windowNumber in 0..<100 {
+                group.addTask {
+                    await submissionOrder.record(
+                        windowNumber,
+                        with: recorder,
+                        at: date
+                    )
+                }
+            }
         }
         await recorder.flushForTesting()
 
+        let submittedWindowNumbers = await submissionOrder.snapshot()
         let contents = try String(contentsOf: recorder.traceURL, encoding: .utf8)
         let lines = contents.split(separator: "\n").map(String.init)
         let writtenWindowNumbers = try lines.map { line in

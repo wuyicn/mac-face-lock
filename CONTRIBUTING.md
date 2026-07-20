@@ -47,6 +47,23 @@ xcrun swiftc -parse-as-library -DTESTING \
   -o /tmp/mac-face-lock-agent-launcher-tests
 /tmp/mac-face-lock-agent-launcher-tests
 
+xcrun swiftc -parse-as-library \
+  -target arm64-apple-macosx12.0 \
+  -strict-concurrency=complete -warn-concurrency -warnings-as-errors \
+  src/app/UIEventTraceRecorder.swift \
+  tests/swift/UIEventTraceRecorderTests.swift \
+  -o /tmp/mac-face-lock-ui-event-trace-tests
+/tmp/mac-face-lock-ui-event-trace-tests
+
+xcrun swiftc -parse-as-library \
+  -target arm64-apple-macosx12.0 \
+  -strict-concurrency=complete -warn-concurrency -warnings-as-errors \
+  src/app/UIEventTraceRecorder.swift src/app/LocalMouseEventMonitor.swift \
+  tests/swift/LocalMouseEventMonitorTests.swift \
+  -framework AppKit \
+  -o /tmp/mac-face-lock-mouse-monitor-tests
+/tmp/mac-face-lock-mouse-monitor-tests
+
 xcrun swiftc -parse-as-library -typecheck \
   src/app/*.swift -framework AppKit -framework SwiftUI
 
