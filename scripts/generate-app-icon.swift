@@ -1,4 +1,5 @@
 import AppKit
+import CoreGraphics
 import Foundation
 
 guard CommandLine.arguments.count == 2 else {
@@ -7,13 +8,29 @@ guard CommandLine.arguments.count == 2 else {
 }
 
 let outputURL = URL(fileURLWithPath: CommandLine.arguments[1])
-let canvas = NSSize(width: 1024, height: 1024)
-let image = NSImage(size: canvas)
-image.lockFocus()
+let pixels = 1024
+let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue
+    | CGImageAlphaInfo.premultipliedLast.rawValue
+guard let bitmapContext = CGContext(
+    data: nil,
+    width: pixels,
+    height: pixels,
+    bitsPerComponent: 8,
+    bytesPerRow: 0,
+    space: colorSpace,
+    bitmapInfo: bitmapInfo
+) else {
+    fputs("unable to create bitmap context\n", stderr)
+    exit(1)
+}
+bitmapContext.clear(CGRect(x: 0, y: 0, width: pixels, height: pixels))
+let previousContext = NSGraphicsContext.current
+NSGraphicsContext.current = NSGraphicsContext(cgContext: bitmapContext, flipped: false)
 
 NSGraphicsContext.current?.imageInterpolation = .high
 NSColor.clear.setFill()
-NSRect(origin: .zero, size: canvas).fill()
+NSRect(x: 0, y: 0, width: pixels, height: pixels).fill()
 
 let tile = NSBezierPath(
     roundedRect: NSRect(x: 72, y: 72, width: 880, height: 880),
@@ -87,10 +104,12 @@ check.line(to: NSPoint(x: 620, y: 278))
 check.line(to: NSPoint(x: 724, y: 382))
 stroke(check, color: .white, width: 34)
 
-image.unlockFocus()
-guard let tiff = image.tiffRepresentation,
-      let bitmap = NSBitmapImageRep(data: tiff),
-      let png = bitmap.representation(using: .png, properties: [:]) else {
+NSGraphicsContext.current = previousContext
+guard let rendered = bitmapContext.makeImage(),
+      let png = NSBitmapImageRep(cgImage: rendered).representation(
+          using: .png,
+          properties: [:]
+      ) else {
     fputs("unable to render PNG\n", stderr)
     exit(1)
 }

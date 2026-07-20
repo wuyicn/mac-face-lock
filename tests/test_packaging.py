@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import plistlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 
@@ -20,6 +23,83 @@ INSTALL_SCRIPT = PROJECT_DIR / "scripts" / "install-launchagent.sh"
 AGENT_BUILD_SCRIPT = PROJECT_DIR / "scripts" / "build-app.sh"
 AGENT_APP = PROJECT_DIR / "dist" / "Mac Face Lock Agent.app"
 UI_BUILD_SCRIPT = PROJECT_DIR / "scripts" / "build-status-app.sh"
+APP_ICON_SLOTS = {
+    "icon_16x16.png": (16, 16),
+    "icon_16x16@2x.png": (32, 32),
+    "icon_32x32.png": (32, 32),
+    "icon_32x32@2x.png": (64, 64),
+    "icon_128x128.png": (128, 128),
+    "icon_128x128@2x.png": (256, 256),
+    "icon_256x256.png": (256, 256),
+    "icon_256x256@2x.png": (512, 512),
+    "icon_512x512.png": (512, 512),
+    "icon_512x512@2x.png": (1024, 1024),
+}
+
+
+def png_rgba_pixel_digest(path: Path) -> tuple[tuple[int, int], str]:
+    """Return dimensions and a digest of decoded RGBA pixels, not PNG metadata."""
+    data = path.read_bytes()
+    assert data.startswith(b"\x89PNG\r\n\x1a\n"), f"not a PNG: {path}"
+    offset = 8
+    width = height = None
+    chunks: list[bytes] = []
+    while offset < len(data):
+        length = struct.unpack(">I", data[offset : offset + 4])[0]
+        kind = data[offset + 4 : offset + 8]
+        payload = data[offset + 8 : offset + 8 + length]
+        offset += 12 + length
+        if kind == b"IHDR":
+            width, height, bit_depth, color_type, compression, filtering, interlace = (
+                struct.unpack(">IIBBBBB", payload)
+            )
+            assert (bit_depth, color_type, compression, filtering, interlace) == (
+                8,
+                6,
+                0,
+                0,
+                0,
+            ), f"expected non-interlaced RGBA PNG: {path}"
+        elif kind == b"IDAT":
+            chunks.append(payload)
+        elif kind == b"IEND":
+            break
+
+    assert width is not None and height is not None, f"missing PNG header: {path}"
+    stride = width * 4
+    filtered = zlib.decompress(b"".join(chunks))
+    assert len(filtered) == height * (stride + 1), f"unexpected PNG payload: {path}"
+    pixels = bytearray()
+    previous = bytearray(stride)
+    position = 0
+    for _ in range(height):
+        filter_type = filtered[position]
+        position += 1
+        source = filtered[position : position + stride]
+        position += stride
+        current = bytearray(stride)
+        for index, value in enumerate(source):
+            left = current[index - 4] if index >= 4 else 0
+            above = previous[index]
+            upper_left = previous[index - 4] if index >= 4 else 0
+            if filter_type == 0:
+                decoded = value
+            elif filter_type == 1:
+                decoded = value + left
+            elif filter_type == 2:
+                decoded = value + above
+            elif filter_type == 3:
+                decoded = value + ((left + above) // 2)
+            elif filter_type == 4:
+                p = left + above - upper_left
+                distances = (abs(p - left), abs(p - above), abs(p - upper_left))
+                decoded = value + (left, above, upper_left)[distances.index(min(distances))]
+            else:
+                raise AssertionError(f"unsupported PNG filter {filter_type}: {path}")
+            current[index] = decoded & 0xFF
+        pixels.extend(current)
+        previous = current
+    return (width, height), hashlib.sha256(pixels).hexdigest()
 
 
 class UnifiedPackagingTests(unittest.TestCase):
@@ -110,6 +190,56 @@ class UnifiedPackagingTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
                 text=True,
+            )
+
+    def test_app_icon_regeneration_uses_fixed_pixels_and_matches_asset(self) -> None:
+        renderer = PROJECT_DIR / "scripts" / "generate-app-icon.swift"
+        generator = PROJECT_DIR / "scripts" / "generate-app-icon.sh"
+        committed = PROJECT_DIR / "src" / "app" / "AppIcon.icns"
+
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            master = temporary / "AppIcon-1024.png"
+            regenerated = temporary / "AppIcon.icns"
+            subprocess.run(
+                ["xcrun", "swift", str(renderer), str(master)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(png_rgba_pixel_digest(master)[0], (1024, 1024))
+
+            subprocess.run(
+                [str(generator), str(regenerated)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            extracted_digests: dict[str, dict[str, str]] = {}
+            for label, icon in (("committed", committed), ("regenerated", regenerated)):
+                iconset = temporary / f"{label}.iconset"
+                subprocess.run(
+                    ["iconutil", "-c", "iconset", "-o", str(iconset), str(icon)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    {image.name for image in iconset.iterdir()},
+                    set(APP_ICON_SLOTS),
+                )
+                extracted_digests[label] = {}
+                for name, dimensions in APP_ICON_SLOTS.items():
+                    actual_dimensions, digest = png_rgba_pixel_digest(iconset / name)
+                    self.assertEqual(actual_dimensions, dimensions, name)
+                    extracted_digests[label][name] = digest
+
+            # iconutil output bytes may vary with container metadata; decoded
+            # pixels must remain identical for each declared icon representation.
+            self.assertEqual(
+                extracted_digests["regenerated"],
+                extracted_digests["committed"],
             )
 
     def test_interactive_cards_use_non_hit_testing_decorative_borders(self) -> None:
