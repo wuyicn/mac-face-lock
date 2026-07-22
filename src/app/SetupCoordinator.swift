@@ -2086,7 +2086,7 @@ final class SetupCoordinator: ObservableObject {
             publishBlockedLegacyCleanupEffects()
             return
         }
-        guard diagnosisPassed, let serviceManager else {
+        guard let serviceManager else {
             return
         }
         do {

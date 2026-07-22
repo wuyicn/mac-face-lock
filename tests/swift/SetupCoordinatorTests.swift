@@ -767,6 +767,7 @@ struct SetupCoordinatorTests {
         try await testSuccessfulEnrollmentClearsActiveEnrollmentRefusal()
         try await testVerificationCannotPassAfterEnrollmentReplacesProfile()
         try await testReleaseDiagnosisInstallsAndUsesAgentOwnedServiceHealth()
+        try await testPermissionBlockedSafetyTestStillBootstrapsReleaseAgent()
         try await testVisibleAppGrantsCannotOverrideUnhealthyAgentPermissions()
         try await testSourceModePreservesExistingServiceHealthBoundary()
         try await testEnableProtectionRefusesWhenAnyGateIsFalse()
@@ -2075,6 +2076,7 @@ struct SetupCoordinatorTests {
                 setupStore: fixture.setupStore,
                 localStore: fixture.localStore,
                 runtimeRunner: runner,
+                serviceManager: FakeServiceManager(state: .healthy),
                 legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
                 serviceHealthProvider: FakeServiceHealthProvider(healthy: true)
             )
@@ -3592,6 +3594,56 @@ struct SetupCoordinatorTests {
         try require(
             coordinator.checks[.serviceHealth] == true,
             "healthy Agent-owned service state did not satisfy service readiness"
+        )
+    }
+
+    private static func testPermissionBlockedSafetyTestStillBootstrapsReleaseAgent()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let runner = FakeRuntimeRunner()
+        runner.results[.diagnose] = RuntimeResult(
+            exitCode: 10,
+            events: [event("diagnosis_check", status: "error", check: "camera")],
+            stderr: "",
+            stderrTruncated: false
+        )
+        let serviceManager = FakeServiceManager(state: .unhealthy)
+        let applicationURL = fixture.root.appendingPathComponent("Mac Face Lock.app")
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            applicationURL: applicationURL
+        )
+        await coordinator.inspectLegacyInstall()
+        _ = try fixture.localStore.writeControl(enabled: true)
+
+        let passed = await coordinator.runSafetyTest()
+
+        try require(!passed, "permission-blocked safety test unexpectedly passed")
+        try require(
+            serviceManager.installs.count == 1,
+            "permission-blocked safety test skipped release service installation"
+        )
+        try require(
+            serviceManager.installs.first?.appURL == applicationURL
+                && serviceManager.installs.first?.supportURL == fixture.environment.supportURL,
+            "permission-blocked service install received the wrong paths"
+        )
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "permission-blocked safety test left protection enabled"
+        )
+        try require(
+            coordinator.checks[.diagnosis] == false
+                && coordinator.checks[.serviceHealth] == false
+                && !coordinator.readiness.canEnableProtection,
+            "permission-blocked bootstrap relaxed a protection-readiness gate"
         )
     }
 
