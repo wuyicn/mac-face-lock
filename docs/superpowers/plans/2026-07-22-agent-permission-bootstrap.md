@@ -266,7 +266,7 @@ Run:
 scripts/build-release.sh
 checksum_file="dist/release/Mac-Face-Lock-0.2.0-beta-arm64.zip.sha256"
 (
-  cd "$(dirname "$checksum_file")"
+  cd "$(dirname "$checksum_file")" || exit 1
   shasum -a 256 -c "$(basename "$checksum_file")"
 )
 scripts/manual-release-acceptance.sh
@@ -280,10 +280,13 @@ Run:
 
 ```bash
 git status --short --branch
-git log --oneline --all | rg '^(4920224|466c73e|999de4b) '
+git merge-base --is-ancestor 4920224 HEAD
+git merge-base --is-ancestor 466c73e HEAD
+git merge-base --is-ancestor 999de4b HEAD
+git log --oneline -5
 ```
 
-Expected: the worktree is clean, and history contains `4920224`, `466c73e`, and `999de4b`. Subsequent commits are allowed only when they are plan-only corrections; do not predict a new commit SHA. Generated `dist/` output remains ignored.
+Expected: the worktree is clean; all three ancestry checks exit 0, proving `4920224`, `466c73e`, and `999de4b` are reachable from the current `HEAD`; and the short log provides review context. Subsequent commits are allowed only when they are plan-only corrections; do not predict a new commit SHA. Generated `dist/` output remains ignored.
 
 ### Task 3: Install safely and close the real macOS permission loop
 
