@@ -264,8 +264,11 @@ Run:
 
 ```bash
 scripts/build-release.sh
-shasum -a 256 -c \
-  dist/release/Mac-Face-Lock-0.2.0-beta-arm64.zip.sha256
+checksum_file="dist/release/Mac-Face-Lock-0.2.0-beta-arm64.zip.sha256"
+(
+  cd "$(dirname "$checksum_file")"
+  shasum -a 256 -c "$(basename "$checksum_file")"
+)
 scripts/manual-release-acceptance.sh
 ```
 
@@ -277,10 +280,10 @@ Run:
 
 ```bash
 git status --short --branch
-git log -2 --oneline
+git log --oneline --all | rg '^(4920224|466c73e|999de4b) '
 ```
 
-Expected: no tracked or untracked source changes remain; the latest three commits are the behavioral fix, this implementation plan, and `999de4b` design commit. Generated `dist/` output remains ignored.
+Expected: the worktree is clean, and history contains `4920224`, `466c73e`, and `999de4b`. Subsequent commits are allowed only when they are plan-only corrections; do not predict a new commit SHA. Generated `dist/` output remains ignored.
 
 ### Task 3: Install safely and close the real macOS permission loop
 
