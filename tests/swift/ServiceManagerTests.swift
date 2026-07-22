@@ -241,7 +241,10 @@ private struct ServiceFixture {
     func seedHealthyStateSequence(
         pid: Int32 = 42,
         sequences: [UInt64],
-        timestamp: String = "2026-07-17T00:00:09Z"
+        timestamp: String = "2026-07-17T00:00:09Z",
+        camera: Bool = true,
+        inputMonitoring: Bool = true,
+        accessibility: Bool = true
     ) throws {
         let data = try sequences.map { sequence in
             try JSONSerialization.data(
@@ -249,9 +252,9 @@ private struct ServiceFixture {
                     "status": "paused",
                     "armed": false,
                     "agent_pid": Int(pid),
-                    "camera_ready": true,
-                    "input_monitoring_ready": true,
-                    "accessibility_ready": true,
+                    "camera_ready": camera,
+                    "input_monitoring_ready": inputMonitoring,
+                    "accessibility_ready": accessibility,
                     "heartbeat_sequence": sequence,
                     "heartbeat_timestamp": timestamp,
                 ] as [String: Any]
@@ -300,6 +303,7 @@ struct ServiceManagerTests {
         try await testUninstallPreservesApplicationData()
         try await testUninstallDoesNotHideRunningJobRemovalFailure()
         try await testAgentPermissionFailureCannotReportHealthy()
+        try await testStableInstallAllowsPendingPermissions()
         try await testStaleOrMissingHeartbeatCannotReportHealthy()
         try await testStableInstallRequiresAdvancingHeartbeat()
         try await testStableInstallWaitsThroughDuplicateHeartbeatPolls()
@@ -676,6 +680,32 @@ struct ServiceManagerTests {
         try require(status.cameraReady, "camera readiness was lost")
         try require(!status.inputMonitoringReady, "input monitoring denial was ignored")
         try require(status.accessibilityReady, "accessibility readiness was lost")
+    }
+
+    private static func testStableInstallAllowsPendingPermissions() async throws {
+        let fixture = try ServiceFixture(printPIDs: [42, 42, 42, 42])
+        try fixture.seedHealthyStateSequence(
+            sequences: [1, 2, 3],
+            inputMonitoring: false,
+            accessibility: false
+        )
+
+        try await fixture.manager().install(
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+
+        let status = await fixture.manager().status()
+        try require(
+            fixture.fileSystem.fileExists(at: fixture.plistURL),
+            "pending permissions rolled back a responsive Agent installation"
+        )
+        try require(status.isResponsive, "responsive Agent was not reported responsive")
+        try require(!status.isHealthy, "pending Agent permissions reported protection ready")
+        try require(status.cameraReady, "camera grant was lost")
+        try require(!status.inputMonitoringReady, "input-monitoring denial was ignored")
+        try require(!status.accessibilityReady, "accessibility denial was ignored")
+        try require(fixture.runner.bootstrapCount == 1, "responsive install unexpectedly rolled back")
     }
 
     private static func testStaleOrMissingHeartbeatCannotReportHealthy() async throws {

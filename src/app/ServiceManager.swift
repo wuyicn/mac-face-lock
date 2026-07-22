@@ -18,6 +18,7 @@ struct ServiceStatus: Equatable {
     let expectedProgram: String
     let heartbeatTimestamp: String?
     let heartbeatSequence: UInt64?
+    let isResponsive: Bool
 
     init(
         state: ServiceState,
@@ -28,7 +29,8 @@ struct ServiceStatus: Equatable {
         installedProgram: String?,
         expectedProgram: String,
         heartbeatTimestamp: String? = nil,
-        heartbeatSequence: UInt64? = nil
+        heartbeatSequence: UInt64? = nil,
+        isResponsive: Bool = false
     ) {
         self.state = state
         self.pid = pid
@@ -39,6 +41,7 @@ struct ServiceStatus: Equatable {
         self.expectedProgram = expectedProgram
         self.heartbeatTimestamp = heartbeatTimestamp
         self.heartbeatSequence = heartbeatSequence
+        self.isResponsive = isResponsive
     }
 
     var isHealthy: Bool {
@@ -331,7 +334,7 @@ final class ServiceManager: ServiceManaging {
                 ["bootstrap", userDomain, destinationURL.path]
             )
             try await runRequiredLaunchctl(["enable", serviceTarget])
-            try await requireStableHealth()
+            try await requireStableResponsiveness()
             if fileSystem.fileExists(at: backupURL) {
                 try fileSystem.removeItem(at: backupURL)
             }
@@ -417,13 +420,14 @@ final class ServiceManager: ServiceManaging {
         let runningState = state.map {
             !["missing", "stopped", "input_listener_error"].contains($0.status)
         } == true
-        let healthy = state?.agentPid == pid
-            && cameraReady
-            && inputMonitoringReady
-            && accessibilityReady
+        let responsive = state?.agentPid == pid
             && heartbeatSequence != nil
             && heartbeatFresh
             && runningState
+        let healthy = responsive
+            && cameraReady
+            && inputMonitoringReady
+            && accessibilityReady
         return ServiceStatus(
             state: healthy ? .healthy : .unhealthy,
             pid: pid,
@@ -433,7 +437,8 @@ final class ServiceManager: ServiceManaging {
             installedProgram: installedProgram,
             expectedProgram: expectedProgram,
             heartbeatTimestamp: heartbeatTimestamp,
-            heartbeatSequence: heartbeatSequence
+            heartbeatSequence: heartbeatSequence,
+            isResponsive: responsive
         )
     }
 
@@ -535,11 +540,11 @@ final class ServiceManager: ServiceManaging {
         try fileSystem.writeAtomically(data, to: controlURL)
     }
 
-    private func requireStableHealth() async throws {
+    private func requireStableResponsiveness() async throws {
         let deadline = monotonicNow() + stableHealthTimeout
         var stablePID: Int32?
         var stableHeartbeatSequence: UInt64?
-        var consecutiveHealthyPolls = 0
+        var consecutiveResponsivePolls = 0
         for attempt in 0..<healthPollAttempts {
             let remainingBeforeProbe = deadline - monotonicNow()
             guard remainingBeforeProbe > 0 else {
@@ -548,18 +553,18 @@ final class ServiceManager: ServiceManaging {
             let current = await status(
                 commandTimeout: min(commandTimeout, remainingBeforeProbe)
             )
-            if current.isHealthy,
+            if current.isResponsive,
                let pid = current.pid,
                pid > 0,
                let sequence = current.heartbeatSequence {
                 if stablePID == pid {
                     if let previousSequence = stableHeartbeatSequence,
                        sequence > previousSequence {
-                        consecutiveHealthyPolls += 1
+                        consecutiveResponsivePolls += 1
                         stableHeartbeatSequence = sequence
                     } else if let previousSequence = stableHeartbeatSequence,
                               sequence < previousSequence {
-                        consecutiveHealthyPolls = 1
+                        consecutiveResponsivePolls = 1
                         stableHeartbeatSequence = sequence
                     } else {
                         // A faster status poll may observe the same live heartbeat.
@@ -567,16 +572,16 @@ final class ServiceManager: ServiceManaging {
                     }
                 } else {
                     stablePID = pid
-                    consecutiveHealthyPolls = 1
+                    consecutiveResponsivePolls = 1
                     stableHeartbeatSequence = sequence
                 }
-                if consecutiveHealthyPolls == 3 {
+                if consecutiveResponsivePolls == 3 {
                     return
                 }
             } else {
                 stablePID = nil
                 stableHeartbeatSequence = nil
-                consecutiveHealthyPolls = 0
+                consecutiveResponsivePolls = 0
             }
             let remainingAfterProbe = deadline - monotonicNow()
             guard remainingAfterProbe > 0 else {
