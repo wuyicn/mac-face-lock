@@ -15,7 +15,7 @@
 - Missing or stale heartbeat, PID mismatch, stopped state, input-listener failure, invalid plist, or `launchctl` failure must still roll back.
 - Camera and permission failures remain fail-open and must never be treated as a stranger result.
 - Do not change face matching, enrollment, locking thresholds, signing/notarization scope, or notification routing.
-- Preserve `/Users/wuyi-macs/Library/Application Support/Mac Face Lock` and the unrelated deletion in the main worktree at `config/config.json`.
+- Preserve `~/Library/Application Support/Mac Face Lock` and the unrelated deletion in the main worktree at `config/config.json`.
 - Do not push GitHub or merge branches without separate user authorization.
 
 ---
@@ -286,9 +286,9 @@ Expected: no tracked or untracked source changes remain; the latest three commit
 
 **Files and system state:**
 - Replace: `/Applications/Mac Face Lock.app`
-- Preserve: `/Users/wuyi-macs/Library/Application Support/Mac Face Lock/**`
+- Preserve: `~/Library/Application Support/Mac Face Lock/**`
 - Create temporarily: a sibling staged app under `/Applications` for atomic swap
-- Manage: `/Users/wuyi-macs/Library/LaunchAgents/com.wuyi.mac-face-lock-agent.plist`
+- Manage: `~/Library/LaunchAgents/com.wuyi.mac-face-lock-agent.plist`
 
 **Interfaces:**
 - Consumes: the verified archive from Task 2 and the existing enrolled owner profile.
@@ -299,12 +299,13 @@ Expected: no tracked or untracked source changes remain; the latest three commit
 Record without modifying support data:
 
 ```bash
+face_lock_support_dir="$HOME/Library/Application Support/Mac Face Lock"
 shasum -a 256 \
-  "/Users/wuyi-macs/Library/Application Support/Mac Face Lock/data/owner_face.npy"
+  "$face_lock_support_dir/data/owner_face.npy"
 plutil -p \
-  "/Users/wuyi-macs/Library/Application Support/Mac Face Lock/data/onboarding.json"
+  "$face_lock_support_dir/data/onboarding.json"
 plutil -p \
-  "/Users/wuyi-macs/Library/Application Support/Mac Face Lock/data/control.json"
+  "$face_lock_support_dir/data/control.json"
 ```
 
 Expected: the owner template exists, onboarding remains at `safety_test`, and `protection_enabled` is `false`.
@@ -335,9 +336,10 @@ Expected: the new app is installed and verified; the swapped previous app remain
 Open the installed app and click `运行安全测试` once while protection remains disabled. Then inspect:
 
 ```bash
+face_lock_support_dir="$HOME/Library/Application Support/Mac Face Lock"
 launchctl print "gui/$(id -u)/com.wuyi.mac-face-lock-agent"
-plutil -p "/Users/wuyi-macs/Library/Application Support/Mac Face Lock/data/state.json"
-plutil -p "/Users/wuyi-macs/Library/Application Support/Mac Face Lock/data/control.json"
+plutil -p "$face_lock_support_dir/data/state.json"
+plutil -p "$face_lock_support_dir/data/control.json"
 ```
 
 Expected within a few advancing heartbeats: the LaunchAgent remains loaded with a stable nonzero PID; `camera_ready`, `input_monitoring_ready`, and `accessibility_ready` show their actual values; at least one pending permission keeps the safety test incomplete; `protection_enabled` remains `false`. Waiting five minutes must no longer remove the plist or stop the Agent.
@@ -359,7 +361,8 @@ Re-run the pre-install evidence commands. Expected: owner template SHA-256 is un
 Because active protection can lock the Mac after input activity, ask the user for confirmation immediately before clicking `开启保护`. After confirmation, enable it and verify:
 
 ```bash
-plutil -p "/Users/wuyi-macs/Library/Application Support/Mac Face Lock/data/control.json"
+face_lock_support_dir="$HOME/Library/Application Support/Mac Face Lock"
+plutil -p "$face_lock_support_dir/data/control.json"
 launchctl print "gui/$(id -u)/com.wuyi.mac-face-lock-agent"
 ```
 
