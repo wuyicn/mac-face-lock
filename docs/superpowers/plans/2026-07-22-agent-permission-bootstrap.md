@@ -288,6 +288,32 @@ git log --oneline -5
 
 Expected: the worktree is clean; all three ancestry checks exit 0, proving `4920224`, `466c73e`, and `999de4b` are reachable from the current `HEAD`; and the short log provides review context. Subsequent commits are allowed only when they are plan-only corrections; do not predict a new commit SHA. Generated `dist/` output remains ignored.
 
+### Task 2A: Install the release Agent even when diagnosis is permission-blocked
+
+**Files:**
+- Modify: `src/app/SetupCoordinator.swift`
+- Modify: `tests/swift/SetupCoordinatorTests.swift`
+
+**Interfaces:**
+- Consumes: a release-mode safety test whose foreground diagnosis may fail because Agent permissions are not yet registered.
+- Produces: an attempted responsive Agent installation regardless of diagnosis result, while diagnosis, service health, owner verification, and protection gates remain strict.
+
+- [ ] **Step 1: Add a failing coordinator regression test**
+
+Add a release-mode test whose diagnostic result exits `10` with a camera/permission failure. Run `runSafetyTest()` and assert that it returns `false`, leaves protection disabled, and still calls `ServiceManaging.install(...)` exactly once with the release app and support paths.
+
+- [ ] **Step 2: Prove RED**
+
+Compile and run the Setup coordinator Swift suite with the Task 1 command. Expected: the new assertion fails because `installAndRefreshReleaseService` currently returns when `diagnosisPassed` is false.
+
+- [ ] **Step 3: Decouple bootstrap from the diagnosis gate**
+
+In `installAndRefreshReleaseService`, require only a valid cleanup generation and an available release `serviceManager` before installing. Do not relax `runSafetyTest`'s `guard diagnosisPassed`, `ServiceStatus.isHealthy`, readiness checks, or `enableProtection` gates.
+
+- [ ] **Step 4: Prove GREEN and commit**
+
+Run the Setup coordinator Swift suite, the Service manager Swift suite, and `git diff --check`. Expected: both suites pass, the regression proves permission-blocked diagnosis still bootstraps the Agent, and no protection gate changes. Commit only the two implementation/test files with `fix: bootstrap agent before permission diagnosis passes`.
+
 ### Task 3: Install safely and close the real macOS permission loop
 
 **Files and system state:**
