@@ -1422,17 +1422,17 @@ final class SetupCoordinator: ObservableObject {
 
     @discardableResult
     func uninstallServicePreservingData() async -> Bool {
-        guard let cleanupGeneration = legacyCleanupAccessGeneration else {
-            publishBlockedLegacyCleanupEffects()
-            return false
-        }
-        guard let serviceManager else {
-            currentError = "当前安装没有可管理的后台服务。"
-            return false
-        }
         currentError = nil
         do {
             _ = try localStore.writeControl(enabled: false)
+            guard let cleanupGeneration = legacyCleanupAccessGeneration else {
+                publishBlockedLegacyCleanupEffects()
+                return false
+            }
+            guard let serviceManager else {
+                currentError = "当前安装没有可管理的后台服务。"
+                return false
+            }
             guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
                 publishBlockedLegacyCleanupEffects()
                 return false
@@ -1692,7 +1692,7 @@ final class SetupCoordinator: ObservableObject {
             case .commandFailed, .commandTimedOut:
                 return "后台服务操作未完成，请稍后重试；若仍失败，请重新安装服务。"
             case .unstableService:
-                return "后台服务尚未稳定，请确认 Agent 权限后重试。"
+                return "后台服务尚未稳定，请确认 Mac Face Lock 权限后重试。"
             case .rollbackFailed:
                 return "后台服务更新未完成，旧设置恢复也遇到问题；保护保持关闭。"
             }
@@ -2067,7 +2067,7 @@ final class SetupCoordinator: ObservableObject {
                 }
             case .unhealthy:
                 if shouldPublishServiceRepair {
-                    currentError = "后台 Agent 权限或运行状态未就绪，请完成授权并重新运行诊断。"
+                    currentError = "Mac Face Lock 权限或后台运行状态未就绪，请完成授权并重新运行诊断。"
                 }
             }
         } else {
@@ -2118,7 +2118,7 @@ final class SetupCoordinator: ObservableObject {
             case .notInstalled:
                 currentError = "后台服务尚未安装，请重新运行诊断。"
             case .unhealthy:
-                currentError = "后台 Agent 权限或运行状态未就绪，请完成授权并重新运行诊断。"
+                currentError = "Mac Face Lock 权限或后台运行状态未就绪，请完成授权并重新运行诊断。"
             }
         } catch {
             serviceHealthy = false

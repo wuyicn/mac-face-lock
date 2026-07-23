@@ -64,7 +64,7 @@ struct RootView: View {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text("首次设置已完成，当前安全状态尚未全部确认")
                                     .font(.system(size: 14, weight: .semibold))
-                                Text("保护恢复前会重新检查当前权限、本人资料和 Agent 状态。")
+                                Text("保护恢复前会重新检查当前权限、本人资料和后台保护状态。")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }

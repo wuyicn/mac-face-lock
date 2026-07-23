@@ -332,13 +332,23 @@ struct OnboardingView: View {
     private var permissionsStep: some View {
         OnboardingCard(
             title: "权限中心",
-            subtitle: "这里先检查 Mac Face Lock 控制中心；后台 Agent 的独立权限会在安全测试中确认。",
+            subtitle: "检查 Mac Face Lock 的三项必要权限；后台状态会在安全测试中确认。",
             symbol: "hand.raised"
         ) {
-            Text("Mac Face Lock 控制中心权限")
+            Text("Mac Face Lock 权限")
                 .font(.headline)
             VStack(spacing: 12) {
-                permissionRow(.camera, title: "摄像头", required: true)
+                permissionRow(.camera, title: "Mac Face Lock 摄像头", required: true)
+                permissionRow(
+                    .inputMonitoring,
+                    title: "Mac Face Lock 输入监控",
+                    required: true
+                )
+                permissionRow(
+                    .accessibility,
+                    title: "Mac Face Lock 辅助功能",
+                    required: true
+                )
                 permissionRow(.screenRecording, title: "屏幕录制", required: false)
             }
 
@@ -358,10 +368,10 @@ struct OnboardingView: View {
                 .disabled(isWorking)
 
                 Button("继续录入本人") {
-                    actionState = .working("正在确认控制中心摄像头权限…")
+                    actionState = .working("正在确认 Mac Face Lock 必要权限…")
                     Task {
                         if await setupCoordinator.continueFromPermissions() {
-                            actionState = .success("控制中心摄像头权限已就绪")
+                            actionState = .success("Mac Face Lock 必要权限已就绪")
                         } else {
                             actionState = .failure(
                                 setupCoordinator.currentError ?? "必需权限尚未就绪"
@@ -463,11 +473,11 @@ struct OnboardingView: View {
             }
 
             VStack(alignment: .leading, spacing: 10) {
-                Text("Mac Face Lock Agent 权限")
+                Text("Mac Face Lock 当前权限")
                     .font(.headline)
-                agentPermissionRow(.camera, title: "Agent 摄像头")
-                agentPermissionRow(.inputMonitoring, title: "Agent 输入监控")
-                agentPermissionRow(.accessibility, title: "Agent 辅助功能")
+                agentPermissionRow(.camera, title: "Mac Face Lock 摄像头")
+                agentPermissionRow(.inputMonitoring, title: "Mac Face Lock 输入监控")
+                agentPermissionRow(.accessibility, title: "Mac Face Lock 辅助功能")
             }
 
             CustomerActionStatusView(state: actionState)
@@ -511,20 +521,20 @@ struct OnboardingView: View {
             symbol: "checkmark.shield"
         ) {
             VStack(alignment: .leading, spacing: 12) {
-                readinessRow(.cameraPermission, title: "控制中心摄像头权限")
-                readinessRow(.inputMonitoringPermission, title: "Agent 输入监控权限")
-                readinessRow(.accessibilityPermission, title: "Agent 辅助功能权限")
+                readinessRow(.cameraPermission, title: "Mac Face Lock 摄像头")
+                readinessRow(.inputMonitoringPermission, title: "Mac Face Lock 输入监控")
+                readinessRow(.accessibilityPermission, title: "Mac Face Lock 辅助功能")
                 readinessRow(.ownerProfile, title: "本人资料")
                 readinessRow(.ownerTest, title: "本人安全测试")
                 readinessRow(.serviceHealth, title: "后台服务")
             }
 
             VStack(alignment: .leading, spacing: 10) {
-                Text("Mac Face Lock Agent 当前权限")
+                Text("Mac Face Lock 当前权限")
                     .font(.headline)
-                agentPermissionRow(.camera, title: "Agent 摄像头")
-                agentPermissionRow(.inputMonitoring, title: "Agent 输入监控")
-                agentPermissionRow(.accessibility, title: "Agent 辅助功能")
+                agentPermissionRow(.camera, title: "Mac Face Lock 摄像头")
+                agentPermissionRow(.inputMonitoring, title: "Mac Face Lock 输入监控")
+                agentPermissionRow(.accessibility, title: "Mac Face Lock 辅助功能")
             }
 
             CustomerActionStatusView(state: actionState)
@@ -649,7 +659,7 @@ struct OnboardingView: View {
         case .accessibility:
             granted = status.accessibilityReady
         case .screenRecording:
-            return (false, "不由 Agent 使用")
+            return (false, "此保护不需要")
         }
         return (granted, granted ? "已开启" : "未开启")
     }

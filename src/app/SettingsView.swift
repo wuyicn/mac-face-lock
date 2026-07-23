@@ -86,18 +86,24 @@ struct SettingsView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("保护将停止，应用数据会保留，之后重新安装服务可继续使用。")
+            Text("保护将停止，应用数据会保留，之后可通过“修复后台保护”继续使用。")
         }
     }
 
     private var permissionsSection: some View {
         SettingsSection(title: "权限与运行状态", symbol: "hand.raised.fill") {
-            Text("Mac Face Lock 控制中心权限")
+            Text("Mac Face Lock 权限")
                 .font(.headline)
             VStack(spacing: 11) {
-                settingsPermissionRow(.camera, title: "摄像头")
-                settingsPermissionRow(.inputMonitoring, title: "输入监控")
-                settingsPermissionRow(.accessibility, title: "辅助功能")
+                settingsPermissionRow(.camera, title: "Mac Face Lock 摄像头")
+                settingsPermissionRow(
+                    .inputMonitoring,
+                    title: "Mac Face Lock 输入监控"
+                )
+                settingsPermissionRow(
+                    .accessibility,
+                    title: "Mac Face Lock 辅助功能"
+                )
                 settingsPermissionRow(.screenRecording, title: "屏幕录制（可选）")
             }
 
@@ -113,18 +119,6 @@ struct SettingsView: View {
             .buttonStyle(.borderedProminent)
             .disabled(isWorking(permissionAction))
 
-            Divider()
-
-            Text("Mac Face Lock Agent 权限")
-                .font(.headline)
-            VStack(spacing: 11) {
-                agentPermissionRow(.camera, title: "Agent 摄像头")
-                agentPermissionRow(.inputMonitoring, title: "Agent 输入监控")
-                agentPermissionRow(.accessibility, title: "Agent 辅助功能")
-            }
-            Text("Agent 权限由后台应用独立持有；控制中心显示已开启，不代表 Agent 已获得同一权限。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
     }
 
@@ -228,9 +222,9 @@ struct SettingsView: View {
             )
 
             VStack(spacing: 9) {
-                agentPermissionRow(.camera, title: "Agent 摄像头")
-                agentPermissionRow(.inputMonitoring, title: "Agent 输入监控")
-                agentPermissionRow(.accessibility, title: "Agent 辅助功能")
+                agentPermissionRow(.camera, title: "Mac Face Lock 摄像头")
+                agentPermissionRow(.inputMonitoring, title: "Mac Face Lock 输入监控")
+                agentPermissionRow(.accessibility, title: "Mac Face Lock 辅助功能")
             }
 
             CustomerActionStatusView(state: serviceStatus)
@@ -246,11 +240,11 @@ struct SettingsView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(isWorking(serviceAction))
 
-                Button("重新安装服务") {
-                    serviceAction = .working("正在安全更新后台服务…")
+                Button("修复后台保护") {
+                    serviceAction = .working("正在修复后台保护…")
                     Task {
                         await setupCoordinator.reinstallService()
-                        updateServiceAction(successMessage: "后台服务已重新安装")
+                        updateServiceAction(successMessage: "后台保护已修复")
                     }
                 }
                 .buttonStyle(.bordered)
@@ -389,14 +383,14 @@ struct SettingsView: View {
         case .unhealthy:
             return "运行异常，需要诊断"
         case .needsRepair:
-            return "应用位置已变化，需要重新安装"
+            return "应用位置已变化，需要修复后台保护"
         }
     }
 
     private var recoveryMessage: String {
         switch setupCoordinator.recoveryStep {
         case .permissions:
-            return "首次设置记录仍然保留。请恢复控制中心摄像头权限，随后重新确认本人。"
+            return "首次设置记录仍然保留。请恢复 Mac Face Lock 摄像头权限，随后重新确认本人。"
         case .enrollment:
             return "首次设置记录仍然保留，但当前本人模板无效，请重新录入本人。"
         case .safetyTest:
@@ -431,7 +425,7 @@ struct SettingsView: View {
                 Button("打开系统设置") {
                     setupCoordinator.openPermissionSettings(permission)
                     let message = CustomerActionState.success(
-                        "已打开 Agent 的 \(title) 设置页，返回后请刷新状态"
+                        "已打开 Mac Face Lock 的 \(title) 设置页，返回后请刷新状态"
                     )
                     permissionAction = message
                     serviceAction = message
@@ -458,7 +452,7 @@ struct SettingsView: View {
         case .accessibility:
             granted = status.accessibilityReady
         case .screenRecording:
-            return (false, "不由 Agent 使用")
+            return (false, "此保护不需要")
         }
         return (granted, granted ? "已开启" : "未开启")
     }

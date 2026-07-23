@@ -450,6 +450,12 @@ class UnifiedPackagingTests(unittest.TestCase):
     def test_onboarding_sources_define_complete_customer_flow(self) -> None:
         onboarding = (PROJECT_DIR / "src/app" / "OnboardingView.swift").read_text()
         settings = (PROJECT_DIR / "src/app" / "SettingsView.swift").read_text()
+        status_menu = (
+            PROJECT_DIR / "src/app" / "StatusMenuController.swift"
+        ).read_text()
+        setup_coordinator = (
+            PROJECT_DIR / "src/app" / "SetupCoordinator.swift"
+        ).read_text()
         views = (PROJECT_DIR / "src/app" / "Views.swift").read_text()
 
         for label in (
@@ -472,7 +478,7 @@ class UnifiedPackagingTests(unittest.TestCase):
             "刷新权限",
             "打开系统设置",
             "重新启动服务",
-            "重新安装服务",
+            "修复后台保护",
             "查看日志",
         ):
             with self.subTest(settings_label=label):
@@ -482,10 +488,15 @@ class UnifiedPackagingTests(unittest.TestCase):
         self.assertIn("setupCoordinator.isLiveReady", views)
         self.assertIn("RootDestination.resolve", views)
         self.assertIn("OnboardingView(", views)
-        self.assertIn("Mac Face Lock 控制中心权限", onboarding)
-        self.assertIn("Mac Face Lock Agent 权限", onboarding)
-        self.assertIn("Mac Face Lock 控制中心权限", settings)
-        self.assertIn("Mac Face Lock Agent 权限", settings)
+        for permission_title in (
+            "Mac Face Lock 摄像头",
+            "Mac Face Lock 输入监控",
+            "Mac Face Lock 辅助功能",
+        ):
+            with self.subTest(permission_title=permission_title):
+                self.assertIn(permission_title, onboarding)
+                self.assertIn(permission_title, settings)
+        self.assertIn("退出 Mac Face Lock 并停止保护", status_menu)
         self.assertIn("enrollmentLifecycle", onboarding)
 
         for guidance in (
@@ -499,7 +510,19 @@ class UnifiedPackagingTests(unittest.TestCase):
             with self.subTest(enrollment_guidance=guidance):
                 self.assertIn(guidance, onboarding)
 
-        user_facing_sources = onboarding + settings
+        user_facing_sources = (
+            onboarding + settings + status_menu + setup_coordinator + views
+        )
+        for retired_copy in (
+            "Agent 权限",
+            "Agent 状态",
+            "后台 Agent",
+            "重新安装 Agent",
+            "退出界面",
+        ):
+            with self.subTest(retired_copy=retired_copy):
+                self.assertNotIn(retired_copy, user_facing_sources)
+
         for shell_copy in (
             "launchctl ",
             "python ",

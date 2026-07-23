@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var themeStore: ThemeStore?
     private var desktopWindowController: DesktopWindowController?
     private var statusMenuController: StatusMenuController?
+    private var applicationQuitCoordinator: ApplicationQuitCoordinator?
     private var localMouseMonitor: LocalMouseEventMonitor?
 
     override init() {
@@ -99,9 +100,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             projectURL: environment.supportURL,
             dataURL: environment.dataURL
         )
+        let applicationQuitCoordinator = ApplicationQuitCoordinator(
+            stopBackground: {
+                await setupCoordinator.uninstallServicePreservingData()
+            },
+            terminate: {
+                NSApp.terminate(nil)
+            }
+        )
         let statusMenuController = StatusMenuController(
             faceLockStore: faceLockStore,
             setupCoordinator: setupCoordinator,
+            applicationQuitCoordinator: applicationQuitCoordinator,
             projectURL: environment.supportURL,
             dataURL: environment.dataURL,
             showDesktopWindow: { [weak desktopWindowController] in
@@ -115,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.themeStore = themeStore
         self.desktopWindowController = desktopWindowController
         self.statusMenuController = statusMenuController
+        self.applicationQuitCoordinator = applicationQuitCoordinator
 
         if !setupCoordinator.hasCompletedOnboarding {
             desktopWindowController.show()
@@ -138,6 +149,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) -> Bool {
         desktopWindowController?.show()
         return true
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(
+        _ sender: NSApplication
+    ) -> Bool {
+        false
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {

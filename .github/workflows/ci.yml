@@ -133,6 +133,13 @@ jobs:
             tests/swift/ApplicationLaunchModeTests.swift \
             -o "$RUNNER_TEMP/mac-face-lock-application-mode-tests"
           "$RUNNER_TEMP/mac-face-lock-application-mode-tests"
+      - name: Run Swift application quit coordinator tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ApplicationQuitCoordinator.swift \
+            tests/swift/ApplicationQuitCoordinatorTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-quit-tests"
+          "$RUNNER_TEMP/mac-face-lock-quit-tests"
       - name: Run Swift agent-launcher tests
         run: |
           xcrun swiftc -parse-as-library -DTESTING \

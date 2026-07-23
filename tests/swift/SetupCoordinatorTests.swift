@@ -140,6 +140,7 @@ private final class FakeServiceManager: ServiceManaging {
     var suspendStatus = false
     var suspendInstall = false
     var onStatus: (() -> Void)?
+    var onUninstall: (() throws -> Void)?
     private(set) var statusStarted = false
     private(set) var installStarted = false
     private var statusContinuation: CheckedContinuation<Void, Never>?
@@ -190,6 +191,7 @@ private final class FakeServiceManager: ServiceManaging {
     }
 
     func uninstallPreservingData() async throws {
+        try onUninstall?()
         uninstallCount += 1
         currentStatus = ServiceStatus(
             state: .notInstalled,
@@ -777,6 +779,7 @@ struct SetupCoordinatorTests {
         try testUnsafePersistedStepFallsBackToLastSatisfiedGate()
         try await testOperationalServiceRepairActionsUseServiceManager()
         try await testOperationalServiceUninstallPreservesDataAndDisablesProtection()
+        try await testQuitStopFailureDisablesProtectionAndPreservesRecords()
         try await testCompletedRecordDoesNotFabricateLiveRuntimeGates()
         try await testEnableProtectionReprobesRevokedPermissionAndFallsBack()
         try await testCompletedAuthorizationRefreshFallsBackAfterRevocation()
@@ -2326,15 +2329,22 @@ struct SetupCoordinatorTests {
         let serviceManager = FakeServiceManager(state: .healthy)
         let ownerURL = fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
         try Data("retained-owner-template".utf8).write(to: ownerURL)
-        try fixture.setupStore.save(
-            OnboardingRecord(
-                currentStep: .completion,
-                completedSteps: SetupStep.allCases,
-                completedAt: "2026-07-18T12:00:00Z",
-                appVersion: "test"
-            )
+        let onboardingRecord = OnboardingRecord(
+            currentStep: .completion,
+            completedSteps: SetupStep.allCases,
+            completedAt: "2026-07-18T12:00:00Z",
+            appVersion: "test",
+            ownerProfileFingerprint: "retained-owner-fingerprint",
+            requiresOwnerReverification: false
         )
+        try fixture.setupStore.save(onboardingRecord)
         _ = try fixture.localStore.writeControl(enabled: true)
+        serviceManager.onUninstall = {
+            try require(
+                !fixture.localStore.readControl().protectionEnabled,
+                "service uninstall began before protection was disabled"
+            )
+        }
         let coordinator = SetupCoordinator(
             environment: fixture.environment,
             permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
@@ -2368,8 +2378,57 @@ struct SetupCoordinatorTests {
             "service uninstall removed retained owner data"
         )
         try require(
-            fixture.setupStore.record.completedAt == "2026-07-18T12:00:00Z",
-            "service uninstall erased onboarding history"
+            fixture.localStore.readOnboarding() == onboardingRecord
+                && fixture.setupStore.record == onboardingRecord,
+            "service uninstall changed onboarding history"
+        )
+    }
+
+    private static func testQuitStopFailureDisablesProtectionAndPreservesRecords()
+        async throws
+    {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
+        let ownerData = Data("retained-owner-template-on-failure".utf8)
+        try ownerData.write(to: ownerURL)
+        let onboardingRecord = OnboardingRecord(
+            currentStep: .completion,
+            completedSteps: SetupStep.allCases,
+            completedAt: "2026-07-23T12:00:00Z",
+            appVersion: "test",
+            ownerProfileFingerprint: "retained-owner-fingerprint",
+            requiresOwnerReverification: false
+        )
+        try fixture.setupStore.save(onboardingRecord)
+        _ = try fixture.localStore.writeControl(enabled: true)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: nil,
+            legacyInstallCleaner: nil,
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        let stopped = await coordinator.uninstallServicePreservingData()
+
+        try require(!stopped, "missing background service unexpectedly reported a stopped state")
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "failed quit stop left protection enabled"
+        )
+        let retainedOwnerData = try Data(contentsOf: ownerURL)
+        try require(
+            retainedOwnerData == ownerData,
+            "failed quit stop changed owner data"
+        )
+        try require(
+            fixture.localStore.readOnboarding() == onboardingRecord
+                && fixture.setupStore.record == onboardingRecord,
+            "failed quit stop changed onboarding history"
         )
     }
 
