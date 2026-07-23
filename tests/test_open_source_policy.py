@@ -922,9 +922,28 @@ scripts/bootstrap.sh
     def test_ci_builds_runtime_only_on_macos_before_unified_app(self):
         workflow = load_ci_workflow()
         linux_commands = ci_job_run_commands(workflow["jobs"]["python-linux"])
-        macos_commands = ci_job_run_commands(workflow["jobs"]["macos-release-gates"])
+        macos_job = workflow["jobs"]["macos-release-gates"]
+        macos_commands = ci_job_run_commands(macos_job)
 
         self.assertNotIn("scripts/build-runtime.sh", linux_commands)
+        uv_steps = [
+            index
+            for index, step in enumerate(macos_job["steps"])
+            if step.get("uses")
+            == "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b"
+        ]
+        self.assertEqual(uv_steps, [2], "macOS must install the pinned uv action")
+        uv_step_index = uv_steps[0]
+        self.assertEqual(
+            macos_job["steps"][uv_step_index].get("with", {}).get("version"),
+            "0.11.13",
+        )
+        runtime_step_index = next(
+            index
+            for index, step in enumerate(macos_job["steps"])
+            if step.get("run") == "scripts/build-runtime.sh"
+        )
+        self.assertLess(uv_step_index, runtime_step_index)
         runtime_index = macos_commands.index("scripts/build-runtime.sh")
         prerequisites_index = macos_commands.index(
             "python -m pip install -r requirements-lock.txt"
