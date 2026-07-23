@@ -109,6 +109,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             cancelTermination: { [weak self] in
                 self?.cancelPendingApplicationTermination()
+            },
+            cancelDeferredTermination: {
+                NSApp.reply(toApplicationShouldTerminate: false)
             }
         )
         let statusMenuController = StatusMenuController(

@@ -194,7 +194,7 @@ private final class FakeServiceManager: ServiceManaging {
         restartCount += 1
     }
 
-    func uninstallPreservingData() async throws {
+    func uninstallPreservingData() async throws -> ServiceStatus {
         try onUninstall?()
         uninstallCount += 1
         uninstallStarted = true
@@ -204,7 +204,7 @@ private final class FakeServiceManager: ServiceManaging {
             }
         }
         guard !preserveStatusOnUninstall else {
-            return
+            return currentStatus
         }
         currentStatus = ServiceStatus(
             state: .notInstalled,
@@ -215,6 +215,7 @@ private final class FakeServiceManager: ServiceManaging {
             installedProgram: nil,
             expectedProgram: currentStatus.expectedProgram
         )
+        return currentStatus
     }
 
     func finishStatus() {
@@ -544,6 +545,90 @@ private final class CancellationEOFWindowRunner: RuntimeCommandRunning {
     }
 }
 
+private final class QuitDrainRuntimeRunner: RuntimeCommandRunning {
+    private let ownerURL: URL?
+    private var cleanupContinuation: CheckedContinuation<Void, Never>?
+    private(set) var command: RuntimeCommand?
+    private(set) var started = false
+    private(set) var cancellationObserved = false
+    private(set) var cleanupFinished = false
+
+    init(ownerURL: URL? = nil) {
+        self.ownerURL = ownerURL
+    }
+
+    func run(
+        command: RuntimeCommand,
+        onEvent: @escaping (RuntimeEvent) -> Void
+    ) async throws -> RuntimeResult {
+        self.command = command
+        return try await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                cleanupContinuation = continuation
+                started = true
+            }
+            cleanupFinished = true
+            try Task.checkCancellation()
+
+            switch command {
+            case .enroll:
+                if let ownerURL {
+                    try Data("replacement-after-quit".utf8).write(to: ownerURL)
+                }
+                let terminal = RuntimeEvent(
+                    schemaVersion: 1,
+                    event: "enrollment_complete",
+                    status: "success",
+                    message: "complete"
+                )
+                onEvent(terminal)
+                return RuntimeResult(
+                    exitCode: 0,
+                    events: [terminal],
+                    stderr: "",
+                    stderrTruncated: false
+                )
+            case .diagnose:
+                let events = [
+                    RuntimeEvent(
+                        schemaVersion: 1,
+                        event: "diagnosis_check",
+                        status: "success",
+                        message: "template",
+                        check: "template"
+                    ),
+                    RuntimeEvent(
+                        schemaVersion: 1,
+                        event: "diagnosis_complete",
+                        status: "success",
+                        message: "complete"
+                    ),
+                ]
+                return RuntimeResult(
+                    exitCode: 0,
+                    events: events,
+                    stderr: "",
+                    stderrTruncated: false
+                )
+            default:
+                return RuntimeResult(
+                    exitCode: 0,
+                    events: [],
+                    stderr: "",
+                    stderrTruncated: false
+                )
+            }
+        } onCancel: {
+            cancellationObserved = true
+        }
+    }
+
+    func finishCleanup() {
+        cleanupContinuation?.resume()
+        cleanupContinuation = nil
+    }
+}
+
 private final class SerializedDiagnosisRunner: RuntimeCommandRunning {
     private var continuations: [CheckedContinuation<Void, Never>] = []
     private(set) var activeCount = 0
@@ -801,6 +886,9 @@ struct SetupCoordinatorTests {
         try await testApplicationQuitBlocksProtectionAndServiceMutations()
         try await testApplicationQuitRejectsUnverifiedStoppedService()
         try await testApplicationQuitRejectsAndRepairsLateControlEnable()
+        try await testApplicationQuitCancelsAndDrainsActiveDiagnosis()
+        try await testApplicationQuitCancelsAndDrainsActiveSafetyTest()
+        try await testApplicationQuitCancelsEnrollmentWithoutPersisting()
         try await testCompletedRecordDoesNotFabricateLiveRuntimeGates()
         try await testEnableProtectionReprobesRevokedPermissionAndFallsBack()
         try await testCompletedAuthorizationRefreshFallsBackAfterRevocation()
@@ -2560,7 +2648,7 @@ struct SetupCoordinatorTests {
         let fixture = try CoordinatorFixture()
         defer { fixture.remove() }
         let serviceManager = FakeServiceManager(state: .healthy)
-        serviceManager.suspendStatus = true
+        serviceManager.suspendUninstall = true
         let coordinator = SetupCoordinator(
             environment: fixture.environment,
             permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
@@ -2575,12 +2663,15 @@ struct SetupCoordinatorTests {
         let quit = Task {
             await coordinator.stopBackgroundForApplicationQuit()
         }
-        for _ in 0..<100 where !serviceManager.statusStarted {
+        for _ in 0..<100 where !serviceManager.uninstallStarted {
             await Task.yield()
         }
-        try require(serviceManager.statusStarted, "quit never reached final service status check")
+        try require(
+            serviceManager.uninstallStarted,
+            "quit never reached authoritative service stop"
+        )
         _ = try fixture.localStore.writeControl(enabled: true)
-        serviceManager.finishStatus()
+        serviceManager.finishUninstall()
         let stopped = await quit.value
 
         try require(!stopped, "quit accepted a late protection enable")
@@ -2589,6 +2680,181 @@ struct SetupCoordinatorTests {
             !fixture.localStore.readControl().protectionEnabled,
             "final control check did not restore durable protection off"
         )
+    }
+
+    private static func testApplicationQuitCancelsAndDrainsActiveDiagnosis()
+        async throws
+    {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let runner = QuitDrainRuntimeRunner()
+        let serviceManager = FakeServiceManager(state: .healthy)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+        await coordinator.inspectLegacyInstall()
+
+        let diagnosis = Task {
+            await coordinator.runDiagnosis()
+        }
+        for _ in 0..<100 where !runner.started {
+            await Task.yield()
+        }
+        try require(runner.started, "diagnosis runtime never reached its suspended work")
+
+        let quit = Task {
+            await coordinator.stopBackgroundForApplicationQuit()
+        }
+        for _ in 0..<100
+            where !runner.cancellationObserved && !serviceManager.uninstallStarted {
+            await Task.yield()
+        }
+        let cancellationObservedBeforeCleanup = runner.cancellationObserved
+        let uninstallStartedBeforeCleanup = serviceManager.uninstallStarted
+
+        runner.finishCleanup()
+        await diagnosis.value
+        let stopped = await quit.value
+
+        try require(
+            cancellationObservedBeforeCleanup,
+            "application quit did not cancel the active diagnosis child"
+        )
+        try require(
+            !uninstallStartedBeforeCleanup,
+            "application quit stopped the service before runtime cleanup completed"
+        )
+        try require(runner.cleanupFinished, "quit returned with an orphaned runtime child")
+        try require(stopped, "drained diagnosis did not permit verified service stop")
+    }
+
+    private static func testApplicationQuitCancelsAndDrainsActiveSafetyTest()
+        async throws
+    {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let runner = QuitDrainRuntimeRunner()
+        let serviceManager = FakeServiceManager(state: .healthy)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+        await coordinator.inspectLegacyInstall()
+
+        let safetyTest = Task {
+            await coordinator.runSafetyTest()
+        }
+        for _ in 0..<100 where !runner.started {
+            await Task.yield()
+        }
+        try require(runner.started, "safety-test runtime never reached suspended diagnosis")
+
+        let quit = Task {
+            await coordinator.stopBackgroundForApplicationQuit()
+        }
+        for _ in 0..<100
+            where !runner.cancellationObserved && !serviceManager.uninstallStarted {
+            await Task.yield()
+        }
+        let cancellationObservedBeforeCleanup = runner.cancellationObserved
+        let uninstallStartedBeforeCleanup = serviceManager.uninstallStarted
+
+        runner.finishCleanup()
+        let safetyPassed = await safetyTest.value
+        let stopped = await quit.value
+
+        try require(
+            cancellationObservedBeforeCleanup,
+            "application quit did not cancel the active safety-test child"
+        )
+        try require(
+            !uninstallStartedBeforeCleanup,
+            "application quit stopped the service before safety-test cleanup completed"
+        )
+        try require(!safetyPassed, "cancelled safety test reported success")
+        try require(runner.cleanupFinished, "quit returned with orphaned safety-test work")
+        try require(stopped, "drained safety test did not permit verified service stop")
+    }
+
+    private static func testApplicationQuitCancelsEnrollmentWithoutPersisting()
+        async throws
+    {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent(
+            "owner_face.npy"
+        )
+        let originalOwner = Data("existing-owner".utf8)
+        try originalOwner.write(to: ownerURL)
+        let originalRecord = fixture.setupStore.record
+        let runner = QuitDrainRuntimeRunner(ownerURL: ownerURL)
+        let serviceManager = FakeServiceManager(state: .healthy)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+        await coordinator.inspectLegacyInstall()
+
+        let enrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        for _ in 0..<100 where !runner.started {
+            await Task.yield()
+        }
+        try require(runner.started, "enrollment runtime never reached its suspended work")
+
+        let quit = Task {
+            await coordinator.stopBackgroundForApplicationQuit()
+        }
+        for _ in 0..<100
+            where !runner.cancellationObserved && !serviceManager.uninstallStarted {
+            await Task.yield()
+        }
+        let cancellationObservedBeforeCleanup = runner.cancellationObserved
+        let uninstallStartedBeforeCleanup = serviceManager.uninstallStarted
+
+        runner.finishCleanup()
+        await enrollment.value
+        let stopped = await quit.value
+
+        try require(
+            cancellationObservedBeforeCleanup,
+            "application quit did not cancel the active enrollment child"
+        )
+        try require(
+            !uninstallStartedBeforeCleanup,
+            "application quit stopped the service before enrollment cleanup completed"
+        )
+        try require(runner.cleanupFinished, "quit returned with an orphaned enrollment child")
+        let retainedOwner = try Data(contentsOf: ownerURL)
+        try require(
+            retainedOwner == originalOwner,
+            "enrollment changed owner data after the quit gate"
+        )
+        try require(
+            fixture.setupStore.record == originalRecord,
+            "enrollment persisted onboarding progress after the quit gate"
+        )
+        try require(stopped, "drained enrollment did not permit verified service stop")
     }
 
     private static func testCompletedRecordDoesNotFabricateLiveRuntimeGates() async throws {

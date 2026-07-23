@@ -454,7 +454,7 @@ struct OnboardingView: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isEnrollmentWorking)
+                .disabled(isEnrollmentWorking || setupCoordinator.isQuitting)
             }
         }
     }
@@ -509,7 +509,7 @@ struct OnboardingView: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isWorking)
+                .disabled(isWorking || setupCoordinator.isQuitting)
             }
         }
     }

@@ -8,6 +8,7 @@ enum ApplicationTerminationDecision: Equatable {
 final class ApplicationQuitCoordinator {
     private enum TerminationState {
         case idle
+        case confirming
         case stopping
         case approved
     }
@@ -15,18 +16,22 @@ final class ApplicationQuitCoordinator {
     private let stopBackground: () async -> Bool
     private let terminate: () -> Void
     private let cancelTermination: () -> Void
+    private let cancelDeferredTermination: () -> Void
     private var nextRequestID: UInt64 = 0
     private var activeRequest: (id: UInt64, task: Task<Bool, Never>)?
     private var terminationState: TerminationState = .idle
+    private var hasDeferredConfirmationRequest = false
 
     init(
         stopBackground: @escaping () async -> Bool,
         terminate: @escaping () -> Void,
-        cancelTermination: @escaping () -> Void = {}
+        cancelTermination: @escaping () -> Void = {},
+        cancelDeferredTermination: @escaping () -> Void = {}
     ) {
         self.stopBackground = stopBackground
         self.terminate = terminate
         self.cancelTermination = cancelTermination
+        self.cancelDeferredTermination = cancelDeferredTermination
     }
 
     func applicationShouldTerminate(
@@ -35,13 +40,24 @@ final class ApplicationQuitCoordinator {
         switch terminationState {
         case .approved:
             return .terminateNow
+        case .confirming:
+            hasDeferredConfirmationRequest = true
+            return .terminateLater
         case .stopping:
             return .terminateLater
         case .idle:
+            terminationState = .confirming
+            hasDeferredConfirmationRequest = false
             guard confirm() else {
+                terminationState = .idle
+                if hasDeferredConfirmationRequest {
+                    hasDeferredConfirmationRequest = false
+                    cancelDeferredTermination()
+                }
                 return .terminateCancel
             }
             terminationState = .stopping
+            hasDeferredConfirmationRequest = false
             Task { @MainActor [weak self] in
                 guard let self else {
                     return

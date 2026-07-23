@@ -26,6 +26,7 @@ struct ApplicationQuitCoordinatorTests {
         try await testExternalTerminationCoalescesAndApprovesWithoutRecursion()
         try await testCancelledExternalTerminationDoesNotStop()
         try await testFailedExternalTerminationCancelsAndCanRetry()
+        try await testReentrantConfirmationCoalescesAndCancelsOnce()
         print("Application quit coordinator tests passed")
     }
 
@@ -232,6 +233,60 @@ struct ApplicationQuitCoordinatorTests {
         try require(
             calls == ["stop", "cancel", "stop", "terminate"],
             "failed termination did not release the gate for retry: \(calls)"
+        )
+    }
+
+    private static func testReentrantConfirmationCoalescesAndCancelsOnce()
+        async throws
+    {
+        var confirmations = 0
+        var stops = 0
+        var deferredCancellationReplies = 0
+        var failureCancellations = 0
+        var nestedDecision: ApplicationTerminationDecision?
+        var subject: ApplicationQuitCoordinator!
+        subject = ApplicationQuitCoordinator(
+            stopBackground: {
+                stops += 1
+                return true
+            },
+            terminate: {},
+            cancelTermination: { failureCancellations += 1 },
+            cancelDeferredTermination: {
+                deferredCancellationReplies += 1
+            }
+        )
+
+        let outerDecision = subject.applicationShouldTerminate {
+            confirmations += 1
+            nestedDecision = subject.applicationShouldTerminate {
+                confirmations += 1
+                return true
+            }
+            return false
+        }
+        await Task.yield()
+
+        try require(
+            outerDecision == .terminateCancel,
+            "declined outer confirmation did not cancel"
+        )
+        try require(
+            nestedDecision == .terminateLater,
+            "reentrant termination did not coalesce behind the open confirmation"
+        )
+        try require(
+            confirmations == 1,
+            "reentrant termination opened a second confirmation"
+        )
+        try require(stops == 0, "reentrant confirmation started a background stop")
+        try require(
+            deferredCancellationReplies == 1,
+            "coalesced cancellation did not resolve exactly one deferred reply"
+        )
+        try require(
+            failureCancellations == 0,
+            "declining a coalesced confirmation reported a stop failure"
         )
     }
 

@@ -54,7 +54,7 @@ protocol ServiceManaging: AnyObject {
     func install(appURL: URL, supportURL: URL) async throws
     func status() async -> ServiceStatus
     func restart() async throws
-    func uninstallPreservingData() async throws
+    func uninstallPreservingData() async throws -> ServiceStatus
 }
 
 struct ServiceCommandResult: Equatable {
@@ -525,24 +525,23 @@ final class ServiceManager: ServiceManaging {
         try await runRequiredLaunchctl(["kickstart", "-k", serviceTarget])
     }
 
-    func uninstallPreservingData() async throws {
-        let bootoutResult = try await runLaunchctl(["bootout", serviceTarget])
-        if bootoutResult.exitCode != 0 {
-            let printResult = try await runLaunchctl(["print", serviceTarget])
-            guard try !jobIsLoaded(
-                from: printResult,
-                target: serviceTarget
-            ) else {
-                throw ServiceManagerError.commandFailed(
-                    command: "launchctl bootout \(serviceTarget)",
-                    exitCode: bootoutResult.exitCode,
-                    stderr: bootoutResult.stderr
-                )
-            }
-        }
+    func uninstallPreservingData() async throws -> ServiceStatus {
+        try await stopJobAndWaitUntilAbsent(target: serviceTarget)
         if fileSystem.fileExists(at: plistURL) {
             try fileSystem.removeItem(at: plistURL)
         }
+        return ServiceStatus(
+            state: .notInstalled,
+            pid: nil,
+            cameraReady: false,
+            inputMonitoringReady: false,
+            accessibilityReady: false,
+            installedProgram: nil,
+            expectedProgram: expectedProgramArguments(
+                appURL: appURL,
+                supportURL: supportURL
+            )[0]
+        )
     }
 
     private var plistURL: URL {

@@ -160,7 +160,7 @@ struct SettingsView: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isEnrollmentWorking)
+                .disabled(isEnrollmentWorking || setupCoordinator.isQuitting)
 
                 if setupCoordinator.enrollmentLifecycle == .running {
                     Button("取消录入") {

@@ -520,6 +520,10 @@ final class SetupCoordinator: ObservableObject {
     private var serviceHealthy = false
     private var enrollmentTask: Task<RuntimeResult, Error>?
     private var enrollmentTaskGeneration: UUID?
+    private var activeRuntimeTask: (
+        id: UUID,
+        task: Task<RuntimeResult, Error>
+    )?
     private var enrollmentGeneration: UUID?
     private var enrollmentStartGate: EnrollmentRuntimeStartGate?
     private var enrollmentPermitWaiterID: UUID?
@@ -933,6 +937,9 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func startEnrollment() async {
+        guard !rejectMutationDuringApplicationQuit() else {
+            return
+        }
         let generation = UUID()
         let startGate = EnrollmentRuntimeStartGate()
         await withTaskCancellationHandler {
@@ -952,6 +959,9 @@ final class SetupCoordinator: ObservableObject {
         generation: UUID,
         startGate: EnrollmentRuntimeStartGate
     ) async {
+        guard !rejectMutationDuringApplicationQuit() else {
+            return
+        }
         guard enrollmentLifecycle == .idle, enrollmentTask == nil else {
             return
         }
@@ -972,7 +982,7 @@ final class SetupCoordinator: ObservableObject {
             enrollmentLifecycle = .idle
             return
         }
-        guard !Task.isCancelled, !startGate.isCancelled,
+        guard !Task.isCancelled, !startGate.isCancelled, !isQuitting,
               enrollmentLifecycle == .running else {
             releaseRuntimeReadinessPermit()
             if enrollmentGeneration == generation {
@@ -1018,6 +1028,7 @@ final class SetupCoordinator: ObservableObject {
         }
         enrollmentTask = task
         enrollmentTaskGeneration = generation
+        activeRuntimeTask = (generation, task)
         startGate.bind(task)
         if Task.isCancelled || startGate.isCancelled {
             startGate.cancel()
@@ -1031,6 +1042,9 @@ final class SetupCoordinator: ObservableObject {
                 enrollmentTask = nil
                 enrollmentTaskGeneration = nil
             }
+            if activeRuntimeTask?.id == generation {
+                activeRuntimeTask = nil
+            }
             if enrollmentGeneration == generation {
                 enrollmentGeneration = nil
             }
@@ -1043,6 +1057,9 @@ final class SetupCoordinator: ObservableObject {
 
         do {
             let result = try await task.value
+            guard !rejectMutationDuringApplicationQuit() else {
+                return
+            }
             applyEnrollment(result.events, generation: generation)
             guard handleExitCode(result.exitCode) else {
                 updateReadiness()
@@ -1104,6 +1121,20 @@ final class SetupCoordinator: ObservableObject {
         }
     }
 
+    private func cancelAndDrainRuntimeForApplicationQuit() async -> Bool {
+        if let generation = enrollmentGeneration
+                ?? enrollmentTaskGeneration {
+            cancelEnrollment(generation: generation)
+        }
+        activeRuntimeTask?.task.cancel()
+
+        guard await acquireRuntimeReadinessPermit() else {
+            return false
+        }
+        releaseRuntimeReadinessPermit()
+        return true
+    }
+
     func runDiagnosis() async {
         guard !rejectMutationDuringApplicationQuit() else {
             return
@@ -1155,7 +1186,10 @@ final class SetupCoordinator: ObservableObject {
         runtimeValidationRequired = true
         refreshStaticOwnerProfileEvidence()
         do {
-            let result = try await runtimeRunner.run(command: .diagnose) { _ in }
+            let result = try await runRuntimeCommand(command: .diagnose) { _ in }
+            guard !rejectMutationDuringApplicationQuit() else {
+                return
+            }
             diagnosisPassed = result.exitCode == 0
                 && result.events.contains {
                     $0.event == "diagnosis_complete" && $0.status == "success"
@@ -1173,6 +1207,12 @@ final class SetupCoordinator: ObservableObject {
                 diagnosisPassed = false
             }
         } catch {
+            if isQuitting {
+                _ = rejectMutationDuringApplicationQuit()
+                diagnosisPassed = false
+                updateReadiness()
+                return
+            }
             currentError = localizedRuntimeError(error)
             diagnosisPassed = false
         }
@@ -1234,6 +1274,9 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func verifyOwnerWithoutLocking() async {
+        guard !rejectMutationDuringApplicationQuit() else {
+            return
+        }
         guard enrollmentTask == nil, enrollmentLifecycle == .idle else {
             ownerTestPassed = false
             currentError = "本人录入正在进行，请完成或取消录入后再测试。"
@@ -1244,7 +1287,8 @@ final class SetupCoordinator: ObservableObject {
             return
         }
         defer { releaseRuntimeReadinessPermit() }
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled,
+              !rejectMutationDuringApplicationQuit() else {
             return
         }
         await verifyOwnerWithoutLockingInsidePermit()
@@ -1261,7 +1305,10 @@ final class SetupCoordinator: ObservableObject {
         ownerTestPassed = false
         let verificationRevision = profileRevision
         do {
-            let result = try await runtimeRunner.run(command: .verifyOwner) { _ in }
+            let result = try await runRuntimeCommand(command: .verifyOwner) { _ in }
+            guard !rejectMutationDuringApplicationQuit() else {
+                return
+            }
             guard verificationRevision == profileRevision else {
                 updateReadiness()
                 return
@@ -1279,6 +1326,12 @@ final class SetupCoordinator: ObservableObject {
                 runtimeValidationRequired = false
             }
         } catch {
+            if isQuitting {
+                _ = rejectMutationDuringApplicationQuit()
+                ownerTestPassed = false
+                updateReadiness()
+                return
+            }
             guard verificationRevision == profileRevision else {
                 updateReadiness()
                 return
@@ -1539,6 +1592,13 @@ final class SetupCoordinator: ObservableObject {
             return false
         }
 
+        guard await cancelAndDrainRuntimeForApplicationQuit() else {
+            _ = try? localStore.writeControl(enabled: false)
+            isQuitting = false
+            updateReadiness()
+            return false
+        }
+
         guard await acquireServiceMutationPermit() else {
             _ = try? localStore.writeControl(enabled: false)
             isQuitting = false
@@ -1573,12 +1633,11 @@ final class SetupCoordinator: ObservableObject {
                 publishBlockedLegacyCleanupEffects()
                 return false
             }
-            try await serviceManager.uninstallPreservingData()
+            let stoppedStatus = try await serviceManager.uninstallPreservingData()
             guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
                 publishBlockedLegacyCleanupEffects()
                 return false
             }
-            let stoppedStatus = await serviceManager.status()
             serviceStatus = stoppedStatus
             serviceHealthy = false
             updateReadiness()
@@ -1805,7 +1864,8 @@ final class SetupCoordinator: ObservableObject {
         _ event: RuntimeEvent,
         generation: UUID
     ) {
-        guard enrollmentGeneration == generation else {
+        guard !isQuitting,
+              enrollmentGeneration == generation else {
             return
         }
         if event.event == "enrollment_complete", event.status == "success" {
@@ -1954,6 +2014,26 @@ final class SetupCoordinator: ObservableObject {
         } catch {
             // Diagnostics are best-effort; customer-facing errors stay sanitized.
         }
+    }
+
+    private func runRuntimeCommand(
+        command: RuntimeCommand,
+        onEvent: @escaping (RuntimeEvent) -> Void
+    ) async throws -> RuntimeResult {
+        let id = UUID()
+        let task = Task { [runtimeRunner] in
+            try await runtimeRunner.run(
+                command: command,
+                onEvent: onEvent
+            )
+        }
+        activeRuntimeTask = (id, task)
+        defer {
+            if activeRuntimeTask?.id == id {
+                activeRuntimeTask = nil
+            }
+        }
+        return try await task.value
     }
 
     private func acquireRuntimeReadinessPermit(

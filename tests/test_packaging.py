@@ -189,6 +189,23 @@ class UnifiedPackagingTests(unittest.TestCase):
         self.assertIn("requestApplicationTermination", status_menu)
         self.assertNotIn("applicationQuitCoordinator.requestQuit()", status_menu)
 
+    def test_runtime_start_controls_disable_during_application_quit(self) -> None:
+        onboarding = (PROJECT_DIR / "src/app" / "OnboardingView.swift").read_text()
+        settings = (PROJECT_DIR / "src/app" / "SettingsView.swift").read_text()
+
+        self.assertIn(
+            ".disabled(isEnrollmentWorking || setupCoordinator.isQuitting)",
+            onboarding,
+        )
+        self.assertIn(
+            ".disabled(isWorking || setupCoordinator.isQuitting)",
+            onboarding,
+        )
+        self.assertIn(
+            ".disabled(isEnrollmentWorking || setupCoordinator.isQuitting)",
+            settings,
+        )
+
     def test_control_center_packages_the_project_owned_icon(self) -> None:
         info_path = PROJECT_DIR / "src" / "app" / "Info.plist"
         icon_path = PROJECT_DIR / "src" / "app" / "AppIcon.icns"

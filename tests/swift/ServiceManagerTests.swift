@@ -453,6 +453,8 @@ struct ServiceManagerTests {
         try await testResponsiveMatchingInstallIsIdempotent()
         try await testFailedStableHealthRestoresPreviousPlistAndJob()
         try await testUninstallPreservesApplicationData()
+        try await testUninstallPreservesPlistWhenAbsenceCannotBeProven()
+        try await testUninstallWaitsForAuthoritativeJobAbsence()
         try await testUninstallDoesNotHideRunningJobRemovalFailure()
         try await testAgentPermissionFailureCannotReportHealthy()
         try await testStableInstallAllowsPendingPermissions()
@@ -1027,7 +1029,7 @@ struct ServiceManagerTests {
         let fixture = try ServiceFixture(loaded: true)
         fixture.fileSystem.seed(Data("current plist".utf8), at: fixture.plistURL)
 
-        try await fixture.manager().uninstallPreservingData()
+        _ = try await fixture.manager().uninstallPreservingData()
 
         try requireReadBoundary(
             fixture,
@@ -1492,7 +1494,7 @@ struct ServiceManagerTests {
         fixture.fileSystem.seed(Data("owner".utf8), at: ownerURL)
         fixture.fileSystem.seed(Data("control".utf8), at: controlURL)
 
-        try await fixture.manager().uninstallPreservingData()
+        _ = try await fixture.manager().uninstallPreservingData()
 
         try require(
             !fixture.fileSystem.fileExists(at: fixture.plistURL),
@@ -1510,13 +1512,80 @@ struct ServiceManagerTests {
         )
     }
 
+    private static func testUninstallWaitsForAuthoritativeJobAbsence() async throws {
+        let fixture = try ServiceFixture(loaded: true, printPIDs: [42, 42, 42])
+        let target = "gui/501/com.wuyi.mac-face-lock-background"
+        fixture.runner.delayBootout(
+            of: target,
+            loadedPrintsBeforeAbsent: 2
+        )
+        fixture.fileSystem.seed(Data("plist".utf8), at: fixture.plistURL)
+        var callsAtRemoval: [[String]] = []
+        fixture.fileSystem.onRemove = { url in
+            guard url.standardizedFileURL == fixture.plistURL.standardizedFileURL else {
+                return
+            }
+            callsAtRemoval = fixture.runner.calls.map(\.arguments)
+        }
+
+        _ = try await fixture.manager(pollAttempts: 3).uninstallPreservingData()
+
+        let absenceProofs = callsAtRemoval.filter {
+            $0 == ["print", target]
+        }
+        try require(
+            absenceProofs.count == 3,
+            "uninstall removed its plist before launchctl proved job absence"
+        )
+        try require(
+            !fixture.fileSystem.fileExists(at: fixture.plistURL),
+            "authoritatively stopped service retained its plist"
+        )
+    }
+
+    private static func testUninstallPreservesPlistWhenAbsenceCannotBeProven()
+        async throws
+    {
+        let fixture = try ServiceFixture(loaded: true, printPIDs: [42, 42, 42])
+        let target = "gui/501/com.wuyi.mac-face-lock-background"
+        fixture.runner.delayBootout(
+            of: target,
+            loadedPrintsBeforeAbsent: 99
+        )
+        let plistData = Data("diagnosable plist".utf8)
+        fixture.fileSystem.seed(plistData, at: fixture.plistURL)
+
+        do {
+            _ = try await fixture.manager(pollAttempts: 3).uninstallPreservingData()
+            throw TestFailure.assertion(
+                "uninstall succeeded without authoritative job absence"
+            )
+        } catch ServiceManagerError.unstableService {
+            // Expected.
+        }
+
+        let retainedPlistData = try fixture.fileSystem.readData(
+            at: fixture.plistURL
+        )
+        try require(
+            retainedPlistData == plistData,
+            "failed absence proof removed or changed the diagnosable plist"
+        )
+        try require(
+            fixture.runner.calls.filter {
+                $0.arguments == ["print", target]
+            }.count == 3,
+            "uninstall did not exhaust its bounded absence proof"
+        )
+    }
+
     private static func testUninstallDoesNotHideRunningJobRemovalFailure() async throws {
         let fixture = try ServiceFixture(loaded: true, printPIDs: [42])
         fixture.runner.bootoutExitCode = 5
         fixture.fileSystem.seed(Data("plist".utf8), at: fixture.plistURL)
 
         do {
-            try await fixture.manager().uninstallPreservingData()
+            _ = try await fixture.manager().uninstallPreservingData()
             throw TestFailure.assertion("uninstall hid a running-job removal failure")
         } catch is ServiceManagerError {
             // Expected.
