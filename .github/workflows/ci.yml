@@ -120,6 +120,13 @@ jobs:
             tests/swift/AppEnvironmentTests.swift \
             -o "$RUNNER_TEMP/mac-face-lock-environment-tests"
           "$RUNNER_TEMP/mac-face-lock-environment-tests"
+      - name: Run Swift application launch mode tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ApplicationLaunchMode.swift \
+            tests/swift/ApplicationLaunchModeTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-application-mode-tests"
+          "$RUNNER_TEMP/mac-face-lock-application-mode-tests"
       - name: Run Swift agent-launcher tests
         run: |
           xcrun swiftc -parse-as-library -DTESTING \
