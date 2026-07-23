@@ -223,7 +223,8 @@ final class BoundedServiceCommandRunner: ServiceCommandRunning {
 }
 
 final class ServiceManager: ServiceManaging {
-    static let label = "com.wuyi.mac-face-lock-agent"
+    static let label = "com.wuyi.mac-face-lock-background"
+    static let legacyReleaseLabel = "com.wuyi.mac-face-lock-agent"
     static let productionHealthPollAttempts = 301
     static let productionHealthPollIntervalNanoseconds: UInt64 = 1_000_000_000
     static let productionStableHealthWindowSeconds: TimeInterval = 300
@@ -302,27 +303,59 @@ final class ServiceManager: ServiceManaging {
     func install(appURL: URL, supportURL: URL) async throws {
         let normalizedAppURL = appURL.standardizedFileURL
         let normalizedSupportURL = supportURL.standardizedFileURL
+        try fileSystem.createDirectory(at: launchAgentsURL)
+        try fileSystem.createDirectory(
+            at: normalizedSupportURL.appendingPathComponent("data", isDirectory: true)
+        )
+        try fileSystem.createDirectory(
+            at: normalizedSupportURL.appendingPathComponent("logs", isDirectory: true)
+        )
+        try writeProtectionDisabled(supportURL: normalizedSupportURL)
+
+        let currentStatus = await status()
+        if currentStatus.isResponsive {
+            return
+        }
+
         let destinationURL = plistURL
         let backupURL = destinationURL.appendingPathExtension("backup")
         let previousData = fileSystem.fileExists(at: destinationURL)
             ? try fileSystem.readData(at: destinationURL)
             : nil
-        let previousWasLoaded = try await jobIsLoaded()
+        let legacyData = fileSystem.fileExists(at: legacyPlistURL)
+            ? try fileSystem.readData(at: legacyPlistURL)
+            : nil
+        if let legacyData,
+           !Self.isRecognizedLegacyReleasePlist(
+               legacyData,
+               appURL: normalizedAppURL,
+               supportURL: normalizedSupportURL
+           ) {
+            throw ServiceManagerError.invalidTemplate
+        }
+        let previousWasLoaded = try await jobIsLoaded(target: serviceTarget)
+        let legacyWasLoaded = try await jobIsLoaded(target: legacyServiceTarget)
+        if legacyWasLoaded && legacyData == nil {
+            throw ServiceManagerError.invalidTemplate
+        }
+        let legacyBackupURL = legacyPlistURL.appendingPathExtension("backup")
 
         do {
-            try fileSystem.createDirectory(at: launchAgentsURL)
-            try fileSystem.createDirectory(
-                at: normalizedSupportURL.appendingPathComponent("data", isDirectory: true)
-            )
-            try fileSystem.createDirectory(
-                at: normalizedSupportURL.appendingPathComponent("logs", isDirectory: true)
-            )
-            try writeProtectionDisabled(supportURL: normalizedSupportURL)
             if let previousData {
                 try fileSystem.writeAtomically(previousData, to: backupURL)
             }
+            if let legacyData {
+                try fileSystem.writeAtomically(legacyData, to: legacyBackupURL)
+            }
 
-            _ = try? await runLaunchctl(["bootout", serviceTarget])
+            if legacyWasLoaded {
+                try await stopJobAndWaitUntilAbsent(target: legacyServiceTarget)
+            }
+            if previousWasLoaded {
+                try await stopJobAndWaitUntilAbsent(target: serviceTarget)
+            } else {
+                try await waitUntilJobAbsent(target: serviceTarget)
+            }
             let templateData = try fileSystem.readData(at: templateURL)
             let renderedData = try Self.renderTemplate(
                 templateData,
@@ -338,12 +371,21 @@ final class ServiceManager: ServiceManaging {
             if fileSystem.fileExists(at: backupURL) {
                 try fileSystem.removeItem(at: backupURL)
             }
+            if legacyData != nil {
+                try fileSystem.removeItem(at: legacyPlistURL)
+            }
+            if fileSystem.fileExists(at: legacyBackupURL) {
+                try fileSystem.removeItem(at: legacyBackupURL)
+            }
         } catch {
             do {
                 try await rollback(
                     previousData: previousData,
                     previousWasLoaded: previousWasLoaded,
-                    backupURL: backupURL
+                    backupURL: backupURL,
+                    legacyData: legacyData,
+                    legacyWasLoaded: legacyWasLoaded,
+                    legacyBackupURL: legacyBackupURL
                 )
             } catch {
                 throw ServiceManagerError.rollbackFailed(error.localizedDescription)
@@ -357,7 +399,11 @@ final class ServiceManager: ServiceManaging {
     }
 
     private func status(commandTimeout: TimeInterval) async -> ServiceStatus {
-        let expectedProgram = agentProgramURL(appURL: appURL).path
+        let expectedArguments = expectedProgramArguments(
+            appURL: appURL,
+            supportURL: supportURL
+        )
+        let expectedProgram = expectedArguments[0]
         guard fileSystem.fileExists(at: plistURL) else {
             return ServiceStatus(
                 state: .notInstalled,
@@ -369,7 +415,7 @@ final class ServiceManager: ServiceManaging {
                 expectedProgram: expectedProgram
             )
         }
-        guard let installedProgram = installedProgramPath() else {
+        guard let configuration = installedServiceConfiguration() else {
             return ServiceStatus(
                 state: .needsRepair,
                 pid: nil,
@@ -380,7 +426,10 @@ final class ServiceManager: ServiceManaging {
                 expectedProgram: expectedProgram
             )
         }
-        guard installedProgram == expectedProgram else {
+        let installedProgram = configuration.arguments.first
+        guard configuration.label == Self.label,
+              configuration.arguments == expectedArguments,
+              let installedProgram else {
             return ServiceStatus(
                 state: .needsRepair,
                 pid: nil,
@@ -451,7 +500,10 @@ final class ServiceManager: ServiceManaging {
         let bootoutResult = try await runLaunchctl(["bootout", serviceTarget])
         if bootoutResult.exitCode != 0 {
             let printResult = try await runLaunchctl(["print", serviceTarget])
-            guard try !jobIsLoaded(from: printResult) else {
+            guard try !jobIsLoaded(
+                from: printResult,
+                target: serviceTarget
+            ) else {
                 throw ServiceManagerError.commandFailed(
                     command: "launchctl bootout \(serviceTarget)",
                     exitCode: bootoutResult.exitCode,
@@ -476,27 +528,50 @@ final class ServiceManager: ServiceManaging {
         "\(userDomain)/\(Self.label)"
     }
 
+    private var legacyPlistURL: URL {
+        launchAgentsURL.appendingPathComponent(
+            "\(Self.legacyReleaseLabel).plist"
+        )
+    }
+
+    private var legacyServiceTarget: String {
+        "\(userDomain)/\(Self.legacyReleaseLabel)"
+    }
+
     private var stateURL: URL {
         supportURL.appendingPathComponent("data/state.json")
     }
 
-    private func agentProgramURL(appURL: URL) -> URL {
-        appURL.appendingPathComponent(
-            "Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent"
-        )
+    private func expectedProgramArguments(
+        appURL: URL,
+        supportURL: URL
+    ) -> [String] {
+        [
+            appURL.appendingPathComponent("Contents/MacOS/MacFaceLock").path,
+            "--internal-runtime",
+            "--resources-dir",
+            appURL.appendingPathComponent("Contents/Resources").path,
+            "--support-dir",
+            supportURL.path,
+            "agent",
+        ]
     }
 
-    private func installedProgramPath() -> String? {
+    private func installedServiceConfiguration() -> (
+        label: String,
+        arguments: [String]
+    )? {
         guard let data = try? fileSystem.readData(at: plistURL),
               let dictionary = try? PropertyListSerialization.propertyList(
                 from: data,
                 options: [],
                 format: nil
               ) as? [String: Any],
+              let label = dictionary["Label"] as? String,
               let arguments = dictionary["ProgramArguments"] as? [String] else {
             return nil
         }
-        return arguments.first
+        return (label, arguments)
     }
 
     private func readAgentState() -> FaceLockState? {
@@ -520,7 +595,10 @@ final class ServiceManager: ServiceManaging {
             inputMonitoringReady: state?.inputMonitoringReady == true,
             accessibilityReady: state?.accessibilityReady == true,
             installedProgram: installedProgram,
-            expectedProgram: agentProgramURL(appURL: appURL).path,
+            expectedProgram: expectedProgramArguments(
+                appURL: appURL,
+                supportURL: supportURL
+            )[0],
             heartbeatTimestamp: state?.heartbeatTimestamp,
             heartbeatSequence: state?.heartbeatSequence
         )
@@ -607,9 +685,12 @@ final class ServiceManager: ServiceManaging {
     private func rollback(
         previousData: Data?,
         previousWasLoaded: Bool,
-        backupURL: URL
+        backupURL: URL,
+        legacyData: Data?,
+        legacyWasLoaded: Bool,
+        legacyBackupURL: URL
     ) async throws {
-        _ = try? await runLaunchctl(["bootout", serviceTarget])
+        try await stopJobAndWaitUntilAbsent(target: serviceTarget)
         if let previousData {
             try atomicReplace(previousData, at: plistURL)
             if previousWasLoaded {
@@ -623,6 +704,19 @@ final class ServiceManager: ServiceManaging {
         }
         if fileSystem.fileExists(at: backupURL) {
             try fileSystem.removeItem(at: backupURL)
+        }
+        if let legacyData {
+            try atomicReplace(legacyData, at: legacyPlistURL)
+            if legacyWasLoaded,
+               try await !jobIsLoaded(target: legacyServiceTarget) {
+                try await runRequiredLaunchctl(
+                    ["bootstrap", userDomain, legacyPlistURL.path]
+                )
+                try await runRequiredLaunchctl(["enable", legacyServiceTarget])
+            }
+        }
+        if fileSystem.fileExists(at: legacyBackupURL) {
+            try fileSystem.removeItem(at: legacyBackupURL)
         }
     }
 
@@ -639,12 +733,15 @@ final class ServiceManager: ServiceManaging {
         )
     }
 
-    private func jobIsLoaded() async throws -> Bool {
-        let result = try await runLaunchctl(["print", serviceTarget])
-        return try jobIsLoaded(from: result)
+    private func jobIsLoaded(target: String) async throws -> Bool {
+        let result = try await runLaunchctl(["print", target])
+        return try jobIsLoaded(from: result, target: target)
     }
 
-    private func jobIsLoaded(from result: ServiceCommandResult) throws -> Bool {
+    private func jobIsLoaded(
+        from result: ServiceCommandResult,
+        target: String
+    ) throws -> Bool {
         if result.exitCode == 0 {
             return true
         }
@@ -652,10 +749,40 @@ final class ServiceManager: ServiceManaging {
             return false
         }
         throw ServiceManagerError.commandFailed(
-            command: "launchctl print \(serviceTarget)",
+            command: "launchctl print \(target)",
             exitCode: result.exitCode,
             stderr: result.stderr
         )
+    }
+
+    private func stopJobAndWaitUntilAbsent(target: String) async throws {
+        let bootoutResult = try await runLaunchctl(["bootout", target])
+        if bootoutResult.exitCode != 0 {
+            let printResult = try await runLaunchctl(["print", target])
+            guard try !jobIsLoaded(from: printResult, target: target) else {
+                throw ServiceManagerError.commandFailed(
+                    command: "launchctl bootout \(target)",
+                    exitCode: bootoutResult.exitCode,
+                    stderr: bootoutResult.stderr
+                )
+            }
+            return
+        }
+        try await waitUntilJobAbsent(target: target)
+    }
+
+    private func waitUntilJobAbsent(target: String) async throws {
+        let attempts = min(healthPollAttempts, 20)
+        for attempt in 0..<attempts {
+            if try await !jobIsLoaded(target: target) {
+                return
+            }
+            if attempt + 1 < attempts,
+               healthPollIntervalNanoseconds > 0 {
+                try await sleep(healthPollIntervalNanoseconds)
+            }
+        }
+        throw ServiceManagerError.unstableService
     }
 
     private func runLaunchctl(
@@ -720,6 +847,42 @@ final class ServiceManager: ServiceManaging {
         } catch {
             throw ServiceManagerError.invalidTemplate
         }
+    }
+
+    private static func isRecognizedLegacyReleasePlist(
+        _ data: Data,
+        appURL: URL,
+        supportURL: URL
+    ) -> Bool {
+        guard let dictionary = try? PropertyListSerialization.propertyList(
+            from: data,
+            options: [],
+            format: nil
+        ) as? [String: Any] else {
+            return false
+        }
+        let expected: [String: Any] = [
+            "Label": legacyReleaseLabel,
+            "ProgramArguments": [
+                appURL.appendingPathComponent(
+                    "Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent"
+                ).path,
+                "--resources-dir",
+                appURL.appendingPathComponent("Contents/Resources").path,
+                "--support-dir",
+                supportURL.path,
+                "agent",
+            ],
+            "WorkingDirectory": supportURL.path,
+            "StandardOutPath": supportURL
+                .appendingPathComponent("logs/agent-launchd.log").path,
+            "StandardErrorPath": supportURL
+                .appendingPathComponent("logs/agent-launchd.error.log").path,
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            "ProcessType": "Background",
+        ]
+        return (dictionary as NSDictionary).isEqual(to: expected)
     }
 
     private static func parsePID(_ output: String) -> Int32? {

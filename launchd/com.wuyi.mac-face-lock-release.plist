@@ -4,10 +4,11 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.wuyi.mac-face-lock-agent</string>
+  <string>com.wuyi.mac-face-lock-background</string>
   <key>ProgramArguments</key>
   <array>
-    <string>__APP_URL__/Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent</string>
+    <string>__APP_URL__/Contents/MacOS/MacFaceLock</string>
+    <string>--internal-runtime</string>
     <string>--resources-dir</string>
     <string>__APP_URL__/Contents/Resources</string>
     <string>--support-dir</string>

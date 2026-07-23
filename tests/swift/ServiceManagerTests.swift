@@ -22,6 +22,7 @@ private final class MemoryServiceFileSystem: ServiceFileSystem {
     private(set) var operations: [String] = []
     private(set) var readPaths: [String] = []
     private var readSequences: [String: [Data]] = [:]
+    var onRemove: ((URL) -> Void)?
 
     func seed(_ data: Data, at url: URL) {
         files[url.standardizedFileURL.path] = data
@@ -74,6 +75,7 @@ private final class MemoryServiceFileSystem: ServiceFileSystem {
         let path = url.standardizedFileURL.path
         files.removeValue(forKey: path)
         operations.append("remove:\(path)")
+        onRemove?(url.standardizedFileURL)
     }
 }
 
@@ -87,6 +89,10 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
     private(set) var bootstrapCount = 0
     var loaded: Bool
     var printPIDs: [Int32]
+    private var loadedTargets: [String: Bool] = [:]
+    private var printPIDsByTarget: [String: [Int32]] = [:]
+    private var bootoutPrintsBeforeAbsentByTarget: [String: Int] = [:]
+    private var bootoutPendingTargets: Set<String> = []
     var bootoutExitCode: Int32 = 0
     var printError: Error?
     var unloadedPrintExitCode: Int32 = 113
@@ -95,6 +101,20 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
     init(loaded: Bool = false, printPIDs: [Int32] = []) {
         self.loaded = loaded
         self.printPIDs = printPIDs
+    }
+
+    func seedLoadedTarget(_ target: String, printPIDs: [Int32]) {
+        loadedTargets[target] = true
+        printPIDsByTarget[target] = printPIDs
+    }
+
+    func seedUnloadedTarget(_ target: String, printPIDs: [Int32] = []) {
+        loadedTargets[target] = false
+        printPIDsByTarget[target] = printPIDs
+    }
+
+    func delayBootout(of target: String, loadedPrintsBeforeAbsent: Int) {
+        bootoutPrintsBeforeAbsentByTarget[target] = loadedPrintsBeforeAbsent
     }
 
     func run(
@@ -108,7 +128,12 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
             if let printError {
                 throw printError
             }
-            guard loaded else {
+            let target = arguments.last ?? ""
+            let targetLoaded = loadedTargets[target]
+                ?? (target.hasSuffix("/com.wuyi.mac-face-lock-background")
+                    ? loaded
+                    : false)
+            guard targetLoaded else {
                 return ServiceCommandResult(
                     exitCode: unloadedPrintExitCode,
                     stdout: "",
@@ -116,7 +141,24 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
                 )
             }
             onLoadedPrint?(timeout)
-            let pid = printPIDs.isEmpty ? 0 : printPIDs.removeFirst()
+            var targetPIDs = printPIDsByTarget[target] ?? []
+            let pid: Int32
+            if targetPIDs.isEmpty {
+                pid = printPIDs.isEmpty ? 0 : printPIDs.removeFirst()
+            } else {
+                pid = targetPIDs.removeFirst()
+                printPIDsByTarget[target] = targetPIDs
+            }
+            if bootoutPendingTargets.contains(target),
+               let remaining = bootoutPrintsBeforeAbsentByTarget[target],
+               remaining > 0 {
+                let nextRemaining = remaining - 1
+                bootoutPrintsBeforeAbsentByTarget[target] = nextRemaining
+                if nextRemaining == 0 {
+                    loadedTargets[target] = false
+                    bootoutPendingTargets.remove(target)
+                }
+            }
             return ServiceCommandResult(
                 exitCode: 0,
                 stdout: "state = running\npid = \(pid)\n",
@@ -124,7 +166,13 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
             )
         case "bootout":
             if bootoutExitCode == 0 {
-                loaded = false
+                let target = arguments.last ?? ""
+                if (bootoutPrintsBeforeAbsentByTarget[target] ?? 0) == 0 {
+                    loadedTargets[target] = false
+                    loaded = false
+                } else {
+                    bootoutPendingTargets.insert(target)
+                }
             }
             return ServiceCommandResult(
                 exitCode: bootoutExitCode,
@@ -133,6 +181,11 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
             )
         case "bootstrap":
             bootstrapCount += 1
+            let plistPath = arguments.last ?? ""
+            let label = URL(fileURLWithPath: plistPath)
+                .deletingPathExtension()
+                .lastPathComponent
+            loadedTargets["\(arguments.dropLast().last ?? "")/\(label)"] = true
             loaded = true
             return ServiceCommandResult(exitCode: 0, stdout: "", stderr: "")
         case "enable", "kickstart":
@@ -163,6 +216,8 @@ private struct ServiceFixture {
     let supportURL: URL
     let launchAgentsURL: URL
     let plistURL: URL
+    let backgroundPlistURL: URL
+    let legacyPlistURL: URL
     let templateURL: URL
     let stateURL: URL
     let fileSystem = MemoryServiceFileSystem()
@@ -174,6 +229,10 @@ private struct ServiceFixture {
         supportURL = root.appendingPathComponent("Library/Application Support/Mac Face Lock")
         launchAgentsURL = root.appendingPathComponent("Library/LaunchAgents")
         plistURL = launchAgentsURL.appendingPathComponent(
+            "com.wuyi.mac-face-lock-background.plist"
+        )
+        backgroundPlistURL = plistURL
+        legacyPlistURL = launchAgentsURL.appendingPathComponent(
             "com.wuyi.mac-face-lock-agent.plist"
         )
         templateURL = root.appendingPathComponent(
@@ -265,6 +324,58 @@ private struct ServiceFixture {
 
     static func templateData() throws -> Data {
         let object: [String: Any] = [
+            "Label": "com.wuyi.mac-face-lock-background",
+            "ProgramArguments": [
+                "__APP_URL__/Contents/MacOS/MacFaceLock",
+                "--internal-runtime",
+                "--resources-dir",
+                "__APP_URL__/Contents/Resources",
+                "--support-dir",
+                "__SUPPORT_URL__",
+                "agent",
+            ],
+            "WorkingDirectory": "__SUPPORT_URL__",
+            "StandardOutPath": "__SUPPORT_URL__/logs/agent-launchd.log",
+            "StandardErrorPath": "__SUPPORT_URL__/logs/agent-launchd.error.log",
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            "ProcessType": "Background",
+        ]
+        return try PropertyListSerialization.data(
+            fromPropertyList: object,
+            format: .xml,
+            options: 0
+        )
+    }
+
+    static func backgroundTemplateData() throws -> Data {
+        let object: [String: Any] = [
+            "Label": "com.wuyi.mac-face-lock-background",
+            "ProgramArguments": [
+                "__APP_URL__/Contents/MacOS/MacFaceLock",
+                "--internal-runtime",
+                "--resources-dir",
+                "__APP_URL__/Contents/Resources",
+                "--support-dir",
+                "__SUPPORT_URL__",
+                "agent",
+            ],
+            "WorkingDirectory": "__SUPPORT_URL__",
+            "StandardOutPath": "__SUPPORT_URL__/logs/agent-launchd.log",
+            "StandardErrorPath": "__SUPPORT_URL__/logs/agent-launchd.error.log",
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            "ProcessType": "Background",
+        ]
+        return try PropertyListSerialization.data(
+            fromPropertyList: object,
+            format: .xml,
+            options: 0
+        )
+    }
+
+    static func legacyReleaseTemplateData() throws -> Data {
+        let object: [String: Any] = [
             "Label": "com.wuyi.mac-face-lock-agent",
             "ProgramArguments": [
                 "__APP_URL__/Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent",
@@ -279,6 +390,7 @@ private struct ServiceFixture {
             "StandardErrorPath": "__SUPPORT_URL__/logs/agent-launchd.error.log",
             "RunAtLoad": true,
             "KeepAlive": true,
+            "ProcessType": "Background",
         ]
         return try PropertyListSerialization.data(
             fromPropertyList: object,
@@ -299,6 +411,11 @@ struct ServiceManagerTests {
         try await testLoadedRollbackBootstrapDoesNotKickstart()
         try await testUninstallReadsNoFiles()
         try await testInstallRendersOnlyApplicationAndSupportPaths()
+        try await testFailedBackgroundStartupPreservesLegacyBytesAndProtectionOff()
+        try await testReplacementWaitsForBackgroundJobToDisappearBeforeBootstrap()
+        try await testUnknownLegacyReleaseBlocksBeforeServiceMutation()
+        try await testRecognizedLegacyReleaseMigratesAfterNewServiceResponds()
+        try await testResponsiveMatchingInstallIsIdempotent()
         try await testFailedStableHealthRestoresPreviousPlistAndJob()
         try await testUninstallPreservesApplicationData()
         try await testUninstallDoesNotHideRunningJobRemovalFailure()
@@ -358,7 +475,7 @@ struct ServiceManagerTests {
 
         let status = await fixture.manager().status()
 
-        try require(status.isHealthy, "current release Agent did not report healthy")
+        try require(status.isHealthy, "current background service did not report healthy")
         try requireReadBoundary(
             fixture,
             operation: "status",
@@ -376,8 +493,8 @@ struct ServiceManagerTests {
 
         try require(
             fixture.runner.calls.map(\.arguments) == [
-                ["enable", "gui/501/com.wuyi.mac-face-lock-agent"],
-                ["kickstart", "-k", "gui/501/com.wuyi.mac-face-lock-agent"],
+                ["enable", "gui/501/com.wuyi.mac-face-lock-background"],
+                ["kickstart", "-k", "gui/501/com.wuyi.mac-face-lock-background"],
             ],
             "explicit restart did not preserve enable followed by kickstart"
         )
@@ -402,13 +519,12 @@ struct ServiceManagerTests {
         }
         try require(
             mutationCalls == [
-                ["bootout", "gui/501/com.wuyi.mac-face-lock-agent"],
                 [
                     "bootstrap",
                     "gui/501",
                     fixture.plistURL.standardizedFileURL.path,
                 ],
-                ["enable", "gui/501/com.wuyi.mac-face-lock-agent"],
+                ["enable", "gui/501/com.wuyi.mac-face-lock-background"],
             ],
             "successful install kickstarted a RunAtLoad job after bootstrap"
         )
@@ -420,7 +536,7 @@ struct ServiceManagerTests {
             printPIDs: [99, 41, 42, 42]
         )
         let previous: [String: Any] = [
-            "Label": "com.wuyi.mac-face-lock-agent",
+            "Label": "com.wuyi.mac-face-lock-background",
             "ProgramArguments": ["/previous/MacFaceLockAgent", "/previous/project"],
             "RunAtLoad": true,
             "KeepAlive": true,
@@ -450,13 +566,13 @@ struct ServiceManagerTests {
         }
         try require(
             Array(mutationCalls.suffix(3)) == [
-                ["bootout", "gui/501/com.wuyi.mac-face-lock-agent"],
+                ["bootout", "gui/501/com.wuyi.mac-face-lock-background"],
                 [
                     "bootstrap",
                     "gui/501",
                     fixture.plistURL.standardizedFileURL.path,
                 ],
-                ["enable", "gui/501/com.wuyi.mac-face-lock-agent"],
+                ["enable", "gui/501/com.wuyi.mac-face-lock-background"],
             ],
             "loaded rollback kickstarted a RunAtLoad job after bootstrap"
         )
@@ -537,19 +653,20 @@ struct ServiceManagerTests {
         let plist = try requireDictionary(plistData)
         let arguments = plist["ProgramArguments"] as? [String] ?? []
         let expectedProgram = fixture.appURL.appendingPathComponent(
-            "Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent"
+            "Contents/MacOS/MacFaceLock"
         ).path
-        try require(arguments.first == expectedProgram, "release Agent path was not embedded")
+        try require(arguments.first == expectedProgram, "main application path was not embedded")
         try require(
             arguments == [
                 expectedProgram,
+                "--internal-runtime",
                 "--resources-dir",
                 fixture.appURL.appendingPathComponent("Contents/Resources").path,
                 "--support-dir",
                 fixture.supportURL.path,
                 "agent",
             ],
-            "release arguments were not limited to application and support paths"
+            "release background arguments did not use the internal runtime contract"
         )
         let rendered = String(decoding: plistData, as: UTF8.self)
         try require(!rendered.contains(".venv"), "release plist referenced a virtual environment")
@@ -569,13 +686,305 @@ struct ServiceManagerTests {
         )
     }
 
+    private static func testResponsiveMatchingInstallIsIdempotent() async throws {
+        let fixture = try ServiceFixture(
+            loaded: true,
+            printPIDs: [42, 42, 42, 42, 42]
+        )
+        let rendered = try renderTemplate(
+            try ServiceFixture.backgroundTemplateData(),
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        fixture.fileSystem.seed(rendered, at: fixture.backgroundPlistURL)
+        try fixture.seedHealthyStateSequence(sequences: [7, 8, 9, 10])
+
+        try await fixture.manager().install(
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+
+        let mutationCalls = fixture.runner.calls.map(\.arguments).filter {
+            ["bootout", "bootstrap", "enable", "kickstart"].contains($0.first)
+        }
+        try require(
+            mutationCalls.isEmpty,
+            "responsive matching background service was unnecessarily replaced"
+        )
+        try require(fixture.runner.loaded, "idempotent install stopped the loaded service")
+        let status = await fixture.manager().status()
+        try require(status.pid == 42, "idempotent install did not retain PID 42")
+        let controlURL = fixture.supportURL.appendingPathComponent("data/control.json")
+        let control = try JSONSerialization.jsonObject(
+            with: fixture.fileSystem.readData(at: controlURL)
+        ) as? [String: Any]
+        try require(
+            control?["protection_enabled"] as? Bool == false,
+            "idempotent install did not keep protection disabled"
+        )
+    }
+
+    private static func testRecognizedLegacyReleaseMigratesAfterNewServiceResponds() async throws {
+        let fixture = try ServiceFixture()
+        let legacyTarget = "gui/501/com.wuyi.mac-face-lock-agent"
+        let backgroundTarget = "gui/501/com.wuyi.mac-face-lock-background"
+        fixture.runner.seedLoadedTarget(legacyTarget, printPIDs: [99])
+        fixture.runner.seedUnloadedTarget(
+            backgroundTarget,
+            printPIDs: [42, 42, 42]
+        )
+        let legacyData = try renderTemplate(
+            try ServiceFixture.legacyReleaseTemplateData(),
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        fixture.fileSystem.seed(legacyData, at: fixture.legacyPlistURL)
+        try fixture.seedHealthyStateSequence(sequences: [1, 2, 3])
+        var responsivePrintsWhenLegacyRemoved: Int?
+        fixture.fileSystem.onRemove = { removedURL in
+            guard removedURL == fixture.legacyPlistURL.standardizedFileURL,
+                  let bootstrapIndex = fixture.runner.calls.lastIndex(where: {
+                      $0.arguments == [
+                          "bootstrap",
+                          "gui/501",
+                          fixture.backgroundPlistURL.standardizedFileURL.path,
+                      ]
+                  }) else {
+                return
+            }
+            responsivePrintsWhenLegacyRemoved = fixture.runner.calls[
+                (bootstrapIndex + 1)...
+            ].filter {
+                $0.arguments == ["print", backgroundTarget]
+            }.count
+        }
+
+        try await fixture.manager().install(
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+
+        try require(
+            !fixture.fileSystem.fileExists(at: fixture.legacyPlistURL),
+            "recognized legacy release plist was not removed"
+        )
+        let backgroundPrints = fixture.runner.calls.filter {
+            $0.arguments == ["print", backgroundTarget]
+        }
+        try require(
+            backgroundPrints.count >= 3
+                && responsivePrintsWhenLegacyRemoved == 3,
+            "legacy plist was removed before the new service proved responsive"
+        )
+        let mutations = fixture.runner.calls.map(\.arguments).filter {
+            ["bootout", "bootstrap", "enable", "kickstart"].contains($0.first)
+        }
+        try require(
+            mutations.contains(["bootout", legacyTarget]),
+            "recognized legacy release service was not stopped"
+        )
+        try require(
+            fixture.fileSystem.fileExists(at: fixture.backgroundPlistURL),
+            "recognized legacy release did not install the background plist"
+        )
+    }
+
+    private static func testUnknownLegacyReleaseBlocksBeforeServiceMutation() async throws {
+        let seedFixture = try ServiceFixture()
+        let recognizedData = try renderTemplate(
+            try ServiceFixture.legacyReleaseTemplateData(),
+            appURL: seedFixture.appURL,
+            supportURL: seedFixture.supportURL
+        )
+        let recognizedObject = try requireDictionary(recognizedData)
+        var extraKeyObject = recognizedObject
+        extraKeyObject["UnexpectedManagedKey"] = true
+        var wrongArgumentsObject = recognizedObject
+        var wrongArguments = wrongArgumentsObject["ProgramArguments"] as? [String] ?? []
+        wrongArguments[0] = "/unknown/background-service"
+        wrongArgumentsObject["ProgramArguments"] = wrongArguments
+
+        for (variant, unknownObject) in [
+            ("extra key", extraKeyObject),
+            ("wrong arguments", wrongArgumentsObject),
+        ] {
+            let fixture = try ServiceFixture(printPIDs: [42, 42, 42])
+            let unknownData = try PropertyListSerialization.data(
+                fromPropertyList: unknownObject,
+                format: .xml,
+                options: 0
+            )
+            fixture.fileSystem.seed(unknownData, at: fixture.legacyPlistURL)
+            try fixture.seedHealthyStateSequence(sequences: [1, 2, 3])
+
+            do {
+                try await fixture.manager().install(
+                    appURL: fixture.appURL,
+                    supportURL: fixture.supportURL
+                )
+                throw TestFailure.assertion(
+                    "\(variant) legacy release plist did not block migration"
+                )
+            } catch ServiceManagerError.invalidTemplate {
+                // Expected.
+            }
+
+            try require(
+                fixture.runner.calls.allSatisfy {
+                    !["bootout", "bootstrap", "enable", "kickstart"]
+                        .contains($0.arguments.first)
+                },
+                "\(variant) legacy release triggered launchctl mutation"
+            )
+            let retainedLegacyData = try fixture.fileSystem.readData(
+                at: fixture.legacyPlistURL
+            )
+            try require(
+                retainedLegacyData == unknownData,
+                "\(variant) legacy release plist bytes were changed"
+            )
+            try require(
+                !fixture.fileSystem.fileExists(at: fixture.backgroundPlistURL),
+                "\(variant) legacy release wrote a background plist"
+            )
+            let controlURL = fixture.supportURL.appendingPathComponent(
+                "data/control.json"
+            )
+            let control = try JSONSerialization.jsonObject(
+                with: fixture.fileSystem.readData(at: controlURL)
+            ) as? [String: Any]
+            try require(
+                control?["protection_enabled"] as? Bool == false,
+                "\(variant) legacy release did not leave protection disabled"
+            )
+        }
+    }
+
+    private static func testReplacementWaitsForBackgroundJobToDisappearBeforeBootstrap() async throws {
+        let fixture = try ServiceFixture()
+        let backgroundTarget = "gui/501/com.wuyi.mac-face-lock-background"
+        fixture.runner.seedLoadedTarget(
+            backgroundTarget,
+            printPIDs: [99, 99, 99, 42, 42, 42]
+        )
+        fixture.runner.delayBootout(
+            of: backgroundTarget,
+            loadedPrintsBeforeAbsent: 2
+        )
+        let movedAppURL = fixture.root.appendingPathComponent("Old/Mac Face Lock.app")
+        let mismatchedData = try renderTemplate(
+            try ServiceFixture.backgroundTemplateData(),
+            appURL: movedAppURL,
+            supportURL: fixture.supportURL
+        )
+        fixture.fileSystem.seed(mismatchedData, at: fixture.backgroundPlistURL)
+        try fixture.seedHealthyStateSequence(sequences: [1, 2, 3])
+
+        try await fixture.manager().install(
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+
+        let calls = fixture.runner.calls.map(\.arguments)
+        guard let bootoutIndex = calls.firstIndex(
+            of: ["bootout", backgroundTarget]
+        ),
+              let bootstrapIndex = calls.firstIndex(where: {
+                  $0.first == "bootstrap"
+              }) else {
+            throw TestFailure.assertion(
+                "background replacement did not boot out and bootstrap"
+            )
+        }
+        let unloadProofCalls = calls[(bootoutIndex + 1)..<bootstrapIndex]
+            .filter { $0 == ["print", backgroundTarget] }
+        try require(
+            unloadProofCalls.count == 3,
+            "bootstrap did not wait for launchctl print to prove absence"
+        )
+        try require(
+            !calls.contains(["kickstart", "-k", backgroundTarget]),
+            "replacement kickstarted a RunAtLoad service"
+        )
+    }
+
+    private static func testFailedBackgroundStartupPreservesLegacyBytesAndProtectionOff() async throws {
+        let fixture = try ServiceFixture()
+        let legacyTarget = "gui/501/com.wuyi.mac-face-lock-agent"
+        let backgroundTarget = "gui/501/com.wuyi.mac-face-lock-background"
+        fixture.runner.seedLoadedTarget(legacyTarget, printPIDs: [99])
+        fixture.runner.seedUnloadedTarget(
+            backgroundTarget,
+            printPIDs: [0, 0, 0]
+        )
+        let legacyData = try renderTemplate(
+            try ServiceFixture.legacyReleaseTemplateData(),
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        fixture.fileSystem.seed(legacyData, at: fixture.legacyPlistURL)
+        try fixture.seedHealthyStateSequence(pid: 42, sequences: [1, 2, 3])
+
+        do {
+            try await fixture.manager().install(
+                appURL: fixture.appURL,
+                supportURL: fixture.supportURL
+            )
+            throw TestFailure.assertion(
+                "unresponsive background service unexpectedly completed migration"
+            )
+        } catch ServiceManagerError.unstableService {
+            // Expected.
+        }
+
+        let retainedLegacyData = try fixture.fileSystem.readData(
+            at: fixture.legacyPlistURL
+        )
+        try require(
+            retainedLegacyData == legacyData,
+            "failed background startup did not preserve legacy plist bytes"
+        )
+        try require(
+            !fixture.fileSystem.fileExists(at: fixture.backgroundPlistURL),
+            "failed background startup retained the failed new plist"
+        )
+        try require(
+            fixture.runner.calls.contains {
+                $0.arguments == [
+                    "bootstrap",
+                    "gui/501",
+                    fixture.backgroundPlistURL.standardizedFileURL.path,
+                ]
+            },
+            "failure fixture did not exercise new background startup"
+        )
+        try require(
+            fixture.runner.calls.contains {
+                $0.arguments == [
+                    "bootstrap",
+                    "gui/501",
+                    fixture.legacyPlistURL.standardizedFileURL.path,
+                ]
+            },
+            "failed migration did not restore the previously loaded legacy service"
+        )
+        let controlURL = fixture.supportURL.appendingPathComponent("data/control.json")
+        let control = try JSONSerialization.jsonObject(
+            with: fixture.fileSystem.readData(at: controlURL)
+        ) as? [String: Any]
+        try require(
+            control?["protection_enabled"] as? Bool == false,
+            "failed background startup did not leave protection disabled"
+        )
+    }
+
     private static func testFailedStableHealthRestoresPreviousPlistAndJob() async throws {
         let fixture = try ServiceFixture(
             loaded: true,
             printPIDs: [99, 41, 42, 42]
         )
         let previous: [String: Any] = [
-            "Label": "com.wuyi.mac-face-lock-agent",
+            "Label": "com.wuyi.mac-face-lock-background",
             "ProgramArguments": ["/previous/MacFaceLockAgent", "/previous/project"],
             "RunAtLoad": true,
             "KeepAlive": true,
@@ -842,18 +1251,32 @@ struct ServiceManagerTests {
             // Expected.
         }
 
+        let serviceFileMutations = fixture.fileSystem.operations.filter {
+            $0.hasPrefix("replace:")
+                || $0.hasPrefix("remove:")
+                || ($0.hasPrefix("write:")
+                    && !$0.hasSuffix("/data/control.json"))
+        }
         try require(
-            fixture.fileSystem.operations.isEmpty,
-            "prior-job print timeout mutated files or directories"
+            serviceFileMutations.isEmpty,
+            "prior-job print timeout mutated a managed service file"
         )
         let retainedData = try fixture.fileSystem.readData(at: fixture.plistURL)
         try require(
             retainedData == previousData,
             "prior-job print timeout changed the existing plist"
         )
+        let controlURL = fixture.supportURL.appendingPathComponent("data/control.json")
+        let control = try JSONSerialization.jsonObject(
+            with: fixture.fileSystem.readData(at: controlURL)
+        ) as? [String: Any]
+        try require(
+            control?["protection_enabled"] as? Bool == false,
+            "prior-job print timeout did not leave protection disabled"
+        )
         try require(
             fixture.runner.calls.map(\.arguments) == [
-                ["print", "gui/501/com.wuyi.mac-face-lock-agent"],
+                ["print", "gui/501/com.wuyi.mac-face-lock-background"],
             ],
             "prior-job print timeout continued into launchctl mutation"
         )
@@ -882,18 +1305,32 @@ struct ServiceManagerTests {
             try require(exitCode == 5, "unexpected print exit code was not preserved")
         }
 
+        let serviceFileMutations = fixture.fileSystem.operations.filter {
+            $0.hasPrefix("replace:")
+                || $0.hasPrefix("remove:")
+                || ($0.hasPrefix("write:")
+                    && !$0.hasSuffix("/data/control.json"))
+        }
         try require(
-            fixture.fileSystem.operations.isEmpty,
-            "unexpected print failure mutated files or directories"
+            serviceFileMutations.isEmpty,
+            "unexpected print failure mutated a managed service file"
         )
         let retainedData = try fixture.fileSystem.readData(at: fixture.plistURL)
         try require(
             retainedData == previousData,
             "unexpected print failure changed the existing plist"
         )
+        let controlURL = fixture.supportURL.appendingPathComponent("data/control.json")
+        let control = try JSONSerialization.jsonObject(
+            with: fixture.fileSystem.readData(at: controlURL)
+        ) as? [String: Any]
+        try require(
+            control?["protection_enabled"] as? Bool == false,
+            "unexpected print failure did not leave protection disabled"
+        )
         try require(
             fixture.runner.calls.map(\.arguments) == [
-                ["print", "gui/501/com.wuyi.mac-face-lock-agent"],
+                ["print", "gui/501/com.wuyi.mac-face-lock-background"],
             ],
             "unexpected print failure continued into launchctl mutation"
         )
