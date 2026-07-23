@@ -1250,10 +1250,16 @@ struct ServiceManagerTests {
         var wrongArguments = wrongArgumentsObject["ProgramArguments"] as? [String] ?? []
         wrongArguments[0] = "/unknown/background-service"
         wrongArgumentsObject["ProgramArguments"] = wrongArguments
+        var renamedArgumentsObject = recognizedObject
+        let renamedArguments = renamedArgumentsObject.removeValue(
+            forKey: "ProgramArguments"
+        )
+        renamedArgumentsObject["program_arguments"] = renamedArguments
 
         for (variant, unknownObject) in [
             ("extra key", extraKeyObject),
             ("wrong arguments", wrongArgumentsObject),
+            ("renamed arguments key", renamedArgumentsObject),
         ] {
             let fixture = try ServiceFixture(printPIDs: [42, 42, 42])
             let unknownData = try PropertyListSerialization.data(

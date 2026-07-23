@@ -92,6 +92,8 @@ struct SecureFileTreeTests {
         try testDescriptorBoundWriteRejectsDestinationReplacement()
         try testDescriptorBoundWriteRejectsRootReplacement()
         try testDescriptorBoundReadRejectsABASwap()
+        try testFileSnapshotRoundTripRestoresPresentAndAbsentStates()
+        try testFileSnapshotRestoreRejectsUnsafeCurrentEntry()
         try testRootPathReplacementBlocksRemoval()
         try testRootIdentityMismatchBlocksRemoval()
         print("Secure file tree tests passed")
@@ -1167,6 +1169,104 @@ struct SecureFileTreeTests {
             try require(
                 restored == "trusted",
                 "A-B-A fixture did not restore the original file"
+            )
+        }
+    }
+
+    private static func testFileSnapshotRoundTripRestoresPresentAndAbsentStates()
+        throws
+    {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        let owner = fixture.root.appendingPathComponent("owner_face.npy")
+        let original = Data("stable-owner".utf8)
+        try original.write(to: owner)
+        guard chmod(owner.path, 0o644) == 0 else {
+            throw TestFailure.assertion("could not set original owner mode")
+        }
+        let tree = try makeTree(fixture)
+
+        let present = try tree.captureFileSnapshot(
+            "owner_face.npy",
+            maximumBytes: 64 * 1_024
+        )
+        try Data("candidate-owner".utf8).write(to: owner, options: .atomic)
+        try tree.restoreFileSnapshot(
+            present,
+            at: "owner_face.npy",
+            temporaryName: ".owner.rollback.tmp",
+            maximumBytes: 64 * 1_024,
+            mode: 0o600
+        )
+
+        let restoredData = try Data(contentsOf: owner)
+        try require(
+            restoredData == original,
+            "present snapshot did not restore the original bytes"
+        )
+        var restored = stat()
+        try require(
+            lstat(owner.path, &restored) == 0
+                && restored.st_uid == getuid()
+                && restored.st_nlink == 1
+                && restored.st_mode & 0o777 == 0o600,
+            "present snapshot restored unsafe metadata"
+        )
+
+        let missing = fixture.root.appendingPathComponent("new-owner.npy")
+        let absent = try tree.captureFileSnapshot(
+            "new-owner.npy",
+            maximumBytes: 64 * 1_024
+        )
+        try Data("uncommitted-owner".utf8).write(to: missing)
+        try tree.restoreFileSnapshot(
+            absent,
+            at: "new-owner.npy",
+            temporaryName: ".new-owner.rollback.tmp",
+            maximumBytes: 64 * 1_024,
+            mode: 0o600
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: missing.path),
+            "absent snapshot did not remove the uncommitted file"
+        )
+    }
+
+    private static func testFileSnapshotRestoreRejectsUnsafeCurrentEntry() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        let owner = fixture.root.appendingPathComponent("owner_face.npy")
+        let outside = fixture.outside.appendingPathComponent("outside-owner.npy")
+        try Data("stable-owner".utf8).write(to: owner)
+        let tree = try makeTree(fixture)
+        let snapshot = try tree.captureFileSnapshot(
+            "owner_face.npy",
+            maximumBytes: 64 * 1_024
+        )
+        try FileManager.default.removeItem(at: owner)
+        try Data("outside-owner".utf8).write(to: outside)
+        try FileManager.default.createSymbolicLink(
+            at: owner,
+            withDestinationURL: outside
+        )
+
+        do {
+            try tree.restoreFileSnapshot(
+                snapshot,
+                at: "owner_face.npy",
+                temporaryName: ".owner.rollback.tmp",
+                maximumBytes: 64 * 1_024,
+                mode: 0o600
+            )
+            throw TestFailure.assertion("snapshot restore replaced a symlink")
+        } catch SecureFileTreeError.symbolicLink("owner_face.npy") {
+            let outsideContents = try String(
+                contentsOf: outside,
+                encoding: .utf8
+            )
+            try require(
+                outsideContents == "outside-owner",
+                "snapshot restore changed the symlink destination"
             )
         }
     }

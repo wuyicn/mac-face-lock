@@ -417,7 +417,7 @@ final class ServiceManager: ServiceManaging {
     }
 
     private func status(commandTimeout: TimeInterval) async -> ServiceStatus {
-        let expectedArguments = expectedProgramArguments(
+        let expectedArguments = expectedServiceArguments(
             appURL: appURL,
             supportURL: supportURL
         )
@@ -537,7 +537,7 @@ final class ServiceManager: ServiceManaging {
             inputMonitoringReady: false,
             accessibilityReady: false,
             installedProgram: nil,
-            expectedProgram: expectedProgramArguments(
+            expectedProgram: expectedServiceArguments(
                 appURL: appURL,
                 supportURL: supportURL
             )[0]
@@ -570,7 +570,7 @@ final class ServiceManager: ServiceManaging {
         supportURL.appendingPathComponent("data/state.json")
     }
 
-    private func expectedProgramArguments(
+    private func expectedServiceArguments(
         appURL: URL,
         supportURL: URL
     ) -> [String] {
@@ -595,7 +595,7 @@ final class ServiceManager: ServiceManaging {
                 options: [],
                 format: nil
               ) as? [String: Any],
-              let arguments = dictionary["ProgramArguments"] as? [String] else {
+              let arguments = Self.plistArguments(in: dictionary) else {
             return nil
         }
         return (dictionary, arguments)
@@ -622,7 +622,7 @@ final class ServiceManager: ServiceManaging {
             inputMonitoringReady: state?.inputMonitoringReady == true,
             accessibilityReady: state?.accessibilityReady == true,
             installedProgram: installedProgram,
-            expectedProgram: expectedProgramArguments(
+            expectedProgram: expectedServiceArguments(
                 appURL: appURL,
                 supportURL: supportURL
             )[0],
@@ -927,18 +927,11 @@ final class ServiceManager: ServiceManaging {
         guard let dictionary = plistDictionary(from: data) else {
             return false
         }
-        let expected: [String: Any] = [
+        guard plistArguments(in: dictionary) != nil else {
+            return false
+        }
+        var expected: [String: Any] = [
             "Label": legacyReleaseLabel,
-            "ProgramArguments": [
-                appURL.appendingPathComponent(
-                    "Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent"
-                ).path,
-                "--resources-dir",
-                appURL.appendingPathComponent("Contents/Resources").path,
-                "--support-dir",
-                supportURL.path,
-                "agent",
-            ],
             "WorkingDirectory": supportURL.path,
             "StandardOutPath": supportURL
                 .appendingPathComponent("logs/agent-launchd.log").path,
@@ -948,7 +941,28 @@ final class ServiceManager: ServiceManaging {
             "KeepAlive": true,
             "ProcessType": "Background",
         ]
+        let argumentKeys = Set(dictionary.keys).subtracting(expected.keys)
+        guard argumentKeys.count == 1, let argumentKey = argumentKeys.first else {
+            return false
+        }
+        expected[argumentKey] = [
+            appURL.appendingPathComponent(
+                "Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent"
+            ).path,
+            "--resources-dir",
+            appURL.appendingPathComponent("Contents/Resources").path,
+            "--support-dir",
+            supportURL.path,
+            "agent",
+        ]
         return propertyListValuesExactlyEqual(dictionary, expected)
+    }
+
+    private static func plistArguments(
+        in dictionary: [String: Any]
+    ) -> [String]? {
+        let arguments = dictionary["ProgramArguments"] as? [String]
+        return arguments
     }
 
     private static func plistDictionary(

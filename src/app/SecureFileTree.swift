@@ -36,6 +36,11 @@ struct SecureRegularFileVersion: Codable, Equatable, Sendable {
     let changeNanoseconds: Int64
 }
 
+enum SecureFileSnapshot: Equatable, Sendable {
+    case absent
+    case present(Data)
+}
+
 private struct SecureFileFingerprint: Equatable {
     let identity: SecureFileIdentity
     let owner: uid_t
@@ -334,6 +339,66 @@ final class SecureFileTree {
         requiredMode: mode_t,
         afterOpen: (() throws -> Void)? = nil
     ) throws -> Data {
+        guard let data = try loadValidatedFileIfPresent(
+            relativePath,
+            maximumBytes: maximumBytes,
+            requiredMode: requiredMode,
+            afterOpen: afterOpen
+        ) else {
+            throw SecureFileTreeError.systemCall(
+                "fstatat",
+                relativePath,
+                ENOENT
+            )
+        }
+        return data
+    }
+
+    func captureFileSnapshot(
+        _ relativePath: String,
+        maximumBytes: Int
+    ) throws -> SecureFileSnapshot {
+        guard let data = try loadValidatedFileIfPresent(
+            relativePath,
+            maximumBytes: maximumBytes,
+            requiredMode: nil
+        ) else {
+            return .absent
+        }
+        return .present(data)
+    }
+
+    func restoreFileSnapshot(
+        _ snapshot: SecureFileSnapshot,
+        at relativePath: String,
+        temporaryName: String,
+        maximumBytes: Int,
+        mode: mode_t
+    ) throws {
+        switch snapshot {
+        case .absent:
+            try removeFileIfPresent(
+                relativePath,
+                maximumBytes: maximumBytes
+            )
+        case .present(let data):
+            try replaceFileAtomically(
+                relativePath,
+                temporaryName: temporaryName,
+                data: data,
+                maximumBytes: maximumBytes,
+                mode: mode,
+                requiredDestinationMode: nil
+            )
+        }
+    }
+
+    private func loadValidatedFileIfPresent(
+        _ relativePath: String,
+        maximumBytes: Int,
+        requiredMode: mode_t?,
+        afterOpen: (() throws -> Void)? = nil
+    ) throws -> Data? {
         let name = try validatedSingleComponent(relativePath)
         guard maximumBytes >= 0 else {
             throw SecureFileTreeError.byteBudgetExceeded
@@ -343,6 +408,16 @@ final class SecureFileTree {
 
         var pathStat = stat()
         guard fstatat(rootFD, name, &pathStat, AT_SYMLINK_NOFOLLOW) == 0 else {
+            if errno == ENOENT {
+                let bindingAfter = try capturePathBinding(
+                    includeRootVersion: true
+                )
+                guard bindingAfter == bindingBefore else {
+                    throw SecureFileTreeError.identityChanged(relativePath)
+                }
+                try requireStableRoot()
+                return nil
+            }
             throw SecureFileTreeError.systemCall("fstatat", relativePath, errno)
         }
         let initial = try validatedFileFingerprint(
@@ -434,6 +509,26 @@ final class SecureFileTree {
         mode: mode_t,
         beforeRename: (() throws -> Void)? = nil
     ) throws {
+        try replaceFileAtomically(
+            relativePath,
+            temporaryName: temporaryName,
+            data: data,
+            maximumBytes: maximumBytes,
+            mode: mode,
+            requiredDestinationMode: mode,
+            beforeRename: beforeRename
+        )
+    }
+
+    private func replaceFileAtomically(
+        _ relativePath: String,
+        temporaryName: String,
+        data: Data,
+        maximumBytes: Int,
+        mode: mode_t,
+        requiredDestinationMode: mode_t?,
+        beforeRename: (() throws -> Void)? = nil
+    ) throws {
         let name = try validatedSingleComponent(relativePath)
         let temporary = try validatedSingleComponent(temporaryName)
         guard name != temporary else {
@@ -448,7 +543,7 @@ final class SecureFileTree {
             name,
             path: relativePath,
             maximumBytes: maximumBytes,
-            requiredMode: mode
+            requiredMode: requiredDestinationMode
         )
 
         let flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC
@@ -519,7 +614,7 @@ final class SecureFileTree {
             name,
             path: relativePath,
             maximumBytes: maximumBytes,
-            requiredMode: mode
+            requiredMode: requiredDestinationMode
         ) == initialDestination else {
             throw SecureFileTreeError.identityChanged(relativePath)
         }
@@ -1350,7 +1445,7 @@ final class SecureFileTree {
         _ statValue: stat,
         path: String,
         maximumBytes: Int,
-        requiredMode: mode_t
+        requiredMode: mode_t?
     ) throws -> SecureFileFingerprint {
         let (identity, kind) = try Self.checkedIdentity(
             statValue,
@@ -1360,8 +1455,10 @@ final class SecureFileTree {
         guard kind == .file else {
             throw SecureFileTreeError.specialFile(path)
         }
-        guard statValue.st_mode & 0o7777 == requiredMode else {
-            throw SecureFileTreeError.specialFile(path)
+        if let requiredMode {
+            guard statValue.st_mode & 0o7777 == requiredMode else {
+                throw SecureFileTreeError.specialFile(path)
+            }
         }
         guard
             statValue.st_size >= 0,
@@ -1383,7 +1480,7 @@ final class SecureFileTree {
         _ name: String,
         path: String,
         maximumBytes: Int,
-        requiredMode: mode_t
+        requiredMode: mode_t?
     ) throws -> SecureFileFingerprint? {
         var result = stat()
         guard fstatat(rootFD, name, &result, AT_SYMLINK_NOFOLLOW) == 0 else {
@@ -1398,6 +1495,64 @@ final class SecureFileTree {
             maximumBytes: maximumBytes,
             requiredMode: requiredMode
         )
+    }
+
+    private func removeFileIfPresent(
+        _ relativePath: String,
+        maximumBytes: Int
+    ) throws {
+        let name = try validatedSingleComponent(relativePath)
+        guard maximumBytes >= 0 else {
+            throw SecureFileTreeError.byteBudgetExceeded
+        }
+        try requireStableRoot()
+        let bindingBefore = try capturePathBinding(includeRootVersion: false)
+        guard let initial = try fileFingerprintIfPresent(
+            name,
+            path: relativePath,
+            maximumBytes: maximumBytes,
+            requiredMode: nil
+        ) else {
+            guard try capturePathBinding(includeRootVersion: false)
+                    == bindingBefore else {
+                throw SecureFileTreeError.identityChanged(relativePath)
+            }
+            try requireStableRoot()
+            return
+        }
+        guard try fileFingerprintIfPresent(
+            name,
+            path: relativePath,
+            maximumBytes: maximumBytes,
+            requiredMode: nil
+        ) == initial else {
+            throw SecureFileTreeError.identityChanged(relativePath)
+        }
+        let flags = SecureRemovalFlags.unlinkFlags(kind: .file)
+        guard unlinkat(rootFD, name, flags) == 0 else {
+            throw SecureFileTreeError.systemCall(
+                "unlinkat",
+                relativePath,
+                errno
+            )
+        }
+        guard fsync(rootFD) == 0 else {
+            throw SecureFileTreeError.systemCall("fsync", relativePath, errno)
+        }
+        var removed = stat()
+        guard fstatat(
+            rootFD,
+            name,
+            &removed,
+            AT_SYMLINK_NOFOLLOW
+        ) != 0, errno == ENOENT else {
+            throw SecureFileTreeError.identityChanged(relativePath)
+        }
+        guard try capturePathBinding(includeRootVersion: false)
+                == bindingBefore else {
+            throw SecureFileTreeError.identityChanged(relativePath)
+        }
+        try requireStableRoot()
     }
 
     private func readAll(
