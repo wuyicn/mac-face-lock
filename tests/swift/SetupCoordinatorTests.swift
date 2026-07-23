@@ -552,6 +552,7 @@ private final class QuitDrainRuntimeRunner: RuntimeCommandRunning {
     private(set) var started = false
     private(set) var cancellationObserved = false
     private(set) var cleanupFinished = false
+    private(set) var ownerReplacementFinished = false
 
     init(ownerURL: URL? = nil) {
         self.ownerURL = ownerURL
@@ -568,13 +569,17 @@ private final class QuitDrainRuntimeRunner: RuntimeCommandRunning {
                 started = true
             }
             cleanupFinished = true
+            if command == .enroll, let ownerURL {
+                try Data("replacement-after-quit".utf8).write(
+                    to: ownerURL,
+                    options: .atomic
+                )
+                ownerReplacementFinished = true
+            }
             try Task.checkCancellation()
 
             switch command {
             case .enroll:
-                if let ownerURL {
-                    try Data("replacement-after-quit".utf8).write(to: ownerURL)
-                }
                 let terminal = RuntimeEvent(
                     schemaVersion: 1,
                     event: "enrollment_complete",
@@ -626,6 +631,50 @@ private final class QuitDrainRuntimeRunner: RuntimeCommandRunning {
     func finishCleanup() {
         cleanupContinuation?.resume()
         cleanupContinuation = nil
+    }
+}
+
+private final class CallerCancellationRuntimeRunner: RuntimeCommandRunning {
+    private var firstCleanupContinuation: CheckedContinuation<Void, Never>?
+    private(set) var runCount = 0
+    private(set) var firstStarted = false
+    private(set) var cancellationObserved = false
+    private(set) var cleanupFinished = false
+
+    func run(
+        command: RuntimeCommand,
+        onEvent: @escaping (RuntimeEvent) -> Void
+    ) async throws -> RuntimeResult {
+        runCount += 1
+        guard runCount == 1 else {
+            return RuntimeResult(
+                exitCode: 20,
+                events: [],
+                stderr: "",
+                stderrTruncated: false
+            )
+        }
+        return try await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                firstCleanupContinuation = continuation
+                firstStarted = true
+            }
+            cleanupFinished = true
+            try Task.checkCancellation()
+            return RuntimeResult(
+                exitCode: 0,
+                events: [],
+                stderr: "",
+                stderrTruncated: false
+            )
+        } onCancel: {
+            cancellationObserved = true
+        }
+    }
+
+    func finishCleanup() {
+        firstCleanupContinuation?.resume()
+        firstCleanupContinuation = nil
     }
 }
 
@@ -888,7 +937,9 @@ struct SetupCoordinatorTests {
         try await testApplicationQuitRejectsAndRepairsLateControlEnable()
         try await testApplicationQuitCancelsAndDrainsActiveDiagnosis()
         try await testApplicationQuitCancelsAndDrainsActiveSafetyTest()
+        try await testOrdinaryCallerCancellationCancelsRuntimeChildAndReleasesPermit()
         try await testApplicationQuitCancelsEnrollmentWithoutPersisting()
+        try await testApplicationQuitRemovesNewOwnerCandidateAfterCancellation()
         try await testCompletedRecordDoesNotFabricateLiveRuntimeGates()
         try await testEnableProtectionReprobesRevokedPermissionAndFallsBack()
         try await testCompletedAuthorizationRefreshFallsBackAfterRevocation()
@@ -2799,6 +2850,9 @@ struct SetupCoordinatorTests {
         )
         let originalOwner = Data("existing-owner".utf8)
         try originalOwner.write(to: ownerURL)
+        guard chmod(ownerURL.path, 0o600) == 0 else {
+            throw TestFailure.assertion("could not secure original owner fixture")
+        }
         let originalRecord = fixture.setupStore.record
         let runner = QuitDrainRuntimeRunner(ownerURL: ownerURL)
         let serviceManager = FakeServiceManager(state: .healthy)
@@ -2845,6 +2899,10 @@ struct SetupCoordinatorTests {
             "application quit stopped the service before enrollment cleanup completed"
         )
         try require(runner.cleanupFinished, "quit returned with an orphaned enrollment child")
+        try require(
+            runner.ownerReplacementFinished,
+            "fixture did not replace the owner during cancellation cleanup"
+        )
         let retainedOwner = try Data(contentsOf: ownerURL)
         try require(
             retainedOwner == originalOwner,
@@ -2854,7 +2912,122 @@ struct SetupCoordinatorTests {
             fixture.setupStore.record == originalRecord,
             "enrollment persisted onboarding progress after the quit gate"
         )
+        let restoredAttributes = try FileManager.default.attributesOfItem(
+            atPath: ownerURL.path
+        )
+        try require(
+            restoredAttributes[.posixPermissions] as? NSNumber
+                == NSNumber(value: 0o600),
+            "owner rollback did not restore a private file mode"
+        )
         try require(stopped, "drained enrollment did not permit verified service stop")
+    }
+
+    private static func testApplicationQuitRemovesNewOwnerCandidateAfterCancellation()
+        async throws
+    {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent(
+            "owner_face.npy"
+        )
+        let originalRecord = fixture.setupStore.record
+        let runner = QuitDrainRuntimeRunner(ownerURL: ownerURL)
+        let serviceManager = FakeServiceManager(state: .healthy)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            ownerProfileInspector: FakeOwnerProfileInspector(valid: false)
+        )
+        await coordinator.inspectLegacyInstall()
+
+        let enrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        for _ in 0..<100 where !runner.started {
+            await Task.yield()
+        }
+        let quit = Task {
+            await coordinator.stopBackgroundForApplicationQuit()
+        }
+        for _ in 0..<100 where !runner.cancellationObserved {
+            await Task.yield()
+        }
+
+        runner.finishCleanup()
+        await enrollment.value
+        let stopped = await quit.value
+
+        try require(runner.cleanupFinished, "new-owner enrollment child was not drained")
+        try require(
+            runner.ownerReplacementFinished,
+            "fixture did not publish the new owner candidate before cancellation"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: ownerURL.path),
+            "quit retained an owner candidate when no prior owner existed"
+        )
+        try require(
+            fixture.setupStore.record == originalRecord,
+            "cancelled first enrollment changed onboarding history"
+        )
+        let rollbackTemps = try FileManager.default.contentsOfDirectory(
+            atPath: fixture.environment.dataURL.path
+        ).filter { $0.hasPrefix(".owner_face.rollback.") }
+        try require(
+            rollbackTemps.isEmpty,
+            "owner rollback left temporary files: \(rollbackTemps)"
+        )
+        try require(stopped, "restored absent-owner state did not permit service stop")
+    }
+
+    private static func testOrdinaryCallerCancellationCancelsRuntimeChildAndReleasesPermit()
+        async throws
+    {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let runner = CallerCancellationRuntimeRunner()
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        let first = Task {
+            await coordinator.runDiagnosis()
+        }
+        for _ in 0..<100 where !runner.firstStarted {
+            await Task.yield()
+        }
+        try require(runner.firstStarted, "caller-cancellation runtime never started")
+        first.cancel()
+        for _ in 0..<100 where !runner.cancellationObserved {
+            await Task.yield()
+        }
+        let childCancellationPropagated = runner.cancellationObserved
+
+        runner.finishCleanup()
+        await first.value
+        await coordinator.runDiagnosis()
+
+        try require(
+            childCancellationPropagated,
+            "ordinary caller cancellation did not cancel the runtime child"
+        )
+        try require(runner.cleanupFinished, "cancelled runtime child did not finish cleanup")
+        try require(
+            runner.runCount == 2,
+            "runtime readiness permit was not released after caller cancellation"
+        )
     }
 
     private static func testCompletedRecordDoesNotFabricateLiveRuntimeGates() async throws {

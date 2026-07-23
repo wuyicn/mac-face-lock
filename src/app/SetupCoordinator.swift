@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import CryptoKit
+import Darwin
 import Foundation
 import UniformTypeIdentifiers
 
@@ -38,6 +39,17 @@ private struct LegacyCleanupDiagnosticReport: Codable, Equatable {
 struct OwnerProfileInspection: Equatable {
     let isValid: Bool
     let fingerprint: String?
+}
+
+private enum EnrollmentOwnerSnapshot {
+    case absent
+    case present(Data)
+}
+
+private enum OwnerProfileTransactionError: Error {
+    case unsafeEntry
+    case byteLimitExceeded
+    case systemCall(String, Int32)
 }
 
 protocol OwnerProfileInspecting: AnyObject {
@@ -484,6 +496,8 @@ private final class UnavailableSetupServiceHealthProvider: SetupServiceHealthPro
 
 @MainActor
 final class SetupCoordinator: ObservableObject {
+    private static let ownerProfileMaximumBytes = 67_108_864
+
     @Published private(set) var progress: Double?
     @Published private(set) var currentError: String?
     @Published private(set) var permissionStates: [SetupPermission: PermissionState]
@@ -524,6 +538,7 @@ final class SetupCoordinator: ObservableObject {
         id: UUID,
         task: Task<RuntimeResult, Error>
     )?
+    private var enrollmentRollbackFailed = false
     private var enrollmentGeneration: UUID?
     private var enrollmentStartGate: EnrollmentRuntimeStartGate?
     private var enrollmentPermitWaiterID: UUID?
@@ -994,6 +1009,18 @@ final class SetupCoordinator: ObservableObject {
             enrollmentLifecycle = .idle
             return
         }
+        let ownerSnapshot: EnrollmentOwnerSnapshot
+        do {
+            ownerSnapshot = try captureEnrollmentOwnerSnapshot()
+            enrollmentRollbackFailed = false
+        } catch {
+            currentError = "无法安全准备本人人脸资料，请检查本地数据目录后重试。"
+            releaseRuntimeReadinessPermit()
+            enrollmentGeneration = nil
+            enrollmentStartGate = nil
+            enrollmentLifecycle = .idle
+            return
+        }
         profileRevision &+= 1
         currentError = nil
         progress = 0
@@ -1036,6 +1063,7 @@ final class SetupCoordinator: ObservableObject {
         } else {
             startGate.open()
         }
+        var retainEnrolledOwner = false
         defer {
             startGate.unbind()
             if enrollmentTaskGeneration == generation {
@@ -1053,6 +1081,19 @@ final class SetupCoordinator: ObservableObject {
             }
             enrollmentLifecycle = .idle
             releaseRuntimeReadinessPermit()
+        }
+        defer {
+            if retainEnrolledOwner {
+                enrollmentRollbackFailed = false
+            } else {
+                do {
+                    try restoreEnrollmentOwnerSnapshot(ownerSnapshot)
+                    enrollmentRollbackFailed = false
+                } catch {
+                    enrollmentRollbackFailed = true
+                    currentError = "未能恢复原有本人人脸资料，保护保持关闭，请重新打开应用后重试。"
+                }
+            }
         }
 
         do {
@@ -1078,7 +1119,11 @@ final class SetupCoordinator: ObservableObject {
                 updateReadiness()
                 return
             }
+            guard !rejectMutationDuringApplicationQuit() else {
+                return
+            }
             try markEnrollmentCompleted()
+            retainEnrolledOwner = true
             currentError = nil
             updateReadiness()
         } catch is CancellationError {
@@ -1131,8 +1176,9 @@ final class SetupCoordinator: ObservableObject {
         guard await acquireRuntimeReadinessPermit() else {
             return false
         }
+        let rollbackSucceeded = !enrollmentRollbackFailed
         releaseRuntimeReadinessPermit()
-        return true
+        return rollbackSucceeded
     }
 
     func runDiagnosis() async {
@@ -2016,6 +2062,252 @@ final class SetupCoordinator: ObservableObject {
         }
     }
 
+    private func captureEnrollmentOwnerSnapshot() throws
+        -> EnrollmentOwnerSnapshot
+    {
+        try fileManager.createDirectory(
+            at: environment.dataURL,
+            withIntermediateDirectories: true
+        )
+        let directoryFD = try openOwnerDataDirectory()
+        defer { Darwin.close(directoryFD) }
+
+        let fileFD = openat(
+            directoryFD,
+            "owner_face.npy",
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard fileFD >= 0 else {
+            if errno == ENOENT {
+                return .absent
+            }
+            throw OwnerProfileTransactionError.systemCall("openat", errno)
+        }
+        defer { Darwin.close(fileFD) }
+
+        let fileSize = try validateOwnerProfileFile(fileFD)
+        var data = Data()
+        data.reserveCapacity(fileSize)
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let count = Darwin.read(fileFD, &buffer, buffer.count)
+            if count == 0 {
+                break
+            }
+            if count < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                throw OwnerProfileTransactionError.systemCall("read", errno)
+            }
+            let nextCount = data.count.addingReportingOverflow(Int(count))
+            guard !nextCount.overflow,
+                  nextCount.partialValue <= Self.ownerProfileMaximumBytes else {
+                throw OwnerProfileTransactionError.byteLimitExceeded
+            }
+            data.append(contentsOf: buffer.prefix(Int(count)))
+        }
+        guard data.count == fileSize else {
+            throw OwnerProfileTransactionError.unsafeEntry
+        }
+        return .present(data)
+    }
+
+    private func restoreEnrollmentOwnerSnapshot(
+        _ snapshot: EnrollmentOwnerSnapshot
+    ) throws {
+        let directoryFD = try openOwnerDataDirectory()
+        defer { Darwin.close(directoryFD) }
+
+        switch snapshot {
+        case .absent:
+            try validateCurrentOwnerEntryIfPresent(directoryFD)
+            if unlinkat(directoryFD, "owner_face.npy", 0) != 0 {
+                guard errno == ENOENT else {
+                    throw OwnerProfileTransactionError.systemCall(
+                        "unlinkat",
+                        errno
+                    )
+                }
+                return
+            }
+            guard fsync(directoryFD) == 0 else {
+                throw OwnerProfileTransactionError.systemCall("fsync", errno)
+            }
+        case .present(let data):
+            guard data.count <= Self.ownerProfileMaximumBytes else {
+                throw OwnerProfileTransactionError.byteLimitExceeded
+            }
+            try validateCurrentOwnerEntryIfPresent(directoryFD)
+            let temporaryName =
+                ".owner_face.rollback.\(UUID().uuidString).tmp"
+            let temporaryFD = openat(
+                directoryFD,
+                temporaryName,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                0o600
+            )
+            guard temporaryFD >= 0 else {
+                throw OwnerProfileTransactionError.systemCall("openat", errno)
+            }
+            var published = false
+            defer {
+                Darwin.close(temporaryFD)
+                if !published {
+                    _ = unlinkat(directoryFD, temporaryName, 0)
+                }
+            }
+            guard fchmod(temporaryFD, 0o600) == 0 else {
+                throw OwnerProfileTransactionError.systemCall("fchmod", errno)
+            }
+            try data.withUnsafeBytes { rawBuffer in
+                guard let baseAddress = rawBuffer.baseAddress else {
+                    return
+                }
+                var offset = 0
+                while offset < rawBuffer.count {
+                    let count = Darwin.write(
+                        temporaryFD,
+                        baseAddress.advanced(by: offset),
+                        rawBuffer.count - offset
+                    )
+                    if count < 0 {
+                        if errno == EINTR {
+                            continue
+                        }
+                        throw OwnerProfileTransactionError.systemCall(
+                            "write",
+                            errno
+                        )
+                    }
+                    guard count > 0 else {
+                        throw OwnerProfileTransactionError.systemCall(
+                            "write",
+                            EIO
+                        )
+                    }
+                    offset += count
+                }
+            }
+            guard fsync(temporaryFD) == 0 else {
+                throw OwnerProfileTransactionError.systemCall("fsync", errno)
+            }
+            guard renameat(
+                directoryFD,
+                temporaryName,
+                directoryFD,
+                "owner_face.npy"
+            ) == 0 else {
+                throw OwnerProfileTransactionError.systemCall("renameat", errno)
+            }
+            published = true
+            guard fsync(directoryFD) == 0 else {
+                throw OwnerProfileTransactionError.systemCall("fsync", errno)
+            }
+
+            let restoredFD = openat(
+                directoryFD,
+                "owner_face.npy",
+                O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+            )
+            guard restoredFD >= 0 else {
+                throw OwnerProfileTransactionError.systemCall("openat", errno)
+            }
+            defer { Darwin.close(restoredFD) }
+            let restoredSize = try validateOwnerProfileFile(restoredFD)
+            guard restoredSize == data.count else {
+                throw OwnerProfileTransactionError.unsafeEntry
+            }
+            var restoredData = Data()
+            restoredData.reserveCapacity(restoredSize)
+            var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+            while true {
+                let count = Darwin.read(restoredFD, &buffer, buffer.count)
+                if count == 0 {
+                    break
+                }
+                if count < 0 {
+                    if errno == EINTR {
+                        continue
+                    }
+                    throw OwnerProfileTransactionError.systemCall(
+                        "read",
+                        errno
+                    )
+                }
+                restoredData.append(
+                    contentsOf: buffer.prefix(Int(count))
+                )
+            }
+            guard restoredData == data else {
+                throw OwnerProfileTransactionError.unsafeEntry
+            }
+        }
+    }
+
+    private func openOwnerDataDirectory() throws -> Int32 {
+        let directoryFD = Darwin.open(
+            environment.dataURL.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard directoryFD >= 0 else {
+            throw OwnerProfileTransactionError.systemCall("open", errno)
+        }
+        var info = stat()
+        guard fstat(directoryFD, &info) == 0 else {
+            let savedErrno = errno
+            Darwin.close(directoryFD)
+            throw OwnerProfileTransactionError.systemCall(
+                "fstat",
+                savedErrno
+            )
+        }
+        guard info.st_mode & S_IFMT == S_IFDIR,
+              info.st_uid == getuid() else {
+            Darwin.close(directoryFD)
+            throw OwnerProfileTransactionError.unsafeEntry
+        }
+        return directoryFD
+    }
+
+    private func validateOwnerProfileFile(_ fileFD: Int32) throws -> Int {
+        var info = stat()
+        guard fstat(fileFD, &info) == 0 else {
+            throw OwnerProfileTransactionError.systemCall("fstat", errno)
+        }
+        guard info.st_mode & S_IFMT == S_IFREG,
+              info.st_uid == getuid(),
+              info.st_nlink == 1,
+              info.st_size >= 0,
+              UInt64(info.st_size) <= UInt64(Self.ownerProfileMaximumBytes),
+              let size = Int(exactly: info.st_size) else {
+            throw OwnerProfileTransactionError.unsafeEntry
+        }
+        return size
+    }
+
+    private func validateCurrentOwnerEntryIfPresent(
+        _ directoryFD: Int32
+    ) throws {
+        var info = stat()
+        guard fstatat(
+            directoryFD,
+            "owner_face.npy",
+            &info,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0 else {
+            if errno == ENOENT {
+                return
+            }
+            throw OwnerProfileTransactionError.systemCall("fstatat", errno)
+        }
+        guard info.st_mode & S_IFMT == S_IFREG,
+              info.st_uid == getuid(),
+              info.st_nlink == 1 else {
+            throw OwnerProfileTransactionError.unsafeEntry
+        }
+    }
+
     private func runRuntimeCommand(
         command: RuntimeCommand,
         onEvent: @escaping (RuntimeEvent) -> Void
@@ -2033,7 +2325,11 @@ final class SetupCoordinator: ObservableObject {
                 activeRuntimeTask = nil
             }
         }
-        return try await task.value
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
     private func acquireRuntimeReadinessPermit(
