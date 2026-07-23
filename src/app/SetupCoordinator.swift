@@ -1018,6 +1018,16 @@ final class SetupCoordinator: ObservableObject {
             enrollmentLifecycle = .idle
             return
         }
+        do {
+            _ = try localStore.writeControl(enabled: false)
+        } catch {
+            currentError = "无法暂停后台保护，未开始录入；请检查应用支持目录权限后重试。"
+            releaseRuntimeReadinessPermit()
+            enrollmentGeneration = nil
+            enrollmentStartGate = nil
+            enrollmentLifecycle = .idle
+            return
+        }
         let ownerSnapshot: EnrollmentOwnerSnapshot
         do {
             ownerSnapshot = try captureEnrollmentOwnerSnapshot()
@@ -1042,6 +1052,9 @@ final class SetupCoordinator: ObservableObject {
 
         guard !Task.isCancelled, !startGate.isCancelled,
               enrollmentLifecycle == .running else {
+            restoreEnrollmentOwnerEvidence(ownerEvidenceSnapshot)
+            refreshStaticOwnerProfileEvidence()
+            updateReadiness()
             enrollmentGeneration = nil
             enrollmentStartGate = nil
             progress = nil
@@ -1104,7 +1117,29 @@ final class SetupCoordinator: ObservableObject {
                     enrollmentRollbackFailed = false
                 } catch {
                     enrollmentRollbackFailed = true
-                    currentError = "未能恢复原有本人人脸资料，保护保持关闭，请重新打开应用后重试。"
+                    let protectionDisabled: Bool
+                    do {
+                        _ = try localStore.writeControl(enabled: false)
+                        protectionDisabled = true
+                    } catch {
+                        protectionDisabled =
+                            !localStore.readControl().protectionEnabled
+                    }
+                    ownerProfileValid = false
+                    currentOwnerFingerprint = nil
+                    diagnosisPassed = false
+                    ownerTestPassed = false
+                    runtimeValidationRequired = true
+                    serviceHealthy = false
+                    if hasCompletedOnboarding {
+                        recoveryStep = .enrollment
+                    }
+                    updateReadiness()
+                    if protectionDisabled {
+                        currentError = "未能恢复原有本人人脸资料，保护保持关闭，请重新打开应用后重试。"
+                    } else {
+                        currentError = "未能恢复原有本人人脸资料，也无法确认保护已关闭；请立即退出应用并检查本地数据。"
+                    }
                 }
             }
         }

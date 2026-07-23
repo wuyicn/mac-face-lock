@@ -179,6 +179,33 @@ private final class FileBackedOwnerProfileInspector: OwnerProfileInspecting {
     }
 }
 
+private final class SnapshotCancellationFileManager: FileManager {
+    private let dataURL: URL
+    private var didCancel = false
+    var onSnapshot: (() -> Void)?
+
+    init(dataURL: URL) {
+        self.dataURL = dataURL.standardizedFileURL
+        super.init()
+    }
+
+    override func createDirectory(
+        at url: URL,
+        withIntermediateDirectories createIntermediates: Bool,
+        attributes: [FileAttributeKey: Any]? = nil
+    ) throws {
+        if !didCancel, url.standardizedFileURL == dataURL {
+            didCancel = true
+            onSnapshot?()
+        }
+        try super.createDirectory(
+            at: url,
+            withIntermediateDirectories: createIntermediates,
+            attributes: attributes
+        )
+    }
+}
+
 private final class FakeServiceManager: ServiceManaging {
     var currentStatus: ServiceStatus
     var installError: Error?
@@ -792,6 +819,58 @@ private final class LateSuccessfulEnrollmentRunner: RuntimeCommandRunning {
     }
 }
 
+private final class UnsafeOwnerReplacementRunner: RuntimeCommandRunning {
+    private let ownerURL: URL
+    private let candidateURL: URL
+    private let localStore: LocalJSONStore
+    private(set) var runCount = 0
+    private(set) var protectionWasDisabledBeforeMutation = false
+    private(set) var replacedOwnerWithSymlink = false
+
+    init(
+        ownerURL: URL,
+        candidateURL: URL,
+        localStore: LocalJSONStore
+    ) {
+        self.ownerURL = ownerURL
+        self.candidateURL = candidateURL
+        self.localStore = localStore
+    }
+
+    func run(
+        command: RuntimeCommand,
+        onEvent: @escaping (RuntimeEvent) -> Void
+    ) async throws -> RuntimeResult {
+        runCount += 1
+        guard command == .enroll else {
+            return RuntimeResult(
+                exitCode: 20,
+                events: [],
+                stderr: "",
+                stderrTruncated: false
+            )
+        }
+        protectionWasDisabledBeforeMutation =
+            !localStore.readControl().protectionEnabled
+        try? FileManager.default.removeItem(at: ownerURL)
+        try Data("uncommitted-owner".utf8).write(
+            to: candidateURL,
+            options: .atomic
+        )
+        try FileManager.default.createSymbolicLink(
+            at: ownerURL,
+            withDestinationURL: candidateURL
+        )
+        replacedOwnerWithSymlink = true
+        return RuntimeResult(
+            exitCode: 20,
+            events: [],
+            stderr: "",
+            stderrTruncated: false
+        )
+    }
+}
+
 private final class SerializedDiagnosisRunner: RuntimeCommandRunning {
     private var continuations: [CheckedContinuation<Void, Never>] = []
     private(set) var activeCount = 0
@@ -1055,6 +1134,9 @@ struct SetupCoordinatorTests {
         try await testEnrollmentParentCancellationRejectsLateChildSuccess()
         try await testEnrollmentRollbackRefreshesRestoredOwnerEvidence()
         try await testEnrollmentSaveFailureRollsBackOwnerAndEvidence()
+        try await testEnrollmentDisablesProtectionBeforeMutationAndRollbackFailure()
+        try await testEnrollmentControlWriteFailureLeavesOwnerAndEvidenceUntouched()
+        try await testEnrollmentEarlyCancellationRestoresPublishedEvidence()
         try await testApplicationQuitCancelsEnrollmentWithoutPersisting()
         try await testApplicationQuitRemovesNewOwnerCandidateAfterCancellation()
         try await testCompletedRecordDoesNotFabricateLiveRuntimeGates()
@@ -3418,6 +3500,241 @@ struct SetupCoordinatorTests {
             coordinator.currentError != nil
                 && coordinator.enrollmentLifecycle == .idle,
             "onboarding save failure was not reported and fully cleaned up"
+        )
+    }
+
+    private static func testEnrollmentDisablesProtectionBeforeMutationAndRollbackFailure()
+        async throws
+    {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent(
+            "owner_face.npy"
+        )
+        let candidateURL = fixture.environment.dataURL.appendingPathComponent(
+            "uncommitted-candidate.npy"
+        )
+        let priorOwner = Data("stable-owner".utf8)
+        try priorOwner.write(to: ownerURL)
+        let originalRecord = OnboardingRecord(
+            currentStep: .completion,
+            completedSteps: SetupStep.allCases,
+            completedAt: "2026-07-23T12:00:00Z",
+            appVersion: "test",
+            ownerProfileFingerprint: "stable-fingerprint",
+            requiresOwnerReverification: false
+        )
+        try fixture.setupStore.save(originalRecord)
+        _ = try fixture.localStore.writeControl(enabled: true)
+        let runner = UnsafeOwnerReplacementRunner(
+            ownerURL: ownerURL,
+            candidateURL: candidateURL,
+            localStore: fixture.localStore
+        )
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: FakeOwnerProfileInspector(
+                valid: true,
+                fingerprint: "stable-fingerprint"
+            )
+        )
+
+        await coordinator.startEnrollment()
+
+        try require(
+            runner.runCount == 1 && runner.replacedOwnerWithSymlink,
+            "rollback-failure fixture did not mutate the owner"
+        )
+        try require(
+            runner.protectionWasDisabledBeforeMutation,
+            "enrollment mutated the owner before disabling protection"
+        )
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "rollback failure left protection enabled"
+        )
+        try require(
+            fixture.setupStore.record == originalRecord,
+            "rollback failure committed onboarding success"
+        )
+        try require(
+            coordinator.currentError?.contains("保护保持关闭") == true,
+            "rollback failure did not report the fail-closed state truthfully"
+        )
+        try require(
+            coordinator.checks[.ownerProfile] == false
+                && coordinator.checks[.diagnosis] == false
+                && coordinator.checks[.ownerTest] == false
+                && !coordinator.readiness.canEnableProtection
+                && coordinator.recoveryStep == .enrollment,
+            "rollback failure retained optimistic readiness evidence"
+        )
+    }
+
+    private static func testEnrollmentControlWriteFailureLeavesOwnerAndEvidenceUntouched()
+        async throws
+    {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent(
+            "owner_face.npy"
+        )
+        let controlURL = fixture.environment.dataURL.appendingPathComponent(
+            "control.json"
+        )
+        let priorOwner = Data("stable-owner".utf8)
+        try priorOwner.write(to: ownerURL)
+        let originalRecord = OnboardingRecord(
+            currentStep: .completion,
+            completedSteps: SetupStep.allCases,
+            completedAt: "2026-07-23T12:00:00Z",
+            appVersion: "test",
+            ownerProfileFingerprint: "stable-fingerprint",
+            requiresOwnerReverification: false
+        )
+        try fixture.setupStore.save(originalRecord)
+        _ = try fixture.localStore.writeControl(enabled: true)
+        let candidateData = Data("must-not-run-owner".utf8)
+        let inspector = FileBackedOwnerProfileInspector(
+            priorData: priorOwner,
+            priorFingerprint: "stable-fingerprint",
+            candidateData: candidateData
+        )
+        let runner = LateSuccessfulEnrollmentRunner(
+            ownerURL: ownerURL,
+            candidateData: candidateData
+        )
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: inspector
+        )
+        let originalReadiness = coordinator.readiness
+        let originalChecks = coordinator.checks
+        let originalRecoveryStep = coordinator.recoveryStep
+        try FileManager.default.removeItem(at: controlURL)
+        try FileManager.default.createDirectory(
+            at: controlURL,
+            withIntermediateDirectories: false
+        )
+
+        let enrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        for _ in 0..<100 where !runner.started {
+            await Task.yield()
+        }
+        let runtimeStarted = runner.started
+        if runtimeStarted {
+            runner.finishWithSuccess()
+        }
+        await enrollment.value
+
+        try require(
+            !runtimeStarted && runner.runCount == 0,
+            "control-write failure started the enrollment runtime"
+        )
+        let retainedOwner = try Data(contentsOf: ownerURL)
+        try require(
+            retainedOwner == priorOwner,
+            "control-write failure changed owner bytes"
+        )
+        try require(
+            fixture.setupStore.record == originalRecord,
+            "control-write failure changed onboarding history"
+        )
+        try require(
+            coordinator.readiness == originalReadiness
+                && coordinator.checks == originalChecks
+                && coordinator.recoveryStep == originalRecoveryStep
+                && inspector.inspections == 1,
+            "control-write failure changed published owner evidence"
+        )
+        try require(
+            coordinator.currentError != nil
+                && fixture.localStore.readControl().protectionEnabled,
+            "control-write failure did not remain visibly fail-closed"
+        )
+    }
+
+    private static func testEnrollmentEarlyCancellationRestoresPublishedEvidence()
+        async throws
+    {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent(
+            "owner_face.npy"
+        )
+        let priorOwner = Data("stable-owner".utf8)
+        try priorOwner.write(to: ownerURL)
+        let originalRecord = OnboardingRecord(
+            currentStep: .completion,
+            completedSteps: SetupStep.allCases,
+            completedAt: "2026-07-23T12:00:00Z",
+            appVersion: "test",
+            ownerProfileFingerprint: "stable-fingerprint",
+            requiresOwnerReverification: false
+        )
+        try fixture.setupStore.save(originalRecord)
+        let fileManager = SnapshotCancellationFileManager(
+            dataURL: fixture.environment.dataURL
+        )
+        let runner = FakeRuntimeRunner()
+        let inspector = FakeOwnerProfileInspector(
+            valid: true,
+            fingerprint: "stable-fingerprint"
+        )
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            fileManager: fileManager,
+            ownerProfileInspector: inspector
+        )
+        let originalReadiness = coordinator.readiness
+        let originalChecks = coordinator.checks
+        let originalRecoveryStep = coordinator.recoveryStep
+        var enrollment: Task<Void, Never>?
+        fileManager.onSnapshot = {
+            enrollment?.cancel()
+        }
+
+        enrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        await enrollment?.value
+
+        try require(
+            !runner.commands.contains(.enroll),
+            "snapshot-window cancellation started the enrollment runtime"
+        )
+        let retainedOwner = try Data(contentsOf: ownerURL)
+        try require(
+            retainedOwner == priorOwner
+                && fixture.setupStore.record == originalRecord,
+            "snapshot-window cancellation changed owner or onboarding data"
+        )
+        try require(
+            coordinator.readiness == originalReadiness
+                && coordinator.checks == originalChecks
+                && coordinator.recoveryStep == originalRecoveryStep,
+            "snapshot-window cancellation downgraded prior published evidence"
+        )
+        try require(
+            coordinator.enrollmentLifecycle == .idle,
+            "snapshot-window cancellation left enrollment bookkeeping active"
         )
     }
 
