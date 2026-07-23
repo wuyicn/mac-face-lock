@@ -170,7 +170,6 @@ class ReleaseBundlePolicyTests(unittest.TestCase):
         for token in (
             "defaults/config.json",
             "runtime/MacFaceLockRuntime",
-            "Mac Face Lock Agent.app",
             "LICENSE",
             "THIRD_PARTY_NOTICES.md",
             "BuildManifest.json",
@@ -179,6 +178,16 @@ class ReleaseBundlePolicyTests(unittest.TestCase):
             "shasum",
         ):
             self.assertIn(token, release)
+        for forbidden in (
+            "scripts/build-app.sh",
+        ):
+            self.assertNotIn(forbidden, release)
+        for required_absence_check in (
+            '[[ -e "$APP/Contents/Library/LoginItems/Mac Face Lock Agent.app" ]]',
+            'find "$APP" -name MacFaceLockAgent -print -quit',
+            'grep -a -r -q "com.wuyi.mac-face-lock-agent.app" "$APP"',
+        ):
+            self.assertIn(required_absence_check, release)
         self.assertIn("release-manifest.py", release)
         self.assertIn('"$RESOURCES/licenses"', release)
 
@@ -275,7 +284,6 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
         contents = self.app / "Contents"
         required = (
             "MacOS/MacFaceLock",
-            "Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent",
             "Resources/defaults/config.json",
             "Resources/runtime/MacFaceLockRuntime/MacFaceLockRuntime",
             "Resources/runtime/MacFaceLockRuntime/_internal/cv2/data/"
@@ -286,6 +294,12 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
         )
         for relative in required:
             self.assertTrue((contents / relative).exists(), relative)
+        self.assertFalse(
+            (self.app / "Contents/Library/LoginItems/Mac Face Lock Agent.app").exists()
+        )
+        self.assertFalse(any(self.app.rglob("MacFaceLockAgent")))
+        archive_bytes = ZIP_PATH.read_bytes()
+        self.assertNotIn(b"com.wuyi.mac-face-lock-agent.app", archive_bytes)
         manifest = json.loads(
             (contents / "Resources/BuildManifest.json").read_text(encoding="utf-8")
         )
@@ -299,13 +313,6 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
             path = licenses / relative
             self.assertTrue(path.is_file(), relative)
             self.assertGreater(path.stat().st_size, 100, relative)
-        plist = plistlib.loads(
-            (
-                contents
-                / "Library/LoginItems/Mac Face Lock Agent.app/Contents/Info.plist"
-            ).read_bytes()
-        )
-        self.assertEqual(plist["LSMinimumSystemVersion"], "12.0")
 
     def test_bundle_contains_no_developer_or_python_dependency_paths(self) -> None:
         forbidden = (
@@ -337,7 +344,6 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
         manifested_paths = {item["path"] for item in document["files"]}
         required_manifest_paths = {
             "Contents/Info.plist",
-            "Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/Info.plist",
             "Contents/Resources/LICENSE",
             "Contents/Resources/THIRD_PARTY_NOTICES.md",
             "Contents/Resources/defaults/config.json",
@@ -384,15 +390,11 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
             if process.stderr is not None:
                 process.stderr.close()
 
-    def test_packaged_launcher_accepts_exact_release_arguments(self) -> None:
+    def test_packaged_main_executable_accepts_exact_release_arguments(self) -> None:
         resources = self.app / "Contents/Resources"
-        launcher = (
-            self.app
-            / "Contents/Library/LoginItems/Mac Face Lock Agent.app"
-            / "Contents/MacOS/MacFaceLockAgent"
-        )
+        launcher = self.app / "Contents/MacOS/MacFaceLock"
         with tempfile.TemporaryDirectory() as directory:
-            support = Path(directory) / "Mac Face Lock"
+            support = Path(directory) / "Library/Application Support/Mac Face Lock"
             (support / "config").mkdir(parents=True)
             (support / "data").mkdir()
             (support / "logs").mkdir()
@@ -410,6 +412,7 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
             process = subprocess.Popen(
                 [
                     str(launcher),
+                    "--internal-runtime",
                     "--resources-dir",
                     str(resources),
                     "--support-dir",
@@ -419,6 +422,11 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env={
+                    **os.environ,
+                    "CFFIXED_USER_HOME": directory,
+                    "HOME": directory,
+                },
             )
             try:
                 deadline = time.monotonic() + 10

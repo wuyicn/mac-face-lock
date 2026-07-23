@@ -899,15 +899,25 @@ scripts/bootstrap.sh
             r"^xcrun swiftc\b.*-target arm64-apple-macosx12\.0\b.*-strict-concurrency=complete\b.*-warn-concurrency\b.*-warnings-as-errors\b.*\btests/swift/UIEventTraceRecorderTests\.swift\b",
             r"^xcrun swiftc\b.*-target arm64-apple-macosx12\.0\b.*-strict-concurrency=complete\b.*-warn-concurrency\b.*-warnings-as-errors\b.*\btests/swift/LocalMouseEventMonitorTests\.swift\b",
             r"^xcrun swiftc -parse-as-library -typecheck\b",
-            r"^scripts/build-app\.sh$",
             r"^scripts/build-status-app\.sh$",
             r"^plutil -lint\b",
-            r'^codesign --verify --deep --strict "dist/Mac Face Lock Agent\.app"$',
             r'^codesign --verify --deep --strict "dist/Mac Face Lock\.app"$',
             r'^build_info="\$\(xcrun vtool -show-build "\$executable"\)"$',
         ]:
             with self.subTest(job="macos", pattern=pattern):
                 assert_command("macos", macos_commands, pattern)
+
+        for forbidden in (
+            "scripts/build-app.sh",
+            'dist/Mac Face Lock Agent.app/Contents/Info.plist',
+            'codesign --verify --deep --strict "dist/Mac Face Lock Agent.app"',
+            'dist/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent',
+        ):
+            with self.subTest(job="macos", forbidden=forbidden):
+                self.assertFalse(
+                    any(forbidden in command for command in macos_commands),
+                    f"macos release gate still depends on {forbidden!r}: {macos_commands}",
+                )
 
     def test_ci_uses_node24_action_majors(self):
         workflow = load_ci_workflow()

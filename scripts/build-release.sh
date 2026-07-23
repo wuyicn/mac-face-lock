@@ -20,7 +20,6 @@ rm -rf "$RELEASE_DIR"
 mkdir -p "$STAGING_DIR" "$RELEASE_DIR"
 
 "$ROOT_DIR/scripts/build-runtime.sh"
-"$ROOT_DIR/scripts/build-app.sh" >/dev/null
 "$ROOT_DIR/scripts/build-status-app.sh" >/dev/null
 cp -R "$ROOT_DIR/dist/Mac Face Lock.app" "$APP"
 
@@ -48,8 +47,19 @@ done < <(
     sort -r
 )
 
-codesign --sign - --force --deep \
-  "$APP/Contents/Library/LoginItems/Mac Face Lock Agent.app" >/dev/null
+if [[ -e "$APP/Contents/Library/LoginItems/Mac Face Lock Agent.app" ]]; then
+  echo "release app must not embed Mac Face Lock Agent.app" >&2
+  exit 1
+fi
+if find "$APP" -name MacFaceLockAgent -print -quit | grep -q .; then
+  echo "release app must not contain MacFaceLockAgent" >&2
+  exit 1
+fi
+if LC_ALL=C grep -a -r -q "com.wuyi.mac-face-lock-agent.app" "$APP"; then
+  echo "release app must not contain the old Agent bundle identifier" >&2
+  exit 1
+fi
+test -x "$RESOURCES/runtime/MacFaceLockRuntime/MacFaceLockRuntime"
 
 MANIFEST="$RESOURCES/BuildManifest.json"
 # Establish every signature path before recording the exact exclusion set.
@@ -75,6 +85,19 @@ EXTRACTED="$BUILD_WORK_DIR/extracted"
 mkdir -p "$EXTRACTED"
 ditto -x -k "$ZIP" "$EXTRACTED"
 codesign --verify --deep --strict "$EXTRACTED/Mac Face Lock.app"
+if [[ -e "$EXTRACTED/Mac Face Lock.app/Contents/Library/LoginItems/Mac Face Lock Agent.app" ]]; then
+  echo "release archive must not embed Mac Face Lock Agent.app" >&2
+  exit 1
+fi
+if find "$EXTRACTED/Mac Face Lock.app" -name MacFaceLockAgent -print -quit | grep -q .; then
+  echo "release archive must not contain MacFaceLockAgent" >&2
+  exit 1
+fi
+if LC_ALL=C grep -a -r -q "com.wuyi.mac-face-lock-agent.app" \
+  "$EXTRACTED/Mac Face Lock.app"; then
+  echo "release archive must not contain the old Agent bundle identifier" >&2
+  exit 1
+fi
 MAC_FACE_LOCK_RELEASE_APP="$EXTRACTED/Mac Face Lock.app" \
   "$ROOT_DIR/.build/runtime-python311/bin/python" -m unittest \
   tests.test_release_bundle.ExtractedReleaseBundleTests -v

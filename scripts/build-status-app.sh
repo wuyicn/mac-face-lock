@@ -11,16 +11,16 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 EXECUTABLE="$MACOS_DIR/MacFaceLock"
 GENERATION_FILE="Contents/Resources/BuildGeneration"
-AGENT_APP="$ROOT_DIR/dist/Mac Face Lock Agent.app"
-EMBEDDED_AGENT_RELATIVE="Contents/Library/LoginItems/Mac Face Lock Agent.app"
-EMBEDDED_AGENT="$BUILD_DIR/$EMBEDDED_AGENT_RELATIVE"
+RUNTIME_SOURCE="$ROOT_DIR/dist/runtime/MacFaceLockRuntime"
+RUNTIME_EXECUTABLE="$RUNTIME_SOURCE/MacFaceLockRuntime"
+BUNDLED_RUNTIME_EXECUTABLE="Contents/Resources/runtime/MacFaceLockRuntime/MacFaceLockRuntime"
 RELEASE_LAUNCHD_DIR="$RESOURCES_DIR/launchd"
 
 bundle_is_valid() {
   local bundle="$1"
   [[ -d "$bundle" ]] || return 1
   [[ -x "$bundle/Contents/MacOS/MacFaceLock" ]] || return 1
-  [[ -x "$bundle/$EMBEDDED_AGENT_RELATIVE/Contents/MacOS/MacFaceLockAgent" ]] || return 1
+  [[ -x "$bundle/$BUNDLED_RUNTIME_EXECUTABLE" ]] || return 1
   [[ -f "$bundle/Contents/Resources/launchd/com.wuyi.mac-face-lock-release.plist" ]] || return 1
   plutil -lint "$bundle/Contents/Info.plist" >/dev/null 2>&1 || return 1
   plutil -lint \
@@ -91,15 +91,15 @@ mkdir -p "$ROOT_DIR/dist"
 recover_pair "$PREVIOUS_DIR"
 recover_pair "$BUILD_DIR" 1
 
-if [[ ! -x "$AGENT_APP/Contents/MacOS/MacFaceLockAgent" ]]; then
-  "$ROOT_DIR/scripts/build-app.sh" >/dev/null
+if [[ ! -x "$RUNTIME_EXECUTABLE" ]]; then
+  echo "缺少已构建的运行时: $RUNTIME_EXECUTABLE" >&2
+  exit 1
 fi
 
-mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" \
-  "$(dirname "$EMBEDDED_AGENT")" "$RELEASE_LAUNCHD_DIR"
+mkdir -p "$MACOS_DIR" "$RESOURCES_DIR/runtime" "$RELEASE_LAUNCHD_DIR"
 cp "$ROOT_DIR/src/app/Info.plist" "$CONTENTS_DIR/Info.plist"
 cp "$ROOT_DIR/src/app/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
-cp -R "$AGENT_APP" "$EMBEDDED_AGENT"
+cp -R "$RUNTIME_SOURCE" "$RESOURCES_DIR/runtime/MacFaceLockRuntime"
 cp "$ROOT_DIR/launchd/com.wuyi.mac-face-lock-release.plist" \
   "$RELEASE_LAUNCHD_DIR/com.wuyi.mac-face-lock-release.plist"
 CURRENT_GENERATION="$(bundle_generation "$APP_DIR")"
@@ -116,7 +116,6 @@ xcrun swiftc "${SOURCE_FILES[@]}" \
   -framework CoreGraphics \
   -o "$EXECUTABLE"
 chmod +x "$EXECUTABLE"
-codesign --verify --deep --strict "$EMBEDDED_AGENT"
 codesign --sign - --force --deep "$BUILD_DIR" >/dev/null
 plutil -lint "$CONTENTS_DIR/Info.plist" >/dev/null
 plutil -lint \

@@ -158,17 +158,10 @@ exit 2
 """,
         )
         self._write_tool("plutil", "#!/bin/bash\nexit 0\n")
-        agent_bundle = self.root / "dist" / "Mac Face Lock Agent.app"
-        agent_executable = (
-            agent_bundle / "Contents" / "MacOS" / "MacFaceLockAgent"
-        )
-        agent_executable.parent.mkdir(parents=True)
-        agent_executable.write_text("#!/bin/sh\n", encoding="utf-8")
-        agent_executable.chmod(0o755)
-        (agent_bundle / "Contents" / "Info.plist").write_text(
-            "fixture", encoding="utf-8"
-        )
-        (agent_bundle / ".test-signed").touch()
+        runtime = self.root / "dist/runtime/MacFaceLockRuntime/MacFaceLockRuntime"
+        runtime.parent.mkdir(parents=True)
+        runtime.write_text("#!/bin/sh\n", encoding="utf-8")
+        runtime.chmod(0o755)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()

@@ -103,20 +103,20 @@ def png_rgba_pixel_digest(path: Path) -> tuple[tuple[int, int], str]:
 
 
 class UnifiedPackagingTests(unittest.TestCase):
-    def test_release_launchagent_targets_only_embedded_agent_and_support_paths(
-        self,
-    ) -> None:
+    def test_release_launchagent_targets_the_unified_runtime_dispatcher(self) -> None:
         plist_path = (
             PROJECT_DIR / "launchd" / "com.wuyi.mac-face-lock-release.plist"
         )
         with plist_path.open("rb") as handle:
             launch = plistlib.load(handle)
 
-        self.assertEqual(launch["Label"], "com.wuyi.mac-face-lock-agent")
+        self.assertEqual(launch["Label"], "com.wuyi.mac-face-lock-background")
+        self.assertEqual(launch["ProcessType"], "Background")
         self.assertEqual(
             launch["ProgramArguments"],
             [
-                "__APP_URL__/Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent",
+                "__APP_URL__/Contents/MacOS/MacFaceLock",
+                "--internal-runtime",
                 "--resources-dir",
                 "__APP_URL__/Contents/Resources",
                 "--support-dir",
@@ -128,11 +128,14 @@ class UnifiedPackagingTests(unittest.TestCase):
         self.assertNotIn(".venv", rendered)
         self.assertNotIn("__PROJECT_DIR__", rendered)
 
-    def test_unified_builder_embeds_agent_and_release_service_template(self) -> None:
+    def test_unified_builder_excludes_agent_and_copies_release_service_template(self) -> None:
         script = UI_BUILD_SCRIPT.read_text()
 
+        self.assertNotIn("Mac Face Lock Agent.app", script)
+        self.assertNotIn("MacFaceLockAgent", script)
+        self.assertNotIn("scripts/build-app.sh", script)
         self.assertIn(
-            'Contents/Library/LoginItems/Mac Face Lock Agent.app',
+            'Contents/Resources/runtime/MacFaceLockRuntime/MacFaceLockRuntime',
             script,
         )
         self.assertIn("com.wuyi.mac-face-lock-release.plist", script)

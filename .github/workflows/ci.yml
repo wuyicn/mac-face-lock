@@ -23,6 +23,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential linux-libc-dev libgl1 libglib2.0-0
       - name: Install locked Python dependencies
         run: python -m pip install -r requirements-lock.txt
+      - name: Build the bundled runtime
+        run: scripts/build-runtime.sh
       - name: Run full Python suite
         run: python -m unittest discover -s tests -p 'test_*.py' -v
       - name: Validate frozen-runtime build lock
@@ -173,9 +175,8 @@ jobs:
             src/app/*.swift -framework AppKit -framework SwiftUI \
             -framework AVFoundation -framework ApplicationServices \
             -framework CoreGraphics
-      - name: Build both ad-hoc signed applications
+      - name: Build the unified ad-hoc signed application
         run: |
-          scripts/build-app.sh
           scripts/build-status-app.sh
       - name: Lint source, LaunchAgent, and bundle plists
         run: |
@@ -183,17 +184,17 @@ jobs:
             launchd/com.wuyi.mac-face-lock-agent.plist \
             launchd/com.wuyi.mac-face-lock-release.plist \
             launchd/com.wuyi.mac-face-lock-status.plist \
-            "dist/Mac Face Lock Agent.app/Contents/Info.plist" \
             "dist/Mac Face Lock.app/Contents/Info.plist"
       - name: Verify ad-hoc signatures
         run: |
-          codesign --verify --deep --strict "dist/Mac Face Lock Agent.app"
           codesign --verify --deep --strict "dist/Mac Face Lock.app"
+          codesign --verify --strict \
+            "dist/runtime/MacFaceLockRuntime/MacFaceLockRuntime"
       - name: Verify Mach-O minos 12.0
         run: |
           for executable in \
-            "dist/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent" \
-            "dist/Mac Face Lock.app/Contents/MacOS/MacFaceLock"
+            "dist/Mac Face Lock.app/Contents/MacOS/MacFaceLock" \
+            "dist/runtime/MacFaceLockRuntime/MacFaceLockRuntime"
           do
             build_info="$(xcrun vtool -show-build "$executable")"
             printf '%s\n' "$build_info"
