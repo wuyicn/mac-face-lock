@@ -71,6 +71,8 @@ struct ApplicationLaunchModeTests {
         try testAllowedCommandsUseBundledRuntime()
         try testMissingAndUnknownCommandsAreRejected()
         try testRelativePathsAreRejected()
+        try testWorkingDirectoryRelativeResourcesAreRejected()
+        try testWorkingDirectoryRelativeSupportIsRejected()
         try testSymlinkedResourcesAreRejected()
         try testBundleExternalResourcesAreRejected()
         try testMismatchedSupportPathIsRejected()
@@ -158,6 +160,45 @@ struct ApplicationLaunchModeTests {
             supportArguments,
             fixture: fixture,
             expected: .invalidSupport("relative/support")
+        )
+    }
+
+    private static func testWorkingDirectoryRelativeResourcesAreRejected() throws {
+        let fixture = try ApplicationFixture()
+        defer { fixture.remove() }
+        let previousDirectory = FileManager.default.currentDirectoryPath
+        defer { FileManager.default.changeCurrentDirectoryPath(previousDirectory) }
+        let contentsDirectory = fixture.bundle.appendingPathComponent("Contents")
+        try require(
+            FileManager.default.changeCurrentDirectoryPath(contentsDirectory.path),
+            "could not set the test current directory to bundle Contents"
+        )
+        var arguments = fixture.internalArguments(command: "agent")
+        arguments[3] = "Resources"
+
+        try expectError(
+            arguments,
+            fixture: fixture,
+            expected: .invalidResources("Resources")
+        )
+    }
+
+    private static func testWorkingDirectoryRelativeSupportIsRejected() throws {
+        let fixture = try ApplicationFixture()
+        defer { fixture.remove() }
+        let previousDirectory = FileManager.default.currentDirectoryPath
+        defer { FileManager.default.changeCurrentDirectoryPath(previousDirectory) }
+        try require(
+            FileManager.default.changeCurrentDirectoryPath(fixture.supportRoot.path),
+            "could not set the test current directory to Application Support"
+        )
+        var arguments = fixture.internalArguments(command: "agent")
+        arguments[5] = "Mac Face Lock"
+
+        try expectError(
+            arguments,
+            fixture: fixture,
+            expected: .invalidSupport("Mac Face Lock")
         )
     }
 

@@ -35,6 +35,12 @@ func resolveApplicationLaunch(
           ["agent", "enroll", "diagnose", "verify-owner"].contains(arguments[6]) else {
         throw ApplicationLaunchModeError.invalidInvocation
     }
+    guard arguments[3].hasPrefix("/") else {
+        throw ApplicationLaunchModeError.invalidResources(arguments[3])
+    }
+    guard arguments[5].hasPrefix("/") else {
+        throw ApplicationLaunchModeError.invalidSupport(arguments[5])
+    }
 
     let bundle = try canonicalDirectory(
         bundleURL,
