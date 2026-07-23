@@ -46,6 +46,15 @@ private enum EnrollmentOwnerSnapshot {
     case present(Data)
 }
 
+private struct EnrollmentOwnerEvidenceSnapshot {
+    let ownerProfileValid: Bool
+    let diagnosisPassed: Bool
+    let ownerTestPassed: Bool
+    let recoveryStep: SetupStep?
+    let currentOwnerFingerprint: String?
+    let runtimeValidationRequired: Bool
+}
+
 private enum OwnerProfileTransactionError: Error {
     case unsafeEntry
     case byteLimitExceeded
@@ -1021,6 +1030,7 @@ final class SetupCoordinator: ObservableObject {
             enrollmentLifecycle = .idle
             return
         }
+        let ownerEvidenceSnapshot = captureEnrollmentOwnerEvidence()
         profileRevision &+= 1
         currentError = nil
         progress = 0
@@ -1088,6 +1098,9 @@ final class SetupCoordinator: ObservableObject {
             } else {
                 do {
                     try restoreEnrollmentOwnerSnapshot(ownerSnapshot)
+                    restoreEnrollmentOwnerEvidence(ownerEvidenceSnapshot)
+                    refreshStaticOwnerProfileEvidence()
+                    updateReadiness()
                     enrollmentRollbackFailed = false
                 } catch {
                     enrollmentRollbackFailed = true
@@ -1098,6 +1111,7 @@ final class SetupCoordinator: ObservableObject {
 
         do {
             let result = try await task.value
+            try Task.checkCancellation()
             guard !rejectMutationDuringApplicationQuit() else {
                 return
             }
@@ -1122,6 +1136,7 @@ final class SetupCoordinator: ObservableObject {
             guard !rejectMutationDuringApplicationQuit() else {
                 return
             }
+            try Task.checkCancellation()
             try markEnrollmentCompleted()
             retainEnrolledOwner = true
             currentError = nil
@@ -1825,6 +1840,30 @@ final class SetupCoordinator: ObservableObject {
         }
     }
 
+    private func captureEnrollmentOwnerEvidence()
+        -> EnrollmentOwnerEvidenceSnapshot
+    {
+        EnrollmentOwnerEvidenceSnapshot(
+            ownerProfileValid: ownerProfileValid,
+            diagnosisPassed: diagnosisPassed,
+            ownerTestPassed: ownerTestPassed,
+            recoveryStep: recoveryStep,
+            currentOwnerFingerprint: currentOwnerFingerprint,
+            runtimeValidationRequired: runtimeValidationRequired
+        )
+    }
+
+    private func restoreEnrollmentOwnerEvidence(
+        _ snapshot: EnrollmentOwnerEvidenceSnapshot
+    ) {
+        ownerProfileValid = snapshot.ownerProfileValid
+        diagnosisPassed = snapshot.diagnosisPassed
+        ownerTestPassed = snapshot.ownerTestPassed
+        recoveryStep = snapshot.recoveryStep
+        currentOwnerFingerprint = snapshot.currentOwnerFingerprint
+        runtimeValidationRequired = snapshot.runtimeValidationRequired
+    }
+
     private func preparationIssues() -> [String] {
         var issues: [String] = []
 #if !arch(arm64)
@@ -2326,7 +2365,9 @@ final class SetupCoordinator: ObservableObject {
             }
         }
         return try await withTaskCancellationHandler {
-            try await task.value
+            let result = try await task.value
+            try Task.checkCancellation()
+            return result
         } onCancel: {
             task.cancel()
         }

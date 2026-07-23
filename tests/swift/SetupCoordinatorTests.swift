@@ -129,6 +129,56 @@ private final class FakeOwnerProfileInspector: OwnerProfileInspecting {
     }
 }
 
+private final class FileBackedOwnerProfileInspector: OwnerProfileInspecting {
+    let priorData: Data?
+    let priorFingerprint: String?
+    let candidateData: Data
+    let candidateFingerprint: String
+    var onCandidateInspection: (() -> Void)?
+    private(set) var inspections = 0
+    private(set) var lastInspection = OwnerProfileInspection(
+        isValid: false,
+        fingerprint: nil
+    )
+
+    init(
+        priorData: Data?,
+        priorFingerprint: String?,
+        candidateData: Data,
+        candidateFingerprint: String = "candidate-owner"
+    ) {
+        self.priorData = priorData
+        self.priorFingerprint = priorFingerprint
+        self.candidateData = candidateData
+        self.candidateFingerprint = candidateFingerprint
+    }
+
+    func inspect(_ url: URL) -> OwnerProfileInspection {
+        inspections += 1
+        let data = try? Data(contentsOf: url)
+        if data == candidateData {
+            lastInspection = OwnerProfileInspection(
+                isValid: true,
+                fingerprint: candidateFingerprint
+            )
+            onCandidateInspection?()
+            return lastInspection
+        }
+        if let priorData, data == priorData {
+            lastInspection = OwnerProfileInspection(
+                isValid: true,
+                fingerprint: priorFingerprint
+            )
+            return lastInspection
+        }
+        lastInspection = OwnerProfileInspection(
+            isValid: false,
+            fingerprint: nil
+        )
+        return lastInspection
+    }
+}
+
 private final class FakeServiceManager: ServiceManaging {
     var currentStatus: ServiceStatus
     var installError: Error?
@@ -654,16 +704,22 @@ private final class CallerCancellationRuntimeRunner: RuntimeCommandRunning {
                 stderrTruncated: false
             )
         }
-        return try await withTaskCancellationHandler {
+        return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 firstCleanupContinuation = continuation
                 firstStarted = true
             }
             cleanupFinished = true
-            try Task.checkCancellation()
+            let terminal = RuntimeEvent(
+                schemaVersion: 1,
+                event: "diagnosis_complete",
+                status: "success",
+                message: "complete"
+            )
+            onEvent(terminal)
             return RuntimeResult(
                 exitCode: 0,
-                events: [],
+                events: [terminal],
                 stderr: "",
                 stderrTruncated: false
             )
@@ -675,6 +731,64 @@ private final class CallerCancellationRuntimeRunner: RuntimeCommandRunning {
     func finishCleanup() {
         firstCleanupContinuation?.resume()
         firstCleanupContinuation = nil
+    }
+}
+
+private final class LateSuccessfulEnrollmentRunner: RuntimeCommandRunning {
+    private let ownerURL: URL
+    private let candidateData: Data
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var runCount = 0
+    private(set) var started = false
+    private(set) var cancellationObserved = false
+    private(set) var cleanupFinished = false
+
+    init(ownerURL: URL, candidateData: Data) {
+        self.ownerURL = ownerURL
+        self.candidateData = candidateData
+    }
+
+    func run(
+        command: RuntimeCommand,
+        onEvent: @escaping (RuntimeEvent) -> Void
+    ) async throws -> RuntimeResult {
+        runCount += 1
+        guard command == .enroll, runCount == 1 else {
+            return RuntimeResult(
+                exitCode: 20,
+                events: [],
+                stderr: "",
+                stderrTruncated: false
+            )
+        }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                self.continuation = continuation
+                started = true
+            }
+            try? candidateData.write(to: ownerURL, options: .atomic)
+            cleanupFinished = true
+            let terminal = RuntimeEvent(
+                schemaVersion: 1,
+                event: "enrollment_complete",
+                status: "success",
+                message: "complete"
+            )
+            onEvent(terminal)
+            return RuntimeResult(
+                exitCode: 0,
+                events: [terminal],
+                stderr: "",
+                stderrTruncated: false
+            )
+        } onCancel: {
+            cancellationObserved = true
+        }
+    }
+
+    func finishWithSuccess() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 
@@ -938,6 +1052,9 @@ struct SetupCoordinatorTests {
         try await testApplicationQuitCancelsAndDrainsActiveDiagnosis()
         try await testApplicationQuitCancelsAndDrainsActiveSafetyTest()
         try await testOrdinaryCallerCancellationCancelsRuntimeChildAndReleasesPermit()
+        try await testEnrollmentParentCancellationRejectsLateChildSuccess()
+        try await testEnrollmentRollbackRefreshesRestoredOwnerEvidence()
+        try await testEnrollmentSaveFailureRollsBackOwnerAndEvidence()
         try await testApplicationQuitCancelsEnrollmentWithoutPersisting()
         try await testApplicationQuitRemovesNewOwnerCandidateAfterCancellation()
         try await testCompletedRecordDoesNotFabricateLiveRuntimeGates()
@@ -3017,16 +3134,290 @@ struct SetupCoordinatorTests {
 
         runner.finishCleanup()
         await first.value
+        let callerReportedCancellation =
+            coordinator.checks[.diagnosis] == false
+                && coordinator.currentError != nil
         await coordinator.runDiagnosis()
 
         try require(
             childCancellationPropagated,
             "ordinary caller cancellation did not cancel the runtime child"
         )
+        try require(
+            callerReportedCancellation,
+            "ordinary caller cancellation consumed a late successful runtime result"
+        )
         try require(runner.cleanupFinished, "cancelled runtime child did not finish cleanup")
         try require(
             runner.runCount == 2,
             "runtime readiness permit was not released after caller cancellation"
+        )
+    }
+
+    private static func testEnrollmentParentCancellationRejectsLateChildSuccess()
+        async throws
+    {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent(
+            "owner_face.npy"
+        )
+        let candidateData = Data("late-success-owner".utf8)
+        let inspector = FileBackedOwnerProfileInspector(
+            priorData: nil,
+            priorFingerprint: nil,
+            candidateData: candidateData
+        )
+        let runner = LateSuccessfulEnrollmentRunner(
+            ownerURL: ownerURL,
+            candidateData: candidateData
+        )
+        let originalRecord = fixture.setupStore.record
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: inspector
+        )
+
+        let enrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        for _ in 0..<100 where !runner.started {
+            await Task.yield()
+        }
+        try require(runner.started, "late-success enrollment did not start")
+        enrollment.cancel()
+        for _ in 0..<100 where !runner.cancellationObserved {
+            await Task.yield()
+        }
+        runner.finishWithSuccess()
+        await enrollment.value
+
+        try require(
+            runner.cancellationObserved && runner.cleanupFinished,
+            "late-success enrollment child was not cancelled and drained"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: ownerURL.path),
+            "parent cancellation retained a late successful owner candidate"
+        )
+        try require(
+            fixture.setupStore.record == originalRecord,
+            "parent cancellation committed late successful onboarding"
+        )
+        try require(
+            coordinator.checks[.ownerProfile] == false,
+            "parent cancellation published late owner readiness"
+        )
+        try require(
+            coordinator.enrollmentLifecycle == .idle,
+            "parent cancellation left enrollment bookkeeping active"
+        )
+
+        await coordinator.runDiagnosis()
+        try require(
+            runner.runCount == 2,
+            "parent-cancelled enrollment did not release its runtime permit"
+        )
+    }
+
+    private static func testEnrollmentRollbackRefreshesRestoredOwnerEvidence()
+        async throws
+    {
+        try await exerciseEnrollmentEvidenceRollback(
+            priorData: Data("prior-owner".utf8),
+            priorFingerprint: "prior-fingerprint"
+        )
+        try await exerciseEnrollmentEvidenceRollback(
+            priorData: nil,
+            priorFingerprint: nil
+        )
+    }
+
+    private static func exerciseEnrollmentEvidenceRollback(
+        priorData: Data?,
+        priorFingerprint: String?
+    ) async throws {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent(
+            "owner_face.npy"
+        )
+        if let priorData {
+            try priorData.write(to: ownerURL)
+        }
+        let originalRecord: OnboardingRecord
+        if priorData != nil {
+            originalRecord = OnboardingRecord(
+                currentStep: .completion,
+                completedSteps: SetupStep.allCases,
+                completedAt: "2026-07-23T12:00:00Z",
+                appVersion: "test",
+                ownerProfileFingerprint: priorFingerprint,
+                requiresOwnerReverification: false
+            )
+        } else {
+            originalRecord = OnboardingRecord(
+                currentStep: .enrollment,
+                completedSteps: [.preparation, .permissions],
+                completedAt: nil,
+                appVersion: "test",
+                ownerProfileFingerprint: nil,
+                requiresOwnerReverification: true
+            )
+        }
+        try fixture.setupStore.save(originalRecord)
+        let candidateData = Data("candidate-owner".utf8)
+        let inspector = FileBackedOwnerProfileInspector(
+            priorData: priorData,
+            priorFingerprint: priorFingerprint,
+            candidateData: candidateData
+        )
+        let runner = LateSuccessfulEnrollmentRunner(
+            ownerURL: ownerURL,
+            candidateData: candidateData
+        )
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: inspector
+        )
+        var enrollment: Task<Void, Never>?
+        inspector.onCandidateInspection = {
+            enrollment?.cancel()
+        }
+        enrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        for _ in 0..<100 where !runner.started {
+            await Task.yield()
+        }
+        runner.finishWithSuccess()
+        await enrollment?.value
+
+        let restoredData = try? Data(contentsOf: ownerURL)
+        try require(
+            restoredData == priorData,
+            "final-gate cancellation did not restore the exact prior owner state"
+        )
+        try require(
+            fixture.setupStore.record == originalRecord,
+            "final-gate cancellation changed onboarding history"
+        )
+        try require(
+            inspector.inspections >= 3,
+            "owner evidence was not re-inspected after rollback"
+        )
+        try require(
+            inspector.lastInspection.fingerprint == priorFingerprint
+                && inspector.lastInspection.isValid == (priorData != nil),
+            "rollback retained the candidate owner fingerprint or validity"
+        )
+        try require(
+            coordinator.checks[.ownerProfile] == (priorData != nil),
+            "rollback published stale owner readiness"
+        )
+        if priorData != nil {
+            try require(
+                coordinator.checks[.diagnosis] == true
+                    && coordinator.checks[.ownerTest] == true
+                    && coordinator.recoveryStep == nil,
+                "rollback did not restore prior durable owner evidence"
+            )
+        } else {
+            try require(
+                coordinator.checks[.diagnosis] == false
+                    && coordinator.checks[.ownerTest] == false
+                    && !coordinator.readiness.canEnableProtection,
+                "absent-owner rollback retained candidate readiness"
+            )
+        }
+        try require(
+            coordinator.enrollmentLifecycle == .idle,
+            "final-gate cancellation left enrollment bookkeeping active"
+        )
+    }
+
+    private static func testEnrollmentSaveFailureRollsBackOwnerAndEvidence()
+        async throws
+    {
+        let fixture = try CoordinatorFixture(mode: .source)
+        defer { fixture.remove() }
+        let ownerURL = fixture.environment.dataURL.appendingPathComponent(
+            "owner_face.npy"
+        )
+        let onboardingURL = fixture.environment.dataURL.appendingPathComponent(
+            "onboarding.json"
+        )
+        try FileManager.default.createDirectory(
+            at: onboardingURL,
+            withIntermediateDirectories: false
+        )
+        let candidateData = Data("save-failure-owner".utf8)
+        let inspector = FileBackedOwnerProfileInspector(
+            priorData: nil,
+            priorFingerprint: nil,
+            candidateData: candidateData
+        )
+        let runner = LateSuccessfulEnrollmentRunner(
+            ownerURL: ownerURL,
+            candidateData: candidateData
+        )
+        let originalRecord = fixture.setupStore.record
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceHealthProvider: FakeServiceHealthProvider(healthy: true),
+            ownerProfileInspector: inspector
+        )
+
+        let enrollment = Task {
+            await coordinator.startEnrollment()
+        }
+        for _ in 0..<100 where !runner.started {
+            await Task.yield()
+        }
+        runner.finishWithSuccess()
+        await enrollment.value
+
+        try require(
+            runner.cleanupFinished,
+            "save-failure enrollment child did not finish"
+        )
+        try require(
+            !FileManager.default.fileExists(atPath: ownerURL.path),
+            "onboarding save failure retained a new owner candidate"
+        )
+        try require(
+            fixture.setupStore.record == originalRecord,
+            "onboarding save failure changed in-memory onboarding history"
+        )
+        try require(
+            inspector.inspections >= 3
+                && !inspector.lastInspection.isValid
+                && inspector.lastInspection.fingerprint == nil,
+            "onboarding save failure retained stale candidate evidence"
+        )
+        try require(
+            coordinator.checks[.ownerProfile] == false
+                && !coordinator.readiness.canEnableProtection,
+            "onboarding save failure retained candidate readiness"
+        )
+        try require(
+            coordinator.currentError != nil
+                && coordinator.enrollmentLifecycle == .idle,
+            "onboarding save failure was not reported and fully cleaned up"
         )
     }
 
