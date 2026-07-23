@@ -23,6 +23,9 @@ struct ApplicationQuitCoordinatorTests {
         try await testFailedStopKeepsApplicationAlive()
         try await testConcurrentRequestsShareOneStop()
         try await testCancellationCannotTerminateBeforeStopSucceeds()
+        try await testExternalTerminationCoalescesAndApprovesWithoutRecursion()
+        try await testCancelledExternalTerminationDoesNotStop()
+        try await testFailedExternalTerminationCancelsAndCanRetry()
         print("Application quit coordinator tests passed")
     }
 
@@ -120,6 +123,115 @@ struct ApplicationQuitCoordinatorTests {
         try require(
             calls == ["stop", "terminate"],
             "successful stop did not terminate after cancellation: \(calls)"
+        )
+    }
+
+    private static func testExternalTerminationCoalescesAndApprovesWithoutRecursion()
+        async throws
+    {
+        var calls: [String] = []
+        var confirmations = 0
+        var stopContinuation: CheckedContinuation<Bool, Never>?
+        var reentrantDecision: ApplicationTerminationDecision?
+        var subject: ApplicationQuitCoordinator!
+        subject = ApplicationQuitCoordinator(
+            stopBackground: {
+                calls.append("stop")
+                return await withCheckedContinuation { continuation in
+                    stopContinuation = continuation
+                }
+            },
+            terminate: {
+                calls.append("terminate")
+                reentrantDecision = subject.applicationShouldTerminate {
+                    confirmations += 1
+                    return true
+                }
+            },
+            cancelTermination: { calls.append("cancel") }
+        )
+
+        let firstDecision = subject.applicationShouldTerminate {
+            confirmations += 1
+            return true
+        }
+        let secondDecision = subject.applicationShouldTerminate {
+            confirmations += 1
+            return true
+        }
+        await waitUntil({ stopContinuation != nil }, message: "external stop never started")
+
+        try require(
+            firstDecision == .terminateLater && secondDecision == .terminateLater,
+            "external termination was not deferred and coalesced"
+        )
+        try require(confirmations == 1, "coalesced termination asked twice")
+        try require(calls == ["stop"], "coalesced termination started extra work: \(calls)")
+
+        stopContinuation?.resume(returning: true)
+        await waitUntil({ reentrantDecision != nil }, message: "termination was not approved")
+
+        try require(
+            calls == ["stop", "terminate"],
+            "successful external termination did not stop then approve: \(calls)"
+        )
+        try require(
+            reentrantDecision == .terminateNow,
+            "approved termination recursively restarted the safe-stop flow"
+        )
+        try require(confirmations == 1, "approved reentry asked for confirmation again")
+    }
+
+    private static func testCancelledExternalTerminationDoesNotStop() async throws {
+        var calls: [String] = []
+        let subject = ApplicationQuitCoordinator(
+            stopBackground: {
+                calls.append("stop")
+                return true
+            },
+            terminate: { calls.append("terminate") },
+            cancelTermination: { calls.append("cancel") }
+        )
+
+        let decision = subject.applicationShouldTerminate { false }
+        await Task.yield()
+
+        try require(decision == .terminateCancel, "declined termination was not cancelled")
+        try require(calls.isEmpty, "declined termination performed work: \(calls)")
+    }
+
+    private static func testFailedExternalTerminationCancelsAndCanRetry() async throws {
+        var calls: [String] = []
+        var stopResult = false
+        let subject = ApplicationQuitCoordinator(
+            stopBackground: {
+                calls.append("stop")
+                return stopResult
+            },
+            terminate: { calls.append("terminate") },
+            cancelTermination: { calls.append("cancel") }
+        )
+
+        let failedDecision = subject.applicationShouldTerminate { true }
+        await waitUntil({ calls.contains("cancel") }, message: "failed termination was not cancelled")
+
+        try require(
+            failedDecision == .terminateLater,
+            "confirmed failed termination was not deferred"
+        )
+        try require(
+            calls == ["stop", "cancel"],
+            "failed termination did not stay alive: \(calls)"
+        )
+
+        stopResult = true
+        let retryDecision = subject.applicationShouldTerminate { true }
+        await waitUntil({ calls.contains("terminate") }, message: "termination retry never completed")
+
+        try require(retryDecision == .terminateLater, "retry did not begin a new safe stop")
+        try require(
+            calls == ["stop", "cancel", "stop", "terminate"],
+            "failed termination did not release the gate for retry: \(calls)"
         )
     }
 

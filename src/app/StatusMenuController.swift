@@ -7,26 +7,26 @@ final class StatusMenuController: NSObject {
 
     private let faceLockStore: FaceLockStore
     private let setupCoordinator: SetupCoordinator
-    private let applicationQuitCoordinator: ApplicationQuitCoordinator
     private let projectURL: URL
     private let dataURL: URL
     private let showDesktopWindow: () -> Void
+    private let requestApplicationTermination: () -> Void
     private var refreshTimer: Timer?
 
     init(
         faceLockStore: FaceLockStore,
         setupCoordinator: SetupCoordinator,
-        applicationQuitCoordinator: ApplicationQuitCoordinator,
         projectURL: URL,
         dataURL: URL,
-        showDesktopWindow: @escaping () -> Void
+        showDesktopWindow: @escaping () -> Void,
+        requestApplicationTermination: @escaping () -> Void
     ) {
         self.faceLockStore = faceLockStore
         self.setupCoordinator = setupCoordinator
-        self.applicationQuitCoordinator = applicationQuitCoordinator
         self.projectURL = projectURL
         self.dataURL = dataURL
         self.showDesktopWindow = showDesktopWindow
+        self.requestApplicationTermination = requestApplicationTermination
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
 
@@ -143,31 +143,6 @@ final class StatusMenuController: NSObject {
     }
 
     @objc private func quitAndStopProtection() {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "退出 Mac Face Lock 并停止保护？"
-        alert.informativeText = "退出后，保护将停止，后台保护也会关闭。再次打开 Mac Face Lock 前，此 Mac 不会继续受到保护。"
-        alert.addButton(withTitle: "退出并停止保护")
-        alert.addButton(withTitle: "取消")
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else {
-            return
-        }
-
-        Task {
-            let didQuit = await applicationQuitCoordinator.requestQuit()
-            guard !didQuit else {
-                return
-            }
-            showDesktopWindow()
-            NSApp.activate(ignoringOtherApps: true)
-            let failureAlert = NSAlert()
-            failureAlert.alertStyle = .critical
-            failureAlert.messageText = "未能停止后台保护"
-            failureAlert.informativeText = setupCoordinator.currentError
-                ?? "保护已关闭，但后台保护尚未确认停止。请在控制中心修复后重试退出。"
-            failureAlert.addButton(withTitle: "返回控制中心")
-            failureAlert.runModal()
-        }
+        requestApplicationTermination()
     }
 }

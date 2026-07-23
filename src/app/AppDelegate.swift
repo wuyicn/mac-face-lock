@@ -102,20 +102,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         let applicationQuitCoordinator = ApplicationQuitCoordinator(
             stopBackground: {
-                await setupCoordinator.uninstallServicePreservingData()
+                await setupCoordinator.stopBackgroundForApplicationQuit()
             },
-            terminate: {
-                NSApp.terminate(nil)
+            terminate: { [weak self] in
+                self?.approvePendingApplicationTermination()
+            },
+            cancelTermination: { [weak self] in
+                self?.cancelPendingApplicationTermination()
             }
         )
         let statusMenuController = StatusMenuController(
             faceLockStore: faceLockStore,
             setupCoordinator: setupCoordinator,
-            applicationQuitCoordinator: applicationQuitCoordinator,
             projectURL: environment.supportURL,
             dataURL: environment.dataURL,
             showDesktopWindow: { [weak desktopWindowController] in
                 desktopWindowController?.show()
+            },
+            requestApplicationTermination: {
+                NSApp.terminate(nil)
             }
         )
 
@@ -157,6 +162,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+        guard let applicationQuitCoordinator else {
+            return .terminateNow
+        }
+
+        switch applicationQuitCoordinator.applicationShouldTerminate(
+            confirm: confirmApplicationTermination
+        ) {
+        case .terminateCancel:
+            return .terminateCancel
+        case .terminateLater:
+            return .terminateLater
+        case .terminateNow:
+            return .terminateNow
+        }
+    }
+
     func applicationDidBecomeActive(_ notification: Notification) {
         UIEventTraceRecorder.shared.record(.appActivation)
         Task {
@@ -171,5 +195,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         localMouseMonitor = nil
         faceLockStore?.stopPolling()
         statusMenuController?.stopRefreshing()
+    }
+
+    private func confirmApplicationTermination() -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "退出 Mac Face Lock 并停止保护？"
+        alert.informativeText = "退出后，保护将停止，后台保护也会关闭。再次打开 Mac Face Lock 前，此 Mac 不会继续受到保护。"
+        alert.addButton(withTitle: "退出并停止保护")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func approvePendingApplicationTermination() {
+        NSApp.reply(toApplicationShouldTerminate: true)
+    }
+
+    private func cancelPendingApplicationTermination() {
+        NSApp.reply(toApplicationShouldTerminate: false)
+        desktopWindowController?.show()
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "未能停止后台保护"
+        alert.informativeText = setupCoordinator?.currentError
+            ?? "保护已关闭，但后台保护尚未确认停止。请在控制中心修复后重试退出。"
+        alert.addButton(withTitle: "返回控制中心")
+        alert.runModal()
     }
 }

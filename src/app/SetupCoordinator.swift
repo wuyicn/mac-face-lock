@@ -391,6 +391,11 @@ private struct RuntimeReadinessWaiter {
     let continuation: CheckedContinuation<Bool, Never>
 }
 
+private struct ServiceMutationWaiter {
+    let id: UUID
+    let continuation: CheckedContinuation<Bool, Never>
+}
+
 private final class EnrollmentRuntimeStartGate: @unchecked Sendable {
     private let lock = NSLock()
     private var opened = false
@@ -494,6 +499,7 @@ final class SetupCoordinator: ObservableObject {
     @Published private(set) var recoveryStep: SetupStep?
     @Published private(set) var legacyCleanupState: LegacyCleanupState
     @Published private(set) var legacyOrphanRecoveryAvailable = false
+    @Published private(set) var isQuitting = false
 
     private let environment: AppEnvironment
     private let permissionCenter: PermissionCenter
@@ -522,6 +528,8 @@ final class SetupCoordinator: ObservableObject {
     private var runtimeValidationRequired: Bool
     private var runtimeReadinessBusy = false
     private var runtimeReadinessWaiters: [RuntimeReadinessWaiter] = []
+    private var serviceMutationBusy = false
+    private var serviceMutationWaiters: [ServiceMutationWaiter] = []
     private var confirmedLegacyCandidate: LegacyCleanupCandidate?
     private var legacyOrphanRecoveryCandidate: LegacyOrphanRecoveryCandidate?
     private var legacyCleanupGeneration: UInt64 = 0
@@ -625,7 +633,9 @@ final class SetupCoordinator: ObservableObject {
     }
 
     var isLiveReady: Bool {
-        legacyCleanupAllowsServiceAccess && readiness.canEnableProtection
+        !isQuitting
+            && legacyCleanupAllowsServiceAccess
+            && readiness.canEnableProtection
     }
 
     var requiresLegacyCleanupAttention: Bool {
@@ -1095,15 +1105,22 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func runDiagnosis() async {
+        guard !rejectMutationDuringApplicationQuit() else {
+            return
+        }
         let cleanupGeneration = legacyCleanupAccessGeneration
         guard await acquireRuntimeReadinessPermit() else {
             return
         }
         defer { releaseRuntimeReadinessPermit() }
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled,
+              !rejectMutationDuringApplicationQuit() else {
             return
         }
         await probeRuntimeDiagnosis()
+        guard !rejectMutationDuringApplicationQuit() else {
+            return
+        }
         await refreshServiceAfterDiagnosis(
             expectedCleanupGeneration: cleanupGeneration
         )
@@ -1113,7 +1130,17 @@ final class SetupCoordinator: ObservableObject {
     private func refreshServiceAfterDiagnosis(
         expectedCleanupGeneration: UInt64?
     ) async {
+        guard !rejectMutationDuringApplicationQuit() else {
+            return
+        }
         if environment.mode == .release {
+            guard await acquireServiceMutationPermit() else {
+                return
+            }
+            defer { releaseServiceMutationPermit() }
+            guard !rejectMutationDuringApplicationQuit() else {
+                return
+            }
             await installAndRefreshReleaseService(
                 expectedCleanupGeneration: expectedCleanupGeneration
             )
@@ -1154,22 +1181,35 @@ final class SetupCoordinator: ObservableObject {
 
     @discardableResult
     func runSafetyTest() async -> Bool {
+        guard !rejectMutationDuringApplicationQuit() else {
+            return false
+        }
         let cleanupGeneration = legacyCleanupAccessGeneration
         guard await acquireRuntimeReadinessPermit() else {
             return false
         }
         defer { releaseRuntimeReadinessPermit() }
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled,
+              !rejectMutationDuringApplicationQuit() else {
             return false
         }
         await probeRuntimeDiagnosis()
+        guard !rejectMutationDuringApplicationQuit() else {
+            return false
+        }
         await refreshServiceAfterDiagnosis(
             expectedCleanupGeneration: cleanupGeneration
         )
+        guard !rejectMutationDuringApplicationQuit() else {
+            return false
+        }
         guard diagnosisPassed else {
             return false
         }
         await verifyOwnerWithoutLockingInsidePermit()
+        guard !rejectMutationDuringApplicationQuit() else {
+            return false
+        }
         updateReadiness()
         guard readiness.canEnableProtection else {
             if currentError == nil {
@@ -1250,7 +1290,9 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func enableProtection() async throws {
+        try rejectProtectionEnableDuringApplicationQuit()
         await ensureLegacyInspectionCompleted()
+        try rejectProtectionEnableDuringApplicationQuit()
         guard let cleanupGeneration = legacyCleanupAccessGeneration else {
             publishBlockedLegacyCleanupEffects()
             throw SetupCoordinatorError.notReady([.serviceHealth])
@@ -1263,25 +1305,34 @@ final class SetupCoordinator: ObservableObject {
         guard await acquireRuntimeReadinessPermit() else {
             throw CancellationError()
         }
+        defer { releaseRuntimeReadinessPermit() }
+        try rejectProtectionEnableDuringApplicationQuit()
+        guard await acquireServiceMutationPermit() else {
+            throw CancellationError()
+        }
+        defer { releaseServiceMutationPermit() }
+        try rejectProtectionEnableDuringApplicationQuit()
         guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
             publishBlockedLegacyCleanupEffects()
             throw SetupCoordinatorError.notReady([.serviceHealth])
         }
-        defer { releaseRuntimeReadinessPermit() }
         try Task.checkCancellation()
         currentError = nil
         await refreshPermissions()
+        try rejectProtectionEnableDuringApplicationQuit()
         guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
             publishBlockedLegacyCleanupEffects()
             throw SetupCoordinatorError.notReady([.serviceHealth])
         }
         await probeRuntimeDiagnosis()
+        try rejectProtectionEnableDuringApplicationQuit()
         guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
             publishBlockedLegacyCleanupEffects()
             throw SetupCoordinatorError.notReady([.serviceHealth])
         }
         if diagnosisPassed {
             await verifyOwnerWithoutLockingInsidePermit()
+            try rejectProtectionEnableDuringApplicationQuit()
             guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
                 publishBlockedLegacyCleanupEffects()
                 throw SetupCoordinatorError.notReady([.serviceHealth])
@@ -1290,11 +1341,13 @@ final class SetupCoordinator: ObservableObject {
         await refreshServiceHealthForEnable(
             expectedCleanupGeneration: cleanupGeneration
         )
+        try rejectProtectionEnableDuringApplicationQuit()
         guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
             publishBlockedLegacyCleanupEffects()
             throw SetupCoordinatorError.notReady([.serviceHealth])
         }
         await refreshPermissions()
+        try rejectProtectionEnableDuringApplicationQuit()
         guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
             publishBlockedLegacyCleanupEffects()
             throw SetupCoordinatorError.notReady([.serviceHealth])
@@ -1331,11 +1384,13 @@ final class SetupCoordinator: ObservableObject {
             requiresOwnerReverification: false
         )
         do {
+            try rejectProtectionEnableDuringApplicationQuit()
             guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
                 publishBlockedLegacyCleanupEffects()
                 throw SetupCoordinatorError.notReady([.serviceHealth])
             }
             try setupStore.save(completedRecord)
+            try rejectProtectionEnableDuringApplicationQuit()
             guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
                 publishBlockedLegacyCleanupEffects()
                 throw SetupCoordinatorError.notReady([.serviceHealth])
@@ -1348,6 +1403,11 @@ final class SetupCoordinator: ObservableObject {
             currentError = nil
         } catch {
             try? setupStore.save(previousRecord)
+            if isQuitting {
+                _ = try? localStore.writeControl(enabled: false)
+                _ = rejectMutationDuringApplicationQuit()
+                throw SetupCoordinatorError.notReady([.serviceHealth])
+            }
             let coordinatorError = SetupCoordinatorError.persistenceFailed
             currentError = coordinatorError.localizedDescription
             throw coordinatorError
@@ -1355,6 +1415,16 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func restartService() async {
+        guard !rejectMutationDuringApplicationQuit() else {
+            return
+        }
+        guard await acquireServiceMutationPermit() else {
+            return
+        }
+        defer { releaseServiceMutationPermit() }
+        guard !rejectMutationDuringApplicationQuit() else {
+            return
+        }
         guard let cleanupGeneration = legacyCleanupAccessGeneration else {
             publishBlockedLegacyCleanupEffects()
             return
@@ -1370,6 +1440,9 @@ final class SetupCoordinator: ObservableObject {
                 return
             }
             try await serviceManager.restart()
+            guard !rejectMutationDuringApplicationQuit() else {
+                return
+            }
             guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
                 publishBlockedLegacyCleanupEffects()
                 return
@@ -1386,6 +1459,16 @@ final class SetupCoordinator: ObservableObject {
     }
 
     func reinstallService() async {
+        guard !rejectMutationDuringApplicationQuit() else {
+            return
+        }
+        guard await acquireServiceMutationPermit() else {
+            return
+        }
+        defer { releaseServiceMutationPermit() }
+        guard !rejectMutationDuringApplicationQuit() else {
+            return
+        }
         guard let cleanupGeneration = legacyCleanupAccessGeneration else {
             publishBlockedLegacyCleanupEffects()
             return
@@ -1405,6 +1488,9 @@ final class SetupCoordinator: ObservableObject {
                 appURL: applicationURL,
                 supportURL: environment.supportURL
             )
+            guard !rejectMutationDuringApplicationQuit() else {
+                return
+            }
             guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
                 publishBlockedLegacyCleanupEffects()
                 return
@@ -1422,6 +1508,56 @@ final class SetupCoordinator: ObservableObject {
 
     @discardableResult
     func uninstallServicePreservingData() async -> Bool {
+        guard !rejectMutationDuringApplicationQuit() else {
+            return false
+        }
+        guard await acquireServiceMutationPermit() else {
+            return false
+        }
+        defer { releaseServiceMutationPermit() }
+        guard !rejectMutationDuringApplicationQuit() else {
+            return false
+        }
+        return await uninstallServicePreservingDataInsidePermit()
+    }
+
+    @discardableResult
+    func stopBackgroundForApplicationQuit() async -> Bool {
+        guard !isQuitting else {
+            return false
+        }
+        isQuitting = true
+        serviceHealthy = false
+        updateReadiness()
+
+        do {
+            _ = try localStore.writeControl(enabled: false)
+        } catch {
+            currentError = SetupCoordinatorError.persistenceFailed.localizedDescription
+            isQuitting = false
+            updateReadiness()
+            return false
+        }
+
+        guard await acquireServiceMutationPermit() else {
+            _ = try? localStore.writeControl(enabled: false)
+            isQuitting = false
+            updateReadiness()
+            return false
+        }
+        let stopped = await uninstallServicePreservingDataInsidePermit()
+        releaseServiceMutationPermit()
+
+        guard stopped else {
+            _ = try? localStore.writeControl(enabled: false)
+            isQuitting = false
+            updateReadiness()
+            return false
+        }
+        return true
+    }
+
+    private func uninstallServicePreservingDataInsidePermit() async -> Bool {
         currentError = nil
         do {
             _ = try localStore.writeControl(enabled: false)
@@ -1442,11 +1578,26 @@ final class SetupCoordinator: ObservableObject {
                 publishBlockedLegacyCleanupEffects()
                 return false
             }
-            serviceStatus = await serviceManager.status()
+            let stoppedStatus = await serviceManager.status()
+            serviceStatus = stoppedStatus
             serviceHealthy = false
             updateReadiness()
+
+            let controlWasDisabled =
+                !localStore.readControl().protectionEnabled
+            let serviceWasStopped =
+                stoppedStatus.state == .notInstalled
+                && stoppedStatus.pid == nil
+            guard controlWasDisabled && serviceWasStopped else {
+                _ = try? localStore.writeControl(enabled: false)
+                currentError = controlWasDisabled
+                    ? "未能确认后台保护已经停止，请修复后重试退出。"
+                    : "检测到保护状态在退出期间发生变化，已保持保护关闭，请重试退出。"
+                return false
+            }
             return true
         } catch {
+            _ = try? localStore.writeControl(enabled: false)
             recordDiagnosticError(error, operation: "uninstall_service_preserving_data")
             currentError = localizedRuntimeError(error)
             serviceHealthy = false
@@ -1855,6 +2006,72 @@ final class SetupCoordinator: ObservableObject {
         waiter.continuation.resume(returning: false)
     }
 
+    private func acquireServiceMutationPermit() async -> Bool {
+        guard !Task.isCancelled else {
+            return false
+        }
+        if !serviceMutationBusy {
+            serviceMutationBusy = true
+            return true
+        }
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                serviceMutationWaiters.append(
+                    ServiceMutationWaiter(
+                        id: id,
+                        continuation: continuation
+                    )
+                )
+            }
+        } onCancel: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.cancelServiceMutationWaiter(id: id)
+            }
+        }
+    }
+
+    private func releaseServiceMutationPermit() {
+        guard !serviceMutationWaiters.isEmpty else {
+            serviceMutationBusy = false
+            return
+        }
+        serviceMutationWaiters.removeFirst().continuation.resume(returning: true)
+    }
+
+    private func cancelServiceMutationWaiter(id: UUID) {
+        guard let index = serviceMutationWaiters.firstIndex(where: {
+            $0.id == id
+        }) else {
+            return
+        }
+        let waiter = serviceMutationWaiters.remove(at: index)
+        waiter.continuation.resume(returning: false)
+    }
+
+    @discardableResult
+    private func rejectMutationDuringApplicationQuit() -> Bool {
+        guard isQuitting else {
+            return false
+        }
+        _ = try? localStore.writeControl(enabled: false)
+        serviceHealthy = false
+        currentError = "正在退出 Mac Face Lock，后台保护操作已停止。"
+        updateReadiness()
+        return true
+    }
+
+    private func rejectProtectionEnableDuringApplicationQuit() throws {
+        guard rejectMutationDuringApplicationQuit() else {
+            return
+        }
+        throw SetupCoordinatorError.notReady([.serviceHealth])
+    }
+
     private func updateReadiness() {
         let evaluated = SetupReadiness.evaluate(
             permissions: permissionStates,
@@ -2080,6 +2297,9 @@ final class SetupCoordinator: ObservableObject {
         expectedCleanupGeneration: UInt64?
     ) async {
         serviceHealthy = false
+        guard !rejectMutationDuringApplicationQuit() else {
+            return
+        }
         guard let cleanupGeneration = legacyCleanupAccessGeneration,
               expectedCleanupGeneration == nil
                 || expectedCleanupGeneration == cleanupGeneration else {
@@ -2099,11 +2319,17 @@ final class SetupCoordinator: ObservableObject {
                 appURL: applicationURL,
                 supportURL: environment.supportURL
             )
+            guard !rejectMutationDuringApplicationQuit() else {
+                return
+            }
             guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
                 publishBlockedLegacyCleanupEffects()
                 return
             }
             let serviceStatus = await serviceManager.status()
+            guard !rejectMutationDuringApplicationQuit() else {
+                return
+            }
             guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
                 publishBlockedLegacyCleanupEffects()
                 return

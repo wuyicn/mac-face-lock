@@ -40,7 +40,10 @@ struct SettingsView: View {
                                 }
                             }
                             .buttonStyle(.borderedProminent)
-                            .disabled(isWorking(protectionAction))
+                            .disabled(
+                                isWorking(protectionAction)
+                                    || setupCoordinator.isQuitting
+                            )
                         }
                     }
                     .padding(16)
@@ -209,7 +212,10 @@ struct SettingsView: View {
                 }
             }
             .buttonStyle(.borderedProminent)
-            .disabled(isWorking(protectionAction))
+            .disabled(
+                isWorking(protectionAction)
+                    || setupCoordinator.isQuitting
+            )
         }
     }
 
@@ -238,7 +244,10 @@ struct SettingsView: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isWorking(serviceAction))
+                .disabled(
+                    isWorking(serviceAction)
+                        || setupCoordinator.isQuitting
+                )
 
                 Button("修复后台保护") {
                     serviceAction = .working("正在修复后台保护…")
@@ -248,7 +257,10 @@ struct SettingsView: View {
                     }
                 }
                 .buttonStyle(.bordered)
-                .disabled(isWorking(serviceAction))
+                .disabled(
+                    isWorking(serviceAction)
+                        || setupCoordinator.isQuitting
+                )
 
                 Button("查看日志") {
                     if setupCoordinator.openLogs() {
@@ -266,7 +278,10 @@ struct SettingsView: View {
                 isConfirmingServiceUninstall = true
             }
             .buttonStyle(.bordered)
-            .disabled(isWorking(serviceAction))
+            .disabled(
+                isWorking(serviceAction)
+                    || setupCoordinator.isQuitting
+            )
         }
     }
 

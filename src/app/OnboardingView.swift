@@ -380,7 +380,7 @@ struct OnboardingView: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isWorking)
+                .disabled(isWorking || setupCoordinator.isQuitting)
             }
         }
     }
@@ -558,7 +558,11 @@ struct OnboardingView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .disabled(isWorking || !setupCoordinator.isLiveReady)
+                .disabled(
+                    isWorking
+                        || setupCoordinator.isQuitting
+                        || !setupCoordinator.isLiveReady
+                )
             }
         }
     }

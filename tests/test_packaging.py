@@ -165,6 +165,30 @@ class UnifiedPackagingTests(unittest.TestCase):
         self.assertIn("NSApp.setActivationPolicy(.regular)", delegate)
         self.assertNotIn("NSApp.setActivationPolicy(.accessory)", delegate)
 
+    def test_all_application_termination_routes_use_safe_gate(self) -> None:
+        delegate = (PROJECT_DIR / "src/app" / "AppDelegate.swift").read_text()
+        quit_coordinator = (
+            PROJECT_DIR / "src/app" / "ApplicationQuitCoordinator.swift"
+        ).read_text()
+        status_menu = (
+            PROJECT_DIR / "src/app" / "StatusMenuController.swift"
+        ).read_text()
+
+        self.assertIn("func applicationShouldTerminate(", delegate)
+        self.assertIn(
+            "applicationQuitCoordinator.applicationShouldTerminate",
+            delegate,
+        )
+        self.assertIn("NSApp.reply(toApplicationShouldTerminate: true)", delegate)
+        self.assertIn("NSApp.reply(toApplicationShouldTerminate: false)", delegate)
+        self.assertIn("退出 Mac Face Lock 并停止保护？", delegate)
+        self.assertIn("ApplicationTerminationDecision", quit_coordinator)
+        self.assertIn(".terminateLater", quit_coordinator)
+        self.assertIn(".terminateCancel", quit_coordinator)
+        self.assertIn(".terminateNow", quit_coordinator)
+        self.assertIn("requestApplicationTermination", status_menu)
+        self.assertNotIn("applicationQuitCoordinator.requestQuit()", status_menu)
+
     def test_control_center_packages_the_project_owned_icon(self) -> None:
         info_path = PROJECT_DIR / "src" / "app" / "Info.plist"
         icon_path = PROJECT_DIR / "src" / "app" / "AppIcon.icns"

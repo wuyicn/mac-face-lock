@@ -325,6 +325,7 @@ private struct OverviewView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
+                .disabled(setupCoordinator.isQuitting)
 
                 if let error = faceLockStore.lastError {
                     Text(error)

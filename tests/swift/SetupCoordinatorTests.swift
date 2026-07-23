@@ -139,12 +139,16 @@ private final class FakeServiceManager: ServiceManaging {
     private(set) var statusChecks = 0
     var suspendStatus = false
     var suspendInstall = false
+    var suspendUninstall = false
+    var preserveStatusOnUninstall = false
     var onStatus: (() -> Void)?
     var onUninstall: (() throws -> Void)?
     private(set) var statusStarted = false
     private(set) var installStarted = false
+    private(set) var uninstallStarted = false
     private var statusContinuation: CheckedContinuation<Void, Never>?
     private var installContinuation: CheckedContinuation<Void, Never>?
+    private var uninstallContinuation: CheckedContinuation<Void, Never>?
 
     init(state: ServiceState, pid: Int32? = 42) {
         currentStatus = ServiceStatus(
@@ -193,6 +197,15 @@ private final class FakeServiceManager: ServiceManaging {
     func uninstallPreservingData() async throws {
         try onUninstall?()
         uninstallCount += 1
+        uninstallStarted = true
+        if suspendUninstall {
+            await withCheckedContinuation { continuation in
+                uninstallContinuation = continuation
+            }
+        }
+        guard !preserveStatusOnUninstall else {
+            return
+        }
         currentStatus = ServiceStatus(
             state: .notInstalled,
             pid: nil,
@@ -212,6 +225,11 @@ private final class FakeServiceManager: ServiceManaging {
     func finishInstall() {
         installContinuation?.resume()
         installContinuation = nil
+    }
+
+    func finishUninstall() {
+        uninstallContinuation?.resume()
+        uninstallContinuation = nil
     }
 }
 
@@ -780,6 +798,9 @@ struct SetupCoordinatorTests {
         try await testOperationalServiceRepairActionsUseServiceManager()
         try await testOperationalServiceUninstallPreservesDataAndDisablesProtection()
         try await testQuitStopFailureDisablesProtectionAndPreservesRecords()
+        try await testApplicationQuitBlocksProtectionAndServiceMutations()
+        try await testApplicationQuitRejectsUnverifiedStoppedService()
+        try await testApplicationQuitRejectsAndRepairsLateControlEnable()
         try await testCompletedRecordDoesNotFabricateLiveRuntimeGates()
         try await testEnableProtectionReprobesRevokedPermissionAndFallsBack()
         try await testCompletedAuthorizationRefreshFallsBackAfterRevocation()
@@ -2429,6 +2450,144 @@ struct SetupCoordinatorTests {
             fixture.localStore.readOnboarding() == onboardingRecord
                 && fixture.setupStore.record == onboardingRecord,
             "failed quit stop changed onboarding history"
+        )
+    }
+
+    private static func testApplicationQuitBlocksProtectionAndServiceMutations()
+        async throws
+    {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let serviceManager = FakeServiceManager(state: .healthy)
+        serviceManager.suspendUninstall = true
+        let runner = FakeRuntimeRunner()
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound)
+        )
+        await coordinator.inspectLegacyInstall()
+        _ = try fixture.localStore.writeControl(enabled: true)
+
+        let quit = Task {
+            await coordinator.stopBackgroundForApplicationQuit()
+        }
+        for _ in 0..<100 where !serviceManager.uninstallStarted {
+            await Task.yield()
+        }
+
+        try require(serviceManager.uninstallStarted, "application quit never began service stop")
+        try require(coordinator.isQuitting, "application quit did not publish its mutation gate")
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "application quit did not disable protection before suspension"
+        )
+
+        do {
+            try await coordinator.enableProtection()
+            throw TestFailure.assertion("enable protection succeeded during application quit")
+        } catch let error as TestFailure {
+            throw error
+        } catch {
+            // Expected: the method-level quit gate rejects the action.
+        }
+        await coordinator.restartService()
+        await coordinator.reinstallService()
+        await coordinator.runDiagnosis()
+
+        try require(
+            serviceManager.restartCount == 0 && serviceManager.installs.isEmpty,
+            "service mutation crossed the application quit gate"
+        )
+        try require(
+            runner.commands.isEmpty,
+            "diagnosis recreated background protection during application quit"
+        )
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "rejected quit-time actions re-enabled protection"
+        )
+
+        serviceManager.finishUninstall()
+        let stopped = await quit.value
+
+        try require(stopped, "verified service stop did not complete application quit")
+        try require(coordinator.isQuitting, "successful application quit released its safety gate")
+    }
+
+    private static func testApplicationQuitRejectsUnverifiedStoppedService()
+        async throws
+    {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let serviceManager = FakeServiceManager(state: .healthy)
+        serviceManager.preserveStatusOnUninstall = true
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound)
+        )
+        await coordinator.inspectLegacyInstall()
+        _ = try fixture.localStore.writeControl(enabled: true)
+
+        let stopped = await coordinator.stopBackgroundForApplicationQuit()
+
+        try require(!stopped, "quit accepted a service that still reported running")
+        try require(!coordinator.isQuitting, "failed final service check did not release quit gate")
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "failed final service check left protection enabled"
+        )
+
+        await coordinator.restartService()
+        try require(
+            serviceManager.restartCount == 1,
+            "failed quit did not release service actions for recovery"
+        )
+    }
+
+    private static func testApplicationQuitRejectsAndRepairsLateControlEnable()
+        async throws
+    {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let serviceManager = FakeServiceManager(state: .healthy)
+        serviceManager.suspendStatus = true
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound)
+        )
+        await coordinator.inspectLegacyInstall()
+
+        let quit = Task {
+            await coordinator.stopBackgroundForApplicationQuit()
+        }
+        for _ in 0..<100 where !serviceManager.statusStarted {
+            await Task.yield()
+        }
+        try require(serviceManager.statusStarted, "quit never reached final service status check")
+        _ = try fixture.localStore.writeControl(enabled: true)
+        serviceManager.finishStatus()
+        let stopped = await quit.value
+
+        try require(!stopped, "quit accepted a late protection enable")
+        try require(!coordinator.isQuitting, "failed final control check did not release quit gate")
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "final control check did not restore durable protection off"
         )
     }
 
