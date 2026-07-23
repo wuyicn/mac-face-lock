@@ -919,6 +919,20 @@ scripts/bootstrap.sh
                     f"macos release gate still depends on {forbidden!r}: {macos_commands}",
                 )
 
+    def test_ci_builds_runtime_only_on_macos_before_unified_app(self):
+        workflow = load_ci_workflow()
+        linux_commands = ci_job_run_commands(workflow["jobs"]["python-linux"])
+        macos_commands = ci_job_run_commands(workflow["jobs"]["macos-release-gates"])
+
+        self.assertNotIn("scripts/build-runtime.sh", linux_commands)
+        runtime_index = macos_commands.index("scripts/build-runtime.sh")
+        prerequisites_index = macos_commands.index(
+            "python -m pip install -r requirements-lock.txt"
+        )
+        unified_app_index = macos_commands.index("scripts/build-status-app.sh")
+        self.assertGreater(runtime_index, prerequisites_index)
+        self.assertLess(runtime_index, unified_app_index)
+
     def test_ci_uses_node24_action_majors(self):
         workflow = load_ci_workflow()
         expected = {
