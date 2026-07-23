@@ -265,20 +265,26 @@ final class RuntimeCommandRunner: RuntimeCommandRunning {
     }
 
     private func arguments(for command: RuntimeCommand) -> [String] {
-        var arguments: [String] = []
-        if environment.mode == .source {
-            arguments.append(
-                environment.resourcesURL.appendingPathComponent("runtime_cli.py").path
-            )
+        switch environment.mode {
+        case .release:
+            return [
+                "--internal-runtime",
+                "--resources-dir",
+                environment.resourcesURL.path,
+                "--support-dir",
+                environment.supportURL.path,
+                command.rawValue,
+            ]
+        case .source:
+            return [
+                environment.resourcesURL.appendingPathComponent("runtime_cli.py").path,
+                "--resources-dir",
+                environment.resourcesURL.path,
+                "--support-dir",
+                environment.supportURL.path,
+                command.rawValue,
+            ]
         }
-        arguments.append(contentsOf: [
-            "--resources-dir",
-            environment.resourcesURL.path,
-            "--support-dir",
-            environment.supportURL.path,
-            command.rawValue,
-        ])
-        return arguments
     }
 }
 

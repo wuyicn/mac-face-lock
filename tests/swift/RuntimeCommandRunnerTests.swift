@@ -21,27 +21,37 @@ private struct RuntimeFixture {
     let root: URL
     let environment: AppEnvironment
 
-    init(script: String) throws {
+    init(mode: AppEnvironmentMode = .release, script: String) throws {
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("mac-face-lock-runtime-\(UUID().uuidString)", isDirectory: true)
         let resourcesURL = root.appendingPathComponent("resources", isDirectory: true)
         let supportURL = root.appendingPathComponent("support", isDirectory: true)
         let dataURL = supportURL.appendingPathComponent("data", isDirectory: true)
         let logsURL = supportURL.appendingPathComponent("logs", isDirectory: true)
-        let executableURL = root.appendingPathComponent("fake-runtime")
+        let executableURL: URL
+        switch mode {
+        case .release:
+            executableURL = root.appendingPathComponent("fake-runtime")
+        case .source:
+            executableURL = root.appendingPathComponent(".venv/bin/python")
+        }
         try FileManager.default.createDirectory(
             at: resourcesURL,
             withIntermediateDirectories: true
         )
         try FileManager.default.createDirectory(at: dataURL, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: logsURL, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: executableURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
         try Data(script.utf8).write(to: executableURL)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o755],
             ofItemAtPath: executableURL.path
         )
         environment = AppEnvironment(
-            mode: .release,
+            mode: mode,
             resourcesURL: resourcesURL,
             supportURL: supportURL,
             configURL: supportURL.appendingPathComponent("config/config.json"),
@@ -59,6 +69,8 @@ private struct RuntimeFixture {
 @main
 struct RuntimeCommandRunnerTests {
     static func main() async throws {
+        try await testReleaseCommandsUseSingleApplicationIdentityInvocation()
+        try await testSourceCommandsKeepPythonRuntimeInvocation()
         try await testValidProgressAndExplicitDirectoryArguments()
         try await testMalformedLineIsActionable()
         try await testUnsupportedSchemaAndUnknownEventAreRejected()
@@ -71,15 +83,105 @@ struct RuntimeCommandRunnerTests {
         print("Runtime command runner tests passed")
     }
 
+    private static func testReleaseCommandsUseSingleApplicationIdentityInvocation() async throws {
+        let fixture = try RuntimeFixture(script: """
+        #!/bin/sh
+        set -eu
+        [ "$1" = "--internal-runtime" ]
+        [ "$2" = "--resources-dir" ]
+        [ "$3" = "__RESOURCES__" ]
+        [ "$4" = "--support-dir" ]
+        [ "$5" = "__SUPPORT__" ]
+        case "$6" in
+          agent)
+            printf '%s\\n' '{"schema_version":1,"event":"agent_stopped","status":"success","message":"stopped"}'
+            ;;
+          enroll)
+            printf '%s\\n' '{"schema_version":1,"event":"enrollment_complete","status":"success","message":"complete"}'
+            ;;
+          diagnose)
+            printf '%s\\n' '{"schema_version":1,"event":"diagnosis_complete","status":"success","message":"complete"}'
+            ;;
+          verify-owner)
+            printf '%s\\n' '{"schema_version":1,"event":"owner_verification_complete","status":"success","message":"complete","decision":"owner"}'
+            ;;
+          *)
+            exit 1
+            ;;
+        esac
+        """)
+        defer { fixture.remove() }
+        let executableURL = fixture.environment.runtimeExecutableURL
+        var script = try String(contentsOf: executableURL, encoding: .utf8)
+        script = script.replacingOccurrences(
+            of: "__RESOURCES__",
+            with: fixture.environment.resourcesURL.path
+        )
+        script = script.replacingOccurrences(
+            of: "__SUPPORT__",
+            with: fixture.environment.supportURL.path
+        )
+        try Data(script.utf8).write(to: executableURL)
+
+        for command in RuntimeCommand.allCases {
+            let result = try await RuntimeCommandRunner(environment: fixture.environment).run(
+                command: command
+            ) { _ in }
+            try require(
+                result.exitCode == 0,
+                "release \(command.rawValue) did not receive the single-identity invocation"
+            )
+        }
+    }
+
+    private static func testSourceCommandsKeepPythonRuntimeInvocation() async throws {
+        let fixture = try RuntimeFixture(mode: .source, script: """
+        #!/bin/sh
+        set -eu
+        [ "$1" = "__RUNTIME_CLI__" ]
+        [ "$2" = "--resources-dir" ]
+        [ "$3" = "__RESOURCES__" ]
+        [ "$4" = "--support-dir" ]
+        [ "$5" = "__SUPPORT__" ]
+        [ "$6" = "diagnose" ]
+        for argument in "$@"; do
+          [ "$argument" != "--internal-runtime" ]
+        done
+        printf '%s\\n' '{"schema_version":1,"event":"diagnosis_complete","status":"success","message":"complete"}'
+        """)
+        defer { fixture.remove() }
+        let executableURL = fixture.environment.runtimeExecutableURL
+        var script = try String(contentsOf: executableURL, encoding: .utf8)
+        script = script.replacingOccurrences(
+            of: "__RUNTIME_CLI__",
+            with: fixture.environment.resourcesURL.appendingPathComponent("runtime_cli.py").path
+        )
+        script = script.replacingOccurrences(
+            of: "__RESOURCES__",
+            with: fixture.environment.resourcesURL.path
+        )
+        script = script.replacingOccurrences(
+            of: "__SUPPORT__",
+            with: fixture.environment.supportURL.path
+        )
+        try Data(script.utf8).write(to: executableURL)
+
+        let result = try await RuntimeCommandRunner(environment: fixture.environment).run(
+            command: .diagnose
+        ) { _ in }
+        try require(result.exitCode == 0, "source runtime invocation changed")
+    }
+
     private static func testValidProgressAndExplicitDirectoryArguments() async throws {
         let actual = try RuntimeFixture(script: """
         #!/bin/sh
         set -eu
-        [ "$1" = "--resources-dir" ]
-        [ "$2" = "__RESOURCES__" ]
-        [ "$3" = "--support-dir" ]
-        [ "$4" = "__SUPPORT__" ]
-        [ "$5" = "enroll" ]
+        [ "$1" = "--internal-runtime" ]
+        [ "$2" = "--resources-dir" ]
+        [ "$3" = "__RESOURCES__" ]
+        [ "$4" = "--support-dir" ]
+        [ "$5" = "__SUPPORT__" ]
+        [ "$6" = "enroll" ]
         printf '%s\\n' \
           '{"schema_version":1,"event":"enrollment_started","status":"success","message":"started"}' \
           '{"schema_version":1,"event":"enrollment_progress","status":"success","message":"progress","captured_samples":3,"required_samples":8}' \

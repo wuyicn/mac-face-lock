@@ -120,10 +120,8 @@ struct AppEnvironmentTests {
         )
         try require(
             release.runtimeExecutableURL
-                == expectedResources.appendingPathComponent(
-                    "runtime/MacFaceLockRuntime/MacFaceLockRuntime"
-                ),
-            "release runtime executable path is incorrect"
+                == fixture.bundle.appendingPathComponent("Contents/MacOS/MacFaceLock"),
+            "release runtime did not use the single application identity"
         )
     }
 
