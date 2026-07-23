@@ -17,11 +17,18 @@ private func require(_ condition: @autoclosure () -> Bool, _ message: String) th
     }
 }
 
+private enum InjectedFileSystemError: Error {
+    case createDirectory(String)
+    case removeItem(String)
+}
+
 private final class MemoryServiceFileSystem: ServiceFileSystem {
     private(set) var files: [String: Data] = [:]
     private(set) var operations: [String] = []
     private(set) var readPaths: [String] = []
     private var readSequences: [String: [Data]] = [:]
+    private var createDirectoryFailurePaths: Set<String> = []
+    private var removeFailurePaths: Set<String> = []
     var onRemove: ((URL) -> Void)?
 
     func seed(_ data: Data, at url: URL) {
@@ -30,6 +37,14 @@ private final class MemoryServiceFileSystem: ServiceFileSystem {
 
     func seedReadSequence(_ data: [Data], at url: URL) {
         readSequences[url.standardizedFileURL.path] = data
+    }
+
+    func failCreateDirectory(at url: URL) {
+        createDirectoryFailurePaths.insert(url.standardizedFileURL.path)
+    }
+
+    func failRemoveItem(at url: URL) {
+        removeFailurePaths.insert(url.standardizedFileURL.path)
     }
 
     func fileExists(at url: URL) -> Bool {
@@ -52,7 +67,11 @@ private final class MemoryServiceFileSystem: ServiceFileSystem {
     }
 
     func createDirectory(at url: URL) throws {
-        operations.append("mkdir:\(url.standardizedFileURL.path)")
+        let path = url.standardizedFileURL.path
+        operations.append("mkdir:\(path)")
+        if createDirectoryFailurePaths.contains(path) {
+            throw InjectedFileSystemError.createDirectory(path)
+        }
     }
 
     func writeAtomically(_ data: Data, to url: URL) throws {
@@ -73,8 +92,11 @@ private final class MemoryServiceFileSystem: ServiceFileSystem {
 
     func removeItem(at url: URL) throws {
         let path = url.standardizedFileURL.path
-        files.removeValue(forKey: path)
         operations.append("remove:\(path)")
+        if removeFailurePaths.contains(path) {
+            throw InjectedFileSystemError.removeItem(path)
+        }
+        files.removeValue(forKey: path)
         onRemove?(url.standardizedFileURL)
     }
 }
@@ -169,7 +191,11 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
                 let target = arguments.last ?? ""
                 if (bootoutPrintsBeforeAbsentByTarget[target] ?? 0) == 0 {
                     loadedTargets[target] = false
-                    loaded = false
+                    if target.hasSuffix(
+                        "/com.wuyi.mac-face-lock-background"
+                    ) {
+                        loaded = false
+                    }
                 } else {
                     bootoutPendingTargets.insert(target)
                 }
@@ -186,7 +212,9 @@ private final class FakeServiceCommandRunner: ServiceCommandRunning {
                 .deletingPathExtension()
                 .lastPathComponent
             loadedTargets["\(arguments.dropLast().last ?? "")/\(label)"] = true
-            loaded = true
+            if label == "com.wuyi.mac-face-lock-background" {
+                loaded = true
+            }
             return ServiceCommandResult(exitCode: 0, stdout: "", stderr: "")
         case "enable", "kickstart":
             return ServiceCommandResult(exitCode: 0, stdout: "", stderr: "")
@@ -403,6 +431,14 @@ private struct ServiceFixture {
 @main
 struct ServiceManagerTests {
     static func main() async throws {
+        try await testLegacyRecognitionRejectsIntegerBooleanConfusion()
+        try await testStatusRequiresCompleteRenderedBackgroundPlist()
+        try await testResponsiveCurrentServiceCannotBypassUnknownLegacy()
+        try await testResponsiveCurrentServiceCleansRecognizedLegacy()
+        try await testResponsiveLegacyCleanupFailureRestoresBytesAndLoadedScope()
+        try await testUnknownLegacyReleaseBlocksBeforeServiceMutation()
+        try await testDirectoryFailuresCannotLeaveProtectionEnabled()
+        try await testMissingControlDirectoryFailureRemainsFailOpen()
         try testProductionHealthWindowCoversPermissionAndHeartbeatStartup()
         try await testInstallReadsOnlyCurrentManagedFiles()
         try await testStatusReadsOnlyCurrentManagedFiles()
@@ -413,7 +449,6 @@ struct ServiceManagerTests {
         try await testInstallRendersOnlyApplicationAndSupportPaths()
         try await testFailedBackgroundStartupPreservesLegacyBytesAndProtectionOff()
         try await testReplacementWaitsForBackgroundJobToDisappearBeforeBootstrap()
-        try await testUnknownLegacyReleaseBlocksBeforeServiceMutation()
         try await testRecognizedLegacyReleaseMigratesAfterNewServiceResponds()
         try await testResponsiveMatchingInstallIsIdempotent()
         try await testFailedStableHealthRestoresPreviousPlistAndJob()
@@ -429,6 +464,415 @@ struct ServiceManagerTests {
         try await testPriorJobUnexpectedPrintFailureAbortsBeforeAnyMutation()
         try await testMovedApplicationNeedsRepair()
         print("Service manager tests passed")
+    }
+
+    private static func testDirectoryFailuresCannotLeaveProtectionEnabled() async throws {
+        for directoryName in ["launch agents", "data", "logs"] {
+            let fixture = try ServiceFixture()
+            let controlURL = fixture.supportURL.appendingPathComponent(
+                "data/control.json"
+            )
+            fixture.fileSystem.seed(
+                try JSONSerialization.data(
+                    withJSONObject: [
+                        "schema_version": 1,
+                        "protection_enabled": true,
+                    ]
+                ),
+                at: controlURL
+            )
+            let failureURL: URL
+            switch directoryName {
+            case "launch agents":
+                failureURL = fixture.launchAgentsURL
+            case "data":
+                failureURL = fixture.supportURL.appendingPathComponent(
+                    "data",
+                    isDirectory: true
+                )
+            default:
+                failureURL = fixture.supportURL.appendingPathComponent(
+                    "logs",
+                    isDirectory: true
+                )
+            }
+            fixture.fileSystem.failCreateDirectory(at: failureURL)
+
+            do {
+                try await fixture.manager().install(
+                    appURL: fixture.appURL,
+                    supportURL: fixture.supportURL
+                )
+                throw TestFailure.assertion(
+                    "\(directoryName) creation failure unexpectedly installed service"
+                )
+            } catch is InjectedFileSystemError {
+                // Expected.
+            }
+
+            let control = try JSONSerialization.jsonObject(
+                with: fixture.fileSystem.readData(at: controlURL)
+            ) as? [String: Any]
+            try require(
+                control?["protection_enabled"] as? Bool == false,
+                "\(directoryName) creation failure left protection enabled"
+            )
+            try require(
+                fixture.runner.calls.allSatisfy {
+                    !["bootout", "bootstrap", "enable", "kickstart"]
+                        .contains($0.arguments.first)
+                },
+                "\(directoryName) creation failure mutated launchd"
+            )
+        }
+    }
+
+    private static func testMissingControlDirectoryFailureRemainsFailOpen() async throws {
+        let fixture = try ServiceFixture()
+        let dataDirectoryURL = fixture.supportURL.appendingPathComponent(
+            "data",
+            isDirectory: true
+        )
+        let controlURL = dataDirectoryURL.appendingPathComponent("control.json")
+        fixture.fileSystem.failCreateDirectory(at: dataDirectoryURL)
+
+        do {
+            try await fixture.manager().install(
+                appURL: fixture.appURL,
+                supportURL: fixture.supportURL
+            )
+            throw TestFailure.assertion(
+                "missing control directory failure unexpectedly installed service"
+            )
+        } catch is InjectedFileSystemError {
+            // Expected.
+        }
+
+        try require(
+            !fixture.fileSystem.fileExists(at: controlURL),
+            "missing control directory failure created an enabled control state"
+        )
+        try require(
+            fixture.fileSystem.operations == [
+                "mkdir:\(dataDirectoryURL.standardizedFileURL.path)",
+            ],
+            "missing control directory failure performed unrelated mutation"
+        )
+        try require(
+            fixture.runner.calls.isEmpty,
+            "missing control directory failure reached launchctl"
+        )
+    }
+
+    private static func testResponsiveCurrentServiceCleansRecognizedLegacy() async throws {
+        let fixture = try ServiceFixture(loaded: true, printPIDs: [42, 42])
+        let backgroundTarget = "gui/501/com.wuyi.mac-face-lock-background"
+        let legacyTarget = "gui/501/com.wuyi.mac-face-lock-agent"
+        fixture.runner.seedLoadedTarget(legacyTarget, printPIDs: [99])
+        let backgroundData = try renderTemplate(
+            try ServiceFixture.backgroundTemplateData(),
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        fixture.fileSystem.seed(backgroundData, at: fixture.backgroundPlistURL)
+        let legacyData = try renderTemplate(
+            try ServiceFixture.legacyReleaseTemplateData(),
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        fixture.fileSystem.seed(legacyData, at: fixture.legacyPlistURL)
+        try fixture.seedHealthyState(heartbeatSequence: 7)
+
+        try await fixture.manager().install(
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+
+        try require(
+            !fixture.fileSystem.fileExists(at: fixture.legacyPlistURL),
+            "responsive current service left the recognized legacy plist"
+        )
+        let mutationCalls = fixture.runner.calls.map(\.arguments).filter {
+            ["bootout", "bootstrap", "enable", "kickstart"].contains($0.first)
+        }
+        try require(
+            mutationCalls == [["bootout", legacyTarget]],
+            "responsive current service did not limit mutation to legacy cleanup"
+        )
+        try require(
+            !mutationCalls.contains(["bootout", backgroundTarget]),
+            "responsive current service was replaced during legacy cleanup"
+        )
+        let status = await fixture.manager().status()
+        try require(
+            status.isResponsive && status.pid == 42,
+            "legacy cleanup did not preserve responsive PID 42"
+        )
+    }
+
+    private static func testResponsiveLegacyCleanupFailureRestoresBytesAndLoadedScope() async throws {
+        let fixture = try ServiceFixture(loaded: true, printPIDs: [42])
+        let legacyTarget = "gui/501/com.wuyi.mac-face-lock-agent"
+        fixture.runner.seedLoadedTarget(legacyTarget, printPIDs: [99])
+        let backgroundData = try renderTemplate(
+            try ServiceFixture.backgroundTemplateData(),
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        fixture.fileSystem.seed(backgroundData, at: fixture.backgroundPlistURL)
+        let legacyData = try renderTemplate(
+            try ServiceFixture.legacyReleaseTemplateData(),
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        fixture.fileSystem.seed(legacyData, at: fixture.legacyPlistURL)
+        fixture.fileSystem.failRemoveItem(at: fixture.legacyPlistURL)
+        try fixture.seedHealthyState(heartbeatSequence: 7)
+
+        do {
+            try await fixture.manager().install(
+                appURL: fixture.appURL,
+                supportURL: fixture.supportURL
+            )
+            throw TestFailure.assertion(
+                "legacy cleanup removal failure unexpectedly succeeded"
+            )
+        } catch is InjectedFileSystemError {
+            // Expected.
+        }
+
+        let retainedLegacyData = try fixture.fileSystem.readData(
+            at: fixture.legacyPlistURL
+        )
+        try require(
+            retainedLegacyData == legacyData,
+            "responsive cleanup failure changed legacy plist bytes"
+        )
+        try require(
+            fixture.runner.calls.contains {
+                $0.arguments == [
+                    "bootstrap",
+                    "gui/501",
+                    fixture.legacyPlistURL.standardizedFileURL.path,
+                ]
+            },
+            "responsive cleanup failure did not reload the prior legacy job"
+        )
+        try require(
+            !fixture.runner.calls.contains {
+                $0.arguments == [
+                    "bootstrap",
+                    "gui/501",
+                    fixture.backgroundPlistURL.standardizedFileURL.path,
+                ]
+            },
+            "responsive cleanup failure replaced the healthy current job"
+        )
+        let controlURL = fixture.supportURL.appendingPathComponent(
+            "data/control.json"
+        )
+        let control = try JSONSerialization.jsonObject(
+            with: fixture.fileSystem.readData(at: controlURL)
+        ) as? [String: Any]
+        try require(
+            control?["protection_enabled"] as? Bool == false,
+            "responsive cleanup failure restored protection true"
+        )
+    }
+
+    private static func testResponsiveCurrentServiceCannotBypassUnknownLegacy() async throws {
+        let fixture = try ServiceFixture(loaded: true, printPIDs: [42])
+        let backgroundData = try renderTemplate(
+            try ServiceFixture.backgroundTemplateData(),
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        fixture.fileSystem.seed(backgroundData, at: fixture.backgroundPlistURL)
+        let recognizedLegacyData = try renderTemplate(
+            try ServiceFixture.legacyReleaseTemplateData(),
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        var unknownLegacy = try requireDictionary(recognizedLegacyData)
+        unknownLegacy["UnexpectedManagedKey"] = true
+        let unknownLegacyData = try PropertyListSerialization.data(
+            fromPropertyList: unknownLegacy,
+            format: .xml,
+            options: 0
+        )
+        fixture.fileSystem.seed(unknownLegacyData, at: fixture.legacyPlistURL)
+        try fixture.seedHealthyState(heartbeatSequence: 7)
+        let controlURL = fixture.supportURL.appendingPathComponent(
+            "data/control.json"
+        )
+        fixture.fileSystem.seed(
+            try JSONSerialization.data(
+                withJSONObject: [
+                    "schema_version": 1,
+                    "protection_enabled": true,
+                ]
+            ),
+            at: controlURL
+        )
+
+        do {
+            try await fixture.manager().install(
+                appURL: fixture.appURL,
+                supportURL: fixture.supportURL
+            )
+            throw TestFailure.assertion(
+                "responsive current service bypassed unknown legacy bytes"
+            )
+        } catch ServiceManagerError.invalidTemplate {
+            // Expected.
+        }
+
+        let retainedLegacyData = try fixture.fileSystem.readData(
+            at: fixture.legacyPlistURL
+        )
+        try require(
+            retainedLegacyData == unknownLegacyData,
+            "responsive current service changed unknown legacy bytes"
+        )
+        try require(
+            fixture.runner.calls.allSatisfy {
+                !["bootout", "bootstrap", "enable", "kickstart"]
+                    .contains($0.arguments.first)
+            },
+            "responsive current service mutated launchd before unknown legacy block"
+        )
+        try require(
+            fixture.fileSystem.operations == [
+                "write:\(controlURL.standardizedFileURL.path)",
+            ],
+            "responsive unknown legacy path performed unrelated filesystem mutation"
+        )
+    }
+
+    private static func testStatusRequiresCompleteRenderedBackgroundPlist() async throws {
+        let seedFixture = try ServiceFixture()
+        let renderedData = try renderTemplate(
+            try ServiceFixture.backgroundTemplateData(),
+            appURL: seedFixture.appURL,
+            supportURL: seedFixture.supportURL
+        )
+        let rendered = try requireDictionary(renderedData)
+
+        func changed(
+            _ name: String,
+            key: String,
+            value: Any
+        ) -> (String, [String: Any]) {
+            var dictionary = rendered
+            dictionary[key] = value
+            return (name, dictionary)
+        }
+
+        var extraKey = rendered
+        extraKey["UnexpectedManagedKey"] = true
+        let variants: [(String, [String: Any])] = [
+            changed(
+                "working directory",
+                key: "WorkingDirectory",
+                value: "/unexpected/working-directory"
+            ),
+            changed(
+                "stdout path",
+                key: "StandardOutPath",
+                value: "/unexpected/stdout.log"
+            ),
+            changed(
+                "stderr path",
+                key: "StandardErrorPath",
+                value: "/unexpected/stderr.log"
+            ),
+            changed("RunAtLoad", key: "RunAtLoad", value: false),
+            changed("KeepAlive", key: "KeepAlive", value: false),
+            changed(
+                "process type",
+                key: "ProcessType",
+                value: "Interactive"
+            ),
+            ("extra key", extraKey),
+        ]
+
+        for (variant, dictionary) in variants {
+            let fixture = try ServiceFixture(loaded: true, printPIDs: [42])
+            fixture.fileSystem.seed(
+                try PropertyListSerialization.data(
+                    fromPropertyList: dictionary,
+                    format: .xml,
+                    options: 0
+                ),
+                at: fixture.backgroundPlistURL
+            )
+            try fixture.seedHealthyState()
+
+            let status = await fixture.manager().status()
+
+            try require(
+                status.state == .needsRepair,
+                "status accepted altered \(variant) in background plist"
+            )
+            try require(
+                fixture.runner.calls.isEmpty,
+                "status trusted launchd before validating altered \(variant)"
+            )
+        }
+    }
+
+    private static func testLegacyRecognitionRejectsIntegerBooleanConfusion() async throws {
+        let seedFixture = try ServiceFixture()
+        let recognizedData = try renderTemplate(
+            try ServiceFixture.legacyReleaseTemplateData(),
+            appURL: seedFixture.appURL,
+            supportURL: seedFixture.supportURL
+        )
+        let recognized = try requireDictionary(recognizedData)
+
+        for key in ["RunAtLoad", "KeepAlive"] {
+            let fixture = try ServiceFixture(printPIDs: [42, 42, 42])
+            var confused = recognized
+            confused[key] = 1
+            let confusedData = try PropertyListSerialization.data(
+                fromPropertyList: confused,
+                format: .xml,
+                options: 0
+            )
+            fixture.fileSystem.seed(confusedData, at: fixture.legacyPlistURL)
+            try fixture.seedHealthyStateSequence(sequences: [1, 2, 3])
+
+            do {
+                try await fixture.manager().install(
+                    appURL: fixture.appURL,
+                    supportURL: fixture.supportURL
+                )
+                throw TestFailure.assertion(
+                    "legacy recognition accepted integer \(key) as Boolean"
+                )
+            } catch ServiceManagerError.invalidTemplate {
+                // Expected.
+            }
+
+            let retainedData = try fixture.fileSystem.readData(
+                at: fixture.legacyPlistURL
+            )
+            try require(
+                retainedData == confusedData,
+                "integer \(key) confusion changed legacy bytes"
+            )
+            try require(
+                !fixture.fileSystem.fileExists(at: fixture.backgroundPlistURL),
+                "integer \(key) confusion wrote the background plist"
+            )
+            try require(
+                fixture.runner.calls.allSatisfy {
+                    !["bootout", "bootstrap", "enable", "kickstart"]
+                        .contains($0.arguments.first)
+                },
+                "integer \(key) confusion mutated launchd"
+            )
+        }
     }
 
     private static func testProductionHealthWindowCoversPermissionAndHeartbeatStartup() throws {
@@ -480,6 +924,7 @@ struct ServiceManagerTests {
             fixture,
             operation: "status",
             allowedReadPaths: [
+                fixture.templateURL.standardizedFileURL.path,
                 fixture.plistURL.standardizedFileURL.path,
                 fixture.stateURL.standardizedFileURL.path,
             ]
@@ -856,6 +1301,17 @@ struct ServiceManagerTests {
             try require(
                 control?["protection_enabled"] as? Bool == false,
                 "\(variant) legacy release did not leave protection disabled"
+            )
+            let dataDirectoryURL = fixture.supportURL.appendingPathComponent(
+                "data",
+                isDirectory: true
+            )
+            try require(
+                fixture.fileSystem.operations == [
+                    "mkdir:\(dataDirectoryURL.standardizedFileURL.path)",
+                    "write:\(controlURL.standardizedFileURL.path)",
+                ],
+                "\(variant) legacy release performed unrelated filesystem mutation"
             )
         }
     }
@@ -1276,7 +1732,7 @@ struct ServiceManagerTests {
         )
         try require(
             fixture.runner.calls.map(\.arguments) == [
-                ["print", "gui/501/com.wuyi.mac-face-lock-background"],
+                ["print", "gui/501/com.wuyi.mac-face-lock-agent"],
             ],
             "prior-job print timeout continued into launchctl mutation"
         )
@@ -1330,7 +1786,7 @@ struct ServiceManagerTests {
         )
         try require(
             fixture.runner.calls.map(\.arguments) == [
-                ["print", "gui/501/com.wuyi.mac-face-lock-background"],
+                ["print", "gui/501/com.wuyi.mac-face-lock-agent"],
             ],
             "unexpected print failure continued into launchctl mutation"
         )

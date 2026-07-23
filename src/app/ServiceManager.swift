@@ -1,4 +1,5 @@
 import Darwin
+import CoreFoundation
 import Foundation
 
 enum ServiceState: String, Codable, Equatable {
@@ -303,25 +304,20 @@ final class ServiceManager: ServiceManaging {
     func install(appURL: URL, supportURL: URL) async throws {
         let normalizedAppURL = appURL.standardizedFileURL
         let normalizedSupportURL = supportURL.standardizedFileURL
-        try fileSystem.createDirectory(at: launchAgentsURL)
-        try fileSystem.createDirectory(
-            at: normalizedSupportURL.appendingPathComponent("data", isDirectory: true)
+        let dataDirectoryURL = normalizedSupportURL.appendingPathComponent(
+            "data",
+            isDirectory: true
         )
-        try fileSystem.createDirectory(
-            at: normalizedSupportURL.appendingPathComponent("logs", isDirectory: true)
-        )
+        let controlURL = dataDirectoryURL.appendingPathComponent("control.json")
+        let createdDataDirectory: Bool
+        if fileSystem.fileExists(at: controlURL) {
+            createdDataDirectory = false
+        } else {
+            try fileSystem.createDirectory(at: dataDirectoryURL)
+            createdDataDirectory = true
+        }
         try writeProtectionDisabled(supportURL: normalizedSupportURL)
 
-        let currentStatus = await status()
-        if currentStatus.isResponsive {
-            return
-        }
-
-        let destinationURL = plistURL
-        let backupURL = destinationURL.appendingPathExtension("backup")
-        let previousData = fileSystem.fileExists(at: destinationURL)
-            ? try fileSystem.readData(at: destinationURL)
-            : nil
         let legacyData = fileSystem.fileExists(at: legacyPlistURL)
             ? try fileSystem.readData(at: legacyPlistURL)
             : nil
@@ -333,11 +329,33 @@ final class ServiceManager: ServiceManaging {
            ) {
             throw ServiceManagerError.invalidTemplate
         }
-        let previousWasLoaded = try await jobIsLoaded(target: serviceTarget)
         let legacyWasLoaded = try await jobIsLoaded(target: legacyServiceTarget)
         if legacyWasLoaded && legacyData == nil {
             throw ServiceManagerError.invalidTemplate
         }
+        let currentStatus = await status()
+        if currentStatus.isResponsive {
+            try await cleanupLegacyAfterResponsiveService(
+                legacyData: legacyData,
+                legacyWasLoaded: legacyWasLoaded
+            )
+            return
+        }
+
+        try fileSystem.createDirectory(at: launchAgentsURL)
+        if !createdDataDirectory {
+            try fileSystem.createDirectory(at: dataDirectoryURL)
+        }
+        try fileSystem.createDirectory(
+            at: normalizedSupportURL.appendingPathComponent("logs", isDirectory: true)
+        )
+
+        let destinationURL = plistURL
+        let backupURL = destinationURL.appendingPathExtension("backup")
+        let previousData = fileSystem.fileExists(at: destinationURL)
+            ? try fileSystem.readData(at: destinationURL)
+            : nil
+        let previousWasLoaded = try await jobIsLoaded(target: serviceTarget)
         let legacyBackupURL = legacyPlistURL.appendingPathExtension("backup")
 
         do {
@@ -427,8 +445,19 @@ final class ServiceManager: ServiceManaging {
             )
         }
         let installedProgram = configuration.arguments.first
-        guard configuration.label == Self.label,
-              configuration.arguments == expectedArguments,
+        guard let templateData = try? fileSystem.readData(at: templateURL),
+              let renderedTemplate = try? Self.renderTemplate(
+                  templateData,
+                  appURL: appURL,
+                  supportURL: supportURL
+              ),
+              let expectedDictionary = Self.plistDictionary(
+                  from: renderedTemplate
+              ),
+              Self.propertyListValuesExactlyEqual(
+                  configuration.dictionary,
+                  expectedDictionary
+              ),
               let installedProgram else {
             return ServiceStatus(
                 state: .needsRepair,
@@ -558,7 +587,7 @@ final class ServiceManager: ServiceManaging {
     }
 
     private func installedServiceConfiguration() -> (
-        label: String,
+        dictionary: [String: Any],
         arguments: [String]
     )? {
         guard let data = try? fileSystem.readData(at: plistURL),
@@ -567,11 +596,10 @@ final class ServiceManager: ServiceManaging {
                 options: [],
                 format: nil
               ) as? [String: Any],
-              let label = dictionary["Label"] as? String,
               let arguments = dictionary["ProgramArguments"] as? [String] else {
             return nil
         }
-        return (label, arguments)
+        return (dictionary, arguments)
     }
 
     private func readAgentState() -> FaceLockState? {
@@ -720,6 +748,49 @@ final class ServiceManager: ServiceManaging {
         }
     }
 
+    private func cleanupLegacyAfterResponsiveService(
+        legacyData: Data?,
+        legacyWasLoaded: Bool
+    ) async throws {
+        guard let legacyData else {
+            return
+        }
+        let backupURL = legacyPlistURL.appendingPathExtension("backup")
+        do {
+            try fileSystem.writeAtomically(legacyData, to: backupURL)
+            if legacyWasLoaded {
+                try await stopJobAndWaitUntilAbsent(
+                    target: legacyServiceTarget
+                )
+            }
+            try fileSystem.removeItem(at: legacyPlistURL)
+            if fileSystem.fileExists(at: backupURL) {
+                try fileSystem.removeItem(at: backupURL)
+            }
+        } catch {
+            do {
+                try atomicReplace(legacyData, at: legacyPlistURL)
+                if legacyWasLoaded,
+                   try await !jobIsLoaded(target: legacyServiceTarget) {
+                    try await runRequiredLaunchctl(
+                        ["bootstrap", userDomain, legacyPlistURL.path]
+                    )
+                    try await runRequiredLaunchctl(
+                        ["enable", legacyServiceTarget]
+                    )
+                }
+                if fileSystem.fileExists(at: backupURL) {
+                    try fileSystem.removeItem(at: backupURL)
+                }
+            } catch {
+                throw ServiceManagerError.rollbackFailed(
+                    error.localizedDescription
+                )
+            }
+            throw error
+        }
+    }
+
     private func atomicReplace(_ data: Data, at destinationURL: URL) throws {
         let temporaryURL = destinationURL
             .deletingLastPathComponent()
@@ -854,11 +925,7 @@ final class ServiceManager: ServiceManaging {
         appURL: URL,
         supportURL: URL
     ) -> Bool {
-        guard let dictionary = try? PropertyListSerialization.propertyList(
-            from: data,
-            options: [],
-            format: nil
-        ) as? [String: Any] else {
+        guard let dictionary = plistDictionary(from: data) else {
             return false
         }
         let expected: [String: Any] = [
@@ -882,7 +949,76 @@ final class ServiceManager: ServiceManaging {
             "KeepAlive": true,
             "ProcessType": "Background",
         ]
-        return (dictionary as NSDictionary).isEqual(to: expected)
+        return propertyListValuesExactlyEqual(dictionary, expected)
+    }
+
+    private static func plistDictionary(
+        from data: Data
+    ) -> [String: Any]? {
+        try? PropertyListSerialization.propertyList(
+            from: data,
+            options: [],
+            format: nil
+        ) as? [String: Any]
+    }
+
+    private static func propertyListValuesExactlyEqual(
+        _ lhs: Any,
+        _ rhs: Any
+    ) -> Bool {
+        if let lhs = lhs as? [String: Any] {
+            guard let rhs = rhs as? [String: Any],
+                  lhs.keys == rhs.keys else {
+                return false
+            }
+            return lhs.allSatisfy { key, value in
+                guard let rhsValue = rhs[key] else {
+                    return false
+                }
+                return propertyListValuesExactlyEqual(value, rhsValue)
+            }
+        }
+        if let lhs = lhs as? [Any] {
+            guard let rhs = rhs as? [Any],
+                  lhs.count == rhs.count else {
+                return false
+            }
+            return zip(lhs, rhs).allSatisfy {
+                propertyListValuesExactlyEqual($0, $1)
+            }
+        }
+        if let lhs = lhs as? String {
+            guard let rhs = rhs as? String else {
+                return false
+            }
+            return lhs == rhs
+        }
+        if let lhs = lhs as? NSNumber {
+            guard let rhs = rhs as? NSNumber else {
+                return false
+            }
+            let lhsIsBoolean = CFGetTypeID(lhs) == CFBooleanGetTypeID()
+            let rhsIsBoolean = CFGetTypeID(rhs) == CFBooleanGetTypeID()
+            guard lhsIsBoolean == rhsIsBoolean else {
+                return false
+            }
+            return lhsIsBoolean
+                ? lhs.boolValue == rhs.boolValue
+                : lhs == rhs
+        }
+        if let lhs = lhs as? Data {
+            guard let rhs = rhs as? Data else {
+                return false
+            }
+            return lhs == rhs
+        }
+        if let lhs = lhs as? Date {
+            guard let rhs = rhs as? Date else {
+                return false
+            }
+            return lhs == rhs
+        }
+        return false
     }
 
     private static func parsePID(_ output: String) -> Int32? {
