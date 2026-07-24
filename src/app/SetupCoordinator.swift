@@ -1369,7 +1369,7 @@ final class SetupCoordinator: ObservableObject {
             return false
         }
         updateReadiness()
-        guard readiness.canEnableProtection else {
+        guard ownerTestPassed, readiness.canEnableProtection else {
             if currentError == nil {
                 currentError = "安全测试尚未全部通过，请修复未通过的项目后重试。"
             }
@@ -1537,25 +1537,12 @@ final class SetupCoordinator: ObservableObject {
         }
         try Task.checkCancellation()
         currentError = nil
+        refreshStaticOwnerProfileEvidence()
         await refreshPermissions()
         try rejectProtectionEnableDuringApplicationQuit()
         guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
             publishBlockedLegacyCleanupEffects()
             throw SetupCoordinatorError.notReady([.serviceHealth])
-        }
-        await probeRuntimeDiagnosis()
-        try rejectProtectionEnableDuringApplicationQuit()
-        guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
-            publishBlockedLegacyCleanupEffects()
-            throw SetupCoordinatorError.notReady([.serviceHealth])
-        }
-        if diagnosisPassed {
-            await verifyOwnerWithoutLockingInsidePermit()
-            try rejectProtectionEnableDuringApplicationQuit()
-            guard isLegacyCleanupAccessCurrent(cleanupGeneration) else {
-                publishBlockedLegacyCleanupEffects()
-                throw SetupCoordinatorError.notReady([.serviceHealth])
-            }
         }
         await refreshServiceHealthForEnable(
             expectedCleanupGeneration: cleanupGeneration
@@ -2113,6 +2100,8 @@ final class SetupCoordinator: ObservableObject {
         let missing = Set(missingChecks)
         if hasCompletedOnboarding {
             if missing.contains(.cameraPermission)
+                || missing.contains(.inputMonitoringPermission)
+                || missing.contains(.accessibilityPermission)
                 || missing.contains(.screenRecordingPermission) {
                 invalidateDurableOwnerEvidenceAfterPermissionRevocation()
                 recoveryStep = .permissions
@@ -2127,6 +2116,8 @@ final class SetupCoordinator: ObservableObject {
         }
         do {
             if missing.contains(.cameraPermission)
+                || missing.contains(.inputMonitoringPermission)
+                || missing.contains(.accessibilityPermission)
                 || missing.contains(.screenRecordingPermission) {
                 try persistStep(.permissions)
             } else if missing.contains(.ownerProfile) {
@@ -2143,7 +2134,9 @@ final class SetupCoordinator: ObservableObject {
         guard hasCompletedOnboarding else {
             return
         }
-        guard readiness.checks[.cameraPermission] == true else {
+        guard readiness.checks[.cameraPermission] == true,
+              readiness.checks[.inputMonitoringPermission] == true,
+              readiness.checks[.accessibilityPermission] == true else {
             invalidateDurableOwnerEvidenceAfterPermissionRevocation()
             recoveryStep = .permissions
             return

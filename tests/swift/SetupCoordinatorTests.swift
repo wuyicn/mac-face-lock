@@ -1116,6 +1116,7 @@ struct SetupCoordinatorTests {
         try await testReleaseDiagnosisInstallsAndUsesAgentOwnedServiceHealth()
         try await testPermissionStatusCompletionSkipsRuntimeAndLeavesProtectionDisabled()
         try await testPermissionStatusCompletionRejectsMissingOwnerProfile()
+        try await testCompatibilitySafetyTestRejectsFailedOwnerVerification()
         try await testPermissionBlockedSafetyTestStillBootstrapsReleaseAgent()
         try await testVisibleAppGrantsCannotOverrideUnhealthyAgentPermissions()
         try await testSourceModePreservesExistingServiceHealthBoundary()
@@ -1147,6 +1148,7 @@ struct SetupCoordinatorTests {
         try await testCompletedRecordDoesNotFabricateLiveRuntimeGates()
         try await testEnableProtectionReprobesRevokedPermissionAndFallsBack()
         try await testCompletedAuthorizationRefreshFallsBackAfterRevocation()
+        try await testCompletedAuthorizationRefreshFallsBackAfterAccessibilityRevocation()
         try await testCompletedInstallKeepsRecoverySurfaceWhenServiceIsUnhealthy()
         try await testCancelImmediateRetryWaitsForRuntimeCleanup()
         try await testServiceErrorsAreSanitizedBeforePublishing()
@@ -3888,56 +3890,58 @@ struct SetupCoordinatorTests {
     private static func testEnableProtectionReprobesRevokedPermissionAndFallsBack() async throws {
         let fixture = try CoordinatorFixture()
         defer { fixture.remove() }
-        try Data("owner".utf8).write(
-            to: fixture.environment.dataURL.appendingPathComponent("owner_face.npy")
-        )
         try fixture.setupStore.save(
             OnboardingRecord(
                 currentStep: .completion,
                 completedSteps: SetupStep.allCases,
                 completedAt: "2026-07-17T12:00:00Z",
-                appVersion: "test"
+                appVersion: "test",
+                ownerProfileFingerprint: "stable-owner",
+                requiresOwnerReverification: false
             )
         )
         _ = try fixture.localStore.writeControl(enabled: false)
         let provider = CoordinatorPermissionProvider()
         let runner = FakeRuntimeRunner()
-        runner.events[.diagnose] = [
-            event("diagnosis_check", check: "template"),
-            event("diagnosis_complete"),
-        ]
-        runner.events[.verifyOwner] = [
-            event("owner_verification_complete", decision: "owner"),
-        ]
+        let serviceManager = FakeServiceManager(state: .healthy)
         let coordinator = SetupCoordinator(
             environment: fixture.environment,
             permissionCenter: PermissionCenter(provider: provider),
             setupStore: fixture.setupStore,
             localStore: fixture.localStore,
             runtimeRunner: runner,
-            serviceManager: FakeServiceManager(state: .healthy),
-            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound)
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            ownerProfileInspector: FakeOwnerProfileInspector()
         )
         await coordinator.inspectLegacyInstall()
         await coordinator.refreshPermissions()
-        provider.cameraStatus = .denied
+        serviceManager.currentStatus = ServiceStatus(
+            state: .unhealthy,
+            pid: 42,
+            cameraReady: true,
+            inputMonitoringReady: false,
+            accessibilityReady: true,
+            installedProgram: nil,
+            expectedProgram: "/expected/MacFaceLockAgent"
+        )
 
         do {
             try await coordinator.enableProtection()
-            throw TestFailure.assertion("protection enabled after accessibility was revoked")
+            throw TestFailure.assertion("protection enabled after input monitoring was revoked")
         } catch is SetupCoordinatorError {
             // Expected.
         }
 
         try require(
-            coordinator.permissionStates[.camera] == .denied,
-            "final enable did not re-probe the revoked permission"
+            coordinator.checks[.inputMonitoringPermission] == false,
+            "final enable did not re-probe revoked input monitoring permission"
         )
         try require(
             coordinator.currentStep == .completion
                 && coordinator.hasCompletedOnboarding
                 && coordinator.recoveryStep == .permissions,
-            "permission revocation did not preserve completion with permission recovery"
+            "input revocation did not preserve completion with permission recovery"
         )
         try require(
             fixture.setupStore.record.completedAt == "2026-07-17T12:00:00Z"
@@ -3948,6 +3952,10 @@ struct SetupCoordinatorTests {
         try require(
             !fixture.localStore.readControl().protectionEnabled,
             "permission revocation did not keep protection disabled"
+        )
+        try require(
+            runner.commands.isEmpty,
+            "failed enable launched runtime security tests"
         )
     }
 
@@ -4030,6 +4038,56 @@ struct SetupCoordinatorTests {
                 && coordinator.hasCompletedOnboarding
                 && coordinator.recoveryStep == .permissions,
             "completion polling did not preserve completion with permission recovery"
+        )
+    }
+
+    private static func testCompletedAuthorizationRefreshFallsBackAfterAccessibilityRevocation()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try fixture.setupStore.save(
+            OnboardingRecord(
+                currentStep: .completion,
+                completedSteps: SetupStep.allCases,
+                completedAt: "2026-07-17T12:00:00Z",
+                appVersion: "test",
+                ownerProfileFingerprint: "stable-owner",
+                requiresOwnerReverification: false
+            )
+        )
+        let serviceManager = FakeServiceManager(state: .unhealthy)
+        serviceManager.currentStatus = ServiceStatus(
+            state: .unhealthy,
+            pid: 42,
+            cameraReady: true,
+            inputMonitoringReady: true,
+            accessibilityReady: false,
+            installedProgram: nil,
+            expectedProgram: "/expected/MacFaceLockAgent"
+        )
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+
+        await coordinator.inspectLegacyInstall()
+        await coordinator.refreshCurrentAuthorizationStatus()
+
+        try require(
+            coordinator.checks[.accessibilityPermission] == false,
+            "authorization refresh did not observe accessibility revocation"
+        )
+        try require(
+            coordinator.currentStep == .completion
+                && coordinator.hasCompletedOnboarding
+                && coordinator.recoveryStep == .permissions,
+            "accessibility revocation did not preserve completion with permission recovery"
         )
     }
 
@@ -5160,6 +5218,50 @@ struct SetupCoordinatorTests {
         try require(
             !fixture.localStore.readControl().protectionEnabled,
             "permission status completion enabled protection before explicit confirmation"
+        )
+
+        try await coordinator.enableProtection()
+
+        try require(
+            runner.commands.isEmpty,
+            "permission confirmation or protection enable launched runtime security tests"
+        )
+        try require(
+            fixture.localStore.readControl().protectionEnabled,
+            "ready permission-led onboarding did not enable protection after confirmation"
+        )
+    }
+
+    private static func testCompatibilitySafetyTestRejectsFailedOwnerVerification()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let runner = FakeRuntimeRunner()
+        runner.events[.diagnose] = [event("diagnosis_complete")]
+        runner.results[.verifyOwner] = RuntimeResult(
+            exitCode: 0,
+            events: [],
+            stderr: "",
+            stderrTruncated: false
+        )
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: FakeServiceManager(state: .healthy),
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+        await coordinator.inspectLegacyInstall()
+
+        let passed = await coordinator.runSafetyTest()
+
+        try require(!passed, "compatibility safety test passed without owner verification")
+        try require(
+            coordinator.checks[.ownerTest] == false,
+            "failed owner verification was not retained in compatibility test state"
         )
     }
 
