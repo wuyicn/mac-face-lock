@@ -1610,6 +1610,10 @@ final class SetupCoordinator: ObservableObject {
                 publishBlockedLegacyCleanupEffects()
                 return
             }
+            _ = try localStore.writeControl(enabled: false)
+            guard !localStore.readControl().protectionEnabled else {
+                throw SetupCoordinatorError.persistenceFailed
+            }
             try await serviceManager.restart()
             guard !rejectMutationDuringApplicationQuit() else {
                 return
@@ -1624,7 +1628,6 @@ final class SetupCoordinator: ObservableObject {
         } catch {
             recordDiagnosticError(error, operation: "restart_service")
             currentError = localizedRuntimeError(error)
-            _ = try? localStore.writeControl(enabled: false)
             serviceHealthy = false
         }
         updateReadiness()

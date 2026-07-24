@@ -1125,6 +1125,7 @@ struct SetupCoordinatorTests {
         try await testOperationalServiceRepairActionsUseServiceManager()
         try await testReleaseRelaunchRestoresMissingBackgroundService()
         try await testFailedServiceRestartDisablesProtection()
+        try await testUnhealthyServiceRestartDisablesProtection()
         try await testOperationalServiceUninstallPreservesDataAndDisablesProtection()
         try await testQuitStopFailureDisablesProtectionAndPreservesRecords()
         try await testApplicationQuitBlocksProtectionAndServiceMutations()
@@ -2732,6 +2733,36 @@ struct SetupCoordinatorTests {
         try require(
             !fixture.localStore.readControl().protectionEnabled,
             "failed service restart left protection enabled"
+        )
+    }
+
+    private static func testUnhealthyServiceRestartDisablesProtection()
+        async throws
+    {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let serviceManager = FakeServiceManager(state: .unhealthy)
+        _ = try fixture.localStore.writeControl(enabled: true)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound)
+        )
+
+        await coordinator.inspectLegacyInstall()
+        await coordinator.restartService()
+
+        try require(
+            serviceManager.restartCount == 1,
+            "unhealthy service restart was not attempted"
+        )
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "unhealthy service restart left protection enabled"
         )
     }
 
