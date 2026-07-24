@@ -842,6 +842,40 @@ final class SetupCoordinator: ObservableObject {
         updateCompletedRecoveryState()
     }
 
+    func restoreBackgroundServiceIfNeeded() async {
+        guard environment.mode == .release,
+              !rejectMutationDuringApplicationQuit() else {
+            return
+        }
+        await ensureLegacyInspectionCompleted()
+        guard let cleanupGeneration = legacyCleanupAccessGeneration,
+              let serviceManager,
+              await acquireServiceMutationPermit() else {
+            return
+        }
+        defer { releaseServiceMutationPermit() }
+        guard !rejectMutationDuringApplicationQuit(),
+              isLegacyCleanupAccessCurrent(cleanupGeneration) else {
+            return
+        }
+        let status = await serviceManager.status()
+        guard !rejectMutationDuringApplicationQuit(),
+              isLegacyCleanupAccessCurrent(cleanupGeneration) else {
+            return
+        }
+        switch status.state {
+        case .notInstalled, .needsRepair:
+            await installAndRefreshReleaseService(
+                expectedCleanupGeneration: cleanupGeneration
+            )
+        case .healthy, .unhealthy:
+            await refreshServiceHealthForEnable(
+                expectedCleanupGeneration: cleanupGeneration
+            )
+        }
+        updateReadiness()
+    }
+
     func refreshCurrentAuthorizationStatus() async {
         await ensureLegacyInspectionCompleted()
         refreshStaticOwnerProfileEvidence()
@@ -1590,6 +1624,7 @@ final class SetupCoordinator: ObservableObject {
         } catch {
             recordDiagnosticError(error, operation: "restart_service")
             currentError = localizedRuntimeError(error)
+            _ = try? localStore.writeControl(enabled: false)
             serviceHealthy = false
         }
         updateReadiness()

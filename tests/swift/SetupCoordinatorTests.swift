@@ -1123,6 +1123,8 @@ struct SetupCoordinatorTests {
         try await testRestoresSafeStepAndForwardsPermissionActions()
         try testUnsafePersistedStepFallsBackToLastSatisfiedGate()
         try await testOperationalServiceRepairActionsUseServiceManager()
+        try await testReleaseRelaunchRestoresMissingBackgroundService()
+        try await testFailedServiceRestartDisablesProtection()
         try await testOperationalServiceUninstallPreservesDataAndDisablesProtection()
         try await testQuitStopFailureDisablesProtectionAndPreservesRecords()
         try await testApplicationQuitBlocksProtectionAndServiceMutations()
@@ -2677,6 +2679,59 @@ struct SetupCoordinatorTests {
         try require(
             coordinator.checks[.serviceHealth] == true,
             "service repair actions did not refresh live readiness"
+        )
+    }
+
+    private static func testReleaseRelaunchRestoresMissingBackgroundService()
+        async throws
+    {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let serviceManager = FakeServiceManager(state: .notInstalled)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound)
+        )
+
+        await coordinator.restoreBackgroundServiceIfNeeded()
+
+        try require(
+            serviceManager.installs.count == 1,
+            "release relaunch did not restore the missing background service"
+        )
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "release relaunch enabled protection while restoring the service"
+        )
+    }
+
+    private static func testFailedServiceRestartDisablesProtection() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let serviceManager = FakeServiceManager(state: .healthy)
+        serviceManager.restartError = TestFailure.assertion("restart failed")
+        _ = try fixture.localStore.writeControl(enabled: true)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: FakeRuntimeRunner(),
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound)
+        )
+
+        await coordinator.inspectLegacyInstall()
+        await coordinator.restartService()
+
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "failed service restart left protection enabled"
         )
     }
 

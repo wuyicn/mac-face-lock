@@ -143,6 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if setupCoordinator.requiresLegacyCleanupAttention {
                 desktopWindowController.show()
             }
+            await setupCoordinator.restoreBackgroundServiceIfNeeded()
             await setupCoordinator.refreshLiveReadiness()
             faceLockStore.startPolling()
             statusMenuController.startRefreshing()
