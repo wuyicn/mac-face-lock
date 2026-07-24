@@ -373,13 +373,16 @@ final class SecureFileTree {
         at relativePath: String,
         temporaryName: String,
         maximumBytes: Int,
-        mode: mode_t
+        mode: mode_t,
+        beforeFinalPublish: (() throws -> Void)? = nil,
+        beforeFinalRemoval: (() throws -> Void)? = nil
     ) throws {
         switch snapshot {
         case .absent:
             try removeFileIfPresent(
                 relativePath,
-                maximumBytes: maximumBytes
+                maximumBytes: maximumBytes,
+                beforeFinalRemoval: beforeFinalRemoval
             )
         case .present(let data):
             try replaceFileAtomically(
@@ -388,7 +391,9 @@ final class SecureFileTree {
                 data: data,
                 maximumBytes: maximumBytes,
                 mode: mode,
-                requiredDestinationMode: nil
+                requiredDestinationMode: nil,
+                secureDestinationReplacement: true,
+                beforeFinalPublish: beforeFinalPublish
             )
         }
     }
@@ -527,7 +532,9 @@ final class SecureFileTree {
         maximumBytes: Int,
         mode: mode_t,
         requiredDestinationMode: mode_t?,
-        beforeRename: (() throws -> Void)? = nil
+        beforeRename: (() throws -> Void)? = nil,
+        secureDestinationReplacement: Bool = false,
+        beforeFinalPublish: (() throws -> Void)? = nil
     ) throws {
         let name = try validatedSingleComponent(relativePath)
         let temporary = try validatedSingleComponent(temporaryName)
@@ -624,10 +631,56 @@ final class SecureFileTree {
             throw SecureFileTreeError.identityChanged(rootPath)
         }
 
-        guard renameat(rootFD, temporary, rootFD, name) == 0 else {
-            throw SecureFileTreeError.systemCall("renameat", relativePath, errno)
+        let quarantined = secureDestinationReplacement
+            ? try quarantineFileForReplacement(
+                name: name,
+                path: relativePath,
+                expected: initialDestination,
+                maximumBytes: maximumBytes,
+                requiredMode: requiredDestinationMode,
+                beforeFinalPublish: beforeFinalPublish
+            )
+            : nil
+        var restoreQuarantineOnFailure = quarantined != nil
+        defer {
+            if restoreQuarantineOnFailure, let quarantined {
+                try? restoreFinalQuarantine(
+                    parentFD: rootFD,
+                    purgeName: quarantined.purgeName,
+                    originalName: name,
+                    path: relativePath
+                )
+            }
+        }
+
+        if secureDestinationReplacement {
+            guard renameatx_np(
+                rootFD,
+                temporary,
+                rootFD,
+                name,
+                UInt32(RENAME_EXCL)
+            ) == 0 else {
+                if errno == EEXIST {
+                    throw SecureFileTreeError.identityChanged(relativePath)
+                }
+                throw SecureFileTreeError.systemCall(
+                    "renameatx_np",
+                    relativePath,
+                    errno
+                )
+            }
+        } else {
+            guard renameat(rootFD, temporary, rootFD, name) == 0 else {
+                throw SecureFileTreeError.systemCall(
+                    "renameat",
+                    relativePath,
+                    errno
+                )
+            }
         }
         published = true
+        restoreQuarantineOnFailure = false
         guard fsync(rootFD) == 0 else {
             throw SecureFileTreeError.systemCall("fsync", rootPath, errno)
         }
@@ -673,6 +726,12 @@ final class SecureFileTree {
         )
         guard verified == data else {
             throw SecureFileTreeError.identityChanged(relativePath)
+        }
+        if let quarantined {
+            try removeQuarantinedFile(
+                quarantined,
+                path: relativePath
+            )
         }
     }
 
@@ -1499,7 +1558,8 @@ final class SecureFileTree {
 
     private func removeFileIfPresent(
         _ relativePath: String,
-        maximumBytes: Int
+        maximumBytes: Int,
+        beforeFinalRemoval: (() throws -> Void)? = nil
     ) throws {
         let name = try validatedSingleComponent(relativePath)
         guard maximumBytes >= 0 else {
@@ -1528,31 +1588,182 @@ final class SecureFileTree {
         ) == initial else {
             throw SecureFileTreeError.identityChanged(relativePath)
         }
-        let flags = SecureRemovalFlags.unlinkFlags(kind: .file)
-        guard unlinkat(rootFD, name, flags) == 0 else {
-            throw SecureFileTreeError.systemCall(
-                "unlinkat",
-                relativePath,
-                errno
-            )
-        }
-        guard fsync(rootFD) == 0 else {
-            throw SecureFileTreeError.systemCall("fsync", relativePath, errno)
-        }
-        var removed = stat()
-        guard fstatat(
-            rootFD,
-            name,
-            &removed,
-            AT_SYMLINK_NOFOLLOW
-        ) != 0, errno == ENOENT else {
-            throw SecureFileTreeError.identityChanged(relativePath)
-        }
+        let quarantine = try makeFileQuarantine(
+            path: relativePath,
+            fingerprint: initial
+        )
+        let finalBinding = try capturePathBinding(includeRootVersion: true)
+        try removeEntry(
+            parentFD: rootFD,
+            name: name,
+            entry: quarantine.entry,
+            beforeFinalRemoval: { _ in
+                try beforeFinalRemoval?()
+                guard try self.capturePathBinding(
+                    includeRootVersion: true
+                ) == finalBinding else {
+                    throw SecureFileTreeError.identityChanged(relativePath)
+                }
+            },
+            purge: quarantine.purge
+        )
         guard try capturePathBinding(includeRootVersion: false)
                 == bindingBefore else {
             throw SecureFileTreeError.identityChanged(relativePath)
         }
         try requireStableRoot()
+    }
+
+    private typealias FileQuarantine = (
+        entry: SecureTreeEntry,
+        purge: SecureTreePurge,
+        purgeName: String
+    )
+
+    private func makeFileQuarantine(
+        path: String,
+        fingerprint: SecureFileFingerprint,
+        purgeName requestedPurgeName: String? = nil
+    ) throws -> FileQuarantine {
+        let purgeName = requestedPurgeName
+            ?? ".mac-face-lock-purge-\(UUID().uuidString.lowercased())"
+        _ = try validatedSingleComponent(purgeName)
+        let entry = SecureTreeEntry(
+            relativePath: path,
+            identity: fingerprint.identity,
+            kind: .file,
+            fileVersion: fingerprint.version
+        )
+        return (
+            entry,
+            SecureTreePurge(
+                originalRelativePath: path,
+                tombstoneRelativePath: path,
+                purgeRelativePath: purgeName,
+                identity: fingerprint.identity,
+                kind: .file,
+                fileVersion: fingerprint.version
+            ),
+            purgeName
+        )
+    }
+
+    private func quarantineFileForReplacement(
+        name: String,
+        path: String,
+        expected: SecureFileFingerprint?,
+        maximumBytes: Int,
+        requiredMode: mode_t?,
+        beforeFinalPublish: (() throws -> Void)?
+    ) throws -> FileQuarantine? {
+        guard try fileFingerprintIfPresent(
+            name,
+            path: path,
+            maximumBytes: maximumBytes,
+            requiredMode: requiredMode
+        ) == expected else {
+            throw SecureFileTreeError.identityChanged(path)
+        }
+
+        let purgeName =
+            ".mac-face-lock-purge-\(UUID().uuidString.lowercased())"
+        _ = try validatedSingleComponent(purgeName)
+        let finalBinding = try capturePathBinding(includeRootVersion: true)
+        try beforeFinalPublish?()
+        guard try capturePathBinding(
+            includeRootVersion: true
+        ) == finalBinding else {
+            throw SecureFileTreeError.identityChanged(path)
+        }
+        guard renameatx_np(
+            rootFD,
+            name,
+            rootFD,
+            purgeName,
+            UInt32(RENAME_EXCL)
+        ) == 0 else {
+            if errno == ENOENT, expected == nil {
+                return nil
+            }
+            if errno == ENOENT {
+                throw SecureFileTreeError.identityChanged(path)
+            }
+            throw SecureFileTreeError.systemCall(
+                "renameatx_np",
+                path,
+                errno
+            )
+        }
+        guard fsync(rootFD) == 0 else {
+            let savedErrno = errno
+            _ = renameatx_np(
+                rootFD,
+                purgeName,
+                rootFD,
+                name,
+                UInt32(RENAME_EXCL)
+            )
+            throw SecureFileTreeError.systemCall("fsync", path, savedErrno)
+        }
+
+        guard let expected else {
+            try restoreFinalQuarantine(
+                parentFD: rootFD,
+                purgeName: purgeName,
+                originalName: name,
+                path: path
+            )
+            throw SecureFileTreeError.identityChanged(path)
+        }
+        let quarantine = try makeFileQuarantine(
+            path: path,
+            fingerprint: expected,
+            purgeName: purgeName
+        )
+        do {
+            var moved = stat()
+            guard fstatat(
+                rootFD,
+                purgeName,
+                &moved,
+                AT_SYMLINK_NOFOLLOW
+            ) == 0 else {
+                throw SecureFileTreeError.systemCall("fstatat", path, errno)
+            }
+            try validateMovedEntryStat(moved, entry: quarantine.entry)
+        } catch {
+            try restoreFinalQuarantine(
+                parentFD: rootFD,
+                purgeName: purgeName,
+                originalName: name,
+                path: path
+            )
+            throw error
+        }
+        return quarantine
+    }
+
+    private func removeQuarantinedFile(
+        _ quarantine: FileQuarantine,
+        path: String
+    ) throws {
+        var moved = stat()
+        guard fstatat(
+            rootFD,
+            quarantine.purgeName,
+            &moved,
+            AT_SYMLINK_NOFOLLOW
+        ) == 0 else {
+            throw SecureFileTreeError.systemCall("fstatat", path, errno)
+        }
+        try validateMovedEntryStat(moved, entry: quarantine.entry)
+        let flags = SecureRemovalFlags.unlinkFlags(kind: .file)
+        guard unlinkat(rootFD, quarantine.purgeName, flags) == 0 else {
+            throw SecureFileTreeError.systemCall("unlinkat", path, errno)
+        }
+        guard fsync(rootFD) == 0 else {
+            throw SecureFileTreeError.systemCall("fsync", path, errno)
+        }
     }
 
     private func readAll(

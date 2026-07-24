@@ -94,6 +94,8 @@ struct SecureFileTreeTests {
         try testDescriptorBoundReadRejectsABASwap()
         try testFileSnapshotRoundTripRestoresPresentAndAbsentStates()
         try testFileSnapshotRestoreRejectsUnsafeCurrentEntry()
+        try testPresentSnapshotRejectsLastWindowReplacement()
+        try testAbsentSnapshotRejectsLastWindowReplacement()
         try testRootPathReplacementBlocksRemoval()
         try testRootIdentityMismatchBlocksRemoval()
         print("Secure file tree tests passed")
@@ -1267,6 +1269,78 @@ struct SecureFileTreeTests {
             try require(
                 outsideContents == "outside-owner",
                 "snapshot restore changed the symlink destination"
+            )
+        }
+    }
+
+    private static func testPresentSnapshotRejectsLastWindowReplacement() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        let owner = fixture.root.appendingPathComponent("owner_face.npy")
+        let attacker = Data("last-window-attacker".utf8)
+        try Data("stable-owner".utf8).write(to: owner)
+        let tree = try makeTree(fixture)
+        let snapshot = try tree.captureFileSnapshot(
+            "owner_face.npy",
+            maximumBytes: 64 * 1_024
+        )
+
+        do {
+            try tree.restoreFileSnapshot(
+                snapshot,
+                at: "owner_face.npy",
+                temporaryName: ".owner.last-window.tmp",
+                maximumBytes: 64 * 1_024,
+                mode: 0o600,
+                beforeFinalPublish: {
+                    try FileManager.default.removeItem(at: owner)
+                    try attacker.write(to: owner)
+                }
+            )
+            throw TestFailure.assertion(
+                "present snapshot overwrote a last-window replacement"
+            )
+        } catch SecureFileTreeError.identityChanged("owner_face.npy") {
+            let retained = try Data(contentsOf: owner)
+            try require(
+                retained == attacker,
+                "present snapshot did not preserve the last-window replacement"
+            )
+        }
+    }
+
+    private static func testAbsentSnapshotRejectsLastWindowReplacement() throws {
+        let fixture = try SecureTreeFixture()
+        defer { fixture.remove() }
+        let owner = fixture.root.appendingPathComponent("owner_face.npy")
+        let attacker = Data("last-window-attacker".utf8)
+        try Data("candidate-owner".utf8).write(to: owner)
+        let tree = try makeTree(fixture)
+        let snapshot = try tree.captureFileSnapshot(
+            "missing-owner.npy",
+            maximumBytes: 64 * 1_024
+        )
+
+        do {
+            try tree.restoreFileSnapshot(
+                snapshot,
+                at: "owner_face.npy",
+                temporaryName: ".owner.absent-last-window.tmp",
+                maximumBytes: 64 * 1_024,
+                mode: 0o600,
+                beforeFinalRemoval: {
+                    try FileManager.default.removeItem(at: owner)
+                    try attacker.write(to: owner)
+                }
+            )
+            throw TestFailure.assertion(
+                "absent snapshot deleted a last-window replacement"
+            )
+        } catch SecureFileTreeError.identityChanged("owner_face.npy") {
+            let retained = try Data(contentsOf: owner)
+            try require(
+                retained == attacker,
+                "absent snapshot did not preserve the last-window replacement"
             )
         }
     }
