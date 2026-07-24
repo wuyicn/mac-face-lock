@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Work only in `/Users/wuyi-macs/.openclaw/workspace/projects/mac-face-lock-agent/.worktrees/codex-self-contained-onboarding` on branch `codex/self-contained-onboarding`.
+- Work only in the isolated repository worktree on branch `codex/self-contained-onboarding`.
 - Preserve the single visible `Mac Face Lock` identity for camera, Input Monitoring, Accessibility, onboarding, protection, and recovery.
 - Do not reintroduce `Mac FaceLockRuntime`, a separately visible Agent permission identity, or a user-facing Safety Test.
 - Never write `protection_enabled=true` until the current owner profile and required permissions are valid and the current service status is healthy.
