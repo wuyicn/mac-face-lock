@@ -433,8 +433,10 @@ struct ServiceManagerTests {
     static func main() async throws {
         try await testLegacyRecognitionRejectsIntegerBooleanConfusion()
         try await testStatusRejectsDuplicatePlistKeysBeforeDictionaryCoercion()
+        try await testStatusRejectsCDATAEncodedDuplicatePlistKey()
         try await testStatusAcceptsBinaryPlistWithoutDetectableXMLStructure()
         try await testLegacyDuplicateKeysBlockBeforeMutation()
+        try await testLegacyCDATAEncodedDuplicateKeyBlocksBeforeMutation()
         try await testStatusRequiresCompleteRenderedBackgroundPlist()
         try await testResponsiveCurrentServiceCannotBypassUnknownLegacy()
         try await testResponsiveCurrentServiceCleansRecognizedLegacy()
@@ -731,6 +733,114 @@ struct ServiceManagerTests {
                 "duplicate (name) legacy key wrote background plist"
             )
         }
+    }
+
+    private static func testStatusRejectsCDATAEncodedDuplicatePlistKey()
+        async throws
+    {
+        let fixture = try ServiceFixture(loaded: true, printPIDs: [42])
+        let rendered = try renderTemplate(
+            try ServiceFixture.backgroundTemplateData(),
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        let argumentsXML = "<array>"
+            + [
+                fixture.appURL.appendingPathComponent(
+                    "Contents/MacOS/MacFaceLock"
+                ).path,
+                "--internal-runtime",
+                "--resources-dir",
+                fixture.appURL.appendingPathComponent(
+                    "Contents/Resources"
+                ).path,
+                "--support-dir",
+                fixture.supportURL.path,
+                "agent",
+            ].map { "<string>\($0)</string>" }.joined()
+            + "</array>"
+        fixture.fileSystem.seed(
+            try plistDataWithCDATAKeyBeforeExistingEntry(
+                rendered,
+                key: "ProgramArguments",
+                valueXML: argumentsXML
+            ),
+            at: fixture.backgroundPlistURL
+        )
+        try fixture.seedHealthyState()
+
+        let status = await fixture.manager().status()
+
+        try require(
+            status.state == .needsRepair,
+            "status accepted CDATA-encoded duplicate plist key"
+        )
+        try require(
+            fixture.runner.calls.isEmpty,
+            "CDATA-encoded duplicate key reached launchctl before rejection"
+        )
+    }
+
+    private static func testLegacyCDATAEncodedDuplicateKeyBlocksBeforeMutation()
+        async throws
+    {
+        let fixture = try ServiceFixture(printPIDs: [99, 42, 42, 42])
+        let rendered = try renderTemplate(
+            try ServiceFixture.legacyReleaseTemplateData(),
+            appURL: fixture.appURL,
+            supportURL: fixture.supportURL
+        )
+        let argumentsXML = "<array>"
+            + [
+                fixture.appURL.appendingPathComponent(
+                    "Contents/Library/LoginItems/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent"
+                ).path,
+                "--resources-dir",
+                fixture.appURL.appendingPathComponent(
+                    "Contents/Resources"
+                ).path,
+                "--support-dir",
+                fixture.supportURL.path,
+                "agent",
+            ].map { "<string>\($0)</string>" }.joined()
+            + "</array>"
+        let duplicateData = try plistDataWithCDATAKeyBeforeExistingEntry(
+            rendered,
+            key: "ProgramArguments",
+            valueXML: argumentsXML
+        )
+        fixture.fileSystem.seed(duplicateData, at: fixture.legacyPlistURL)
+
+        do {
+            try await fixture.manager().install(
+                appURL: fixture.appURL,
+                supportURL: fixture.supportURL
+            )
+            throw TestFailure.assertion(
+                "CDATA-encoded duplicate legacy key did not block migration"
+            )
+        } catch ServiceManagerError.invalidTemplate {
+            // Expected.
+        }
+
+        let retainedLegacyData = try fixture.fileSystem.readData(
+            at: fixture.legacyPlistURL
+        )
+        try require(
+            retainedLegacyData == duplicateData,
+            "CDATA-encoded duplicate legacy key changed plist bytes"
+        )
+        try require(
+            fixture.runner.calls.allSatisfy {
+                !["bootout", "bootstrap", "enable", "kickstart"]
+                    .contains($0.arguments.first)
+            },
+            "CDATA-encoded duplicate legacy key mutated launchd"
+        )
+        try require(
+            !fixture.fileSystem.fileExists(at: fixture.backgroundPlistURL),
+            "CDATA-encoded duplicate legacy key wrote background plist"
+        )
     }
 
     private static func testStatusAcceptsBinaryPlistWithoutDetectableXMLStructure()
@@ -2089,6 +2199,25 @@ struct ServiceManagerTests {
         )
         guard let duplicateData = xml.data(using: .utf8) else {
             throw TestFailure.assertion("duplicate-key fixture was not UTF-8")
+        }
+        return duplicateData
+    }
+
+    private static func plistDataWithCDATAKeyBeforeExistingEntry(
+        _ data: Data,
+        key: String,
+        valueXML: String
+    ) throws -> Data {
+        guard var xml = String(data: data, encoding: .utf8),
+              let openingDictionary = xml.range(of: "<dict>") else {
+            throw TestFailure.assertion("plist was not XML for CDATA-key fixture")
+        }
+        xml.insert(
+            contentsOf: "<key><![CDATA[\(key)]]></key>\(valueXML)",
+            at: openingDictionary.upperBound
+        )
+        guard let duplicateData = xml.data(using: .utf8) else {
+            throw TestFailure.assertion("CDATA-key fixture was not UTF-8")
         }
         return duplicateData
     }

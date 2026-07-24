@@ -1095,6 +1095,18 @@ private final class XMLPlistDuplicateKeyDetector: NSObject, XMLParserDelegate {
         elements[elements.count - 1].keyText?.append(string)
     }
 
+    func parser(_ parser: XMLParser, foundCDATA CDATABlock: Data) {
+        guard elements.last?.name == "key" else {
+            return
+        }
+        guard let text = String(data: CDATABlock, encoding: .utf8) else {
+            hasDuplicateDictionaryKey = true
+            parser.abortParsing()
+            return
+        }
+        elements[elements.count - 1].keyText?.append(text)
+    }
+
     func parser(
         _ parser: XMLParser,
         didEndElement elementName: String,

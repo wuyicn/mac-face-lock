@@ -181,3 +181,44 @@ behavior remain in force. If a post-publication durability or verification
 system call fails, the function reports failure and does not risk overwriting a
 new public-path entrant; an already isolated old file may remain under its
 unpredictable quarantine name for forensic recovery.
+
+## XML plist CDATA duplicate-key follow-up (2026-07-24)
+
+**Status:** Scoped implementation complete; release, live app, launchctl, TCC,
+Settings, user data, and protection state were not touched.
+
+### Root cause and fix
+
+`XMLPlistDuplicateKeyDetector` accumulated ordinary character callbacks for
+`<key>` content but did not accumulate `foundCDATA`. Foundation can route CDATA
+to that separate delegate callback once it is implemented, so a CDATA-encoded
+key could otherwise be represented as an empty detector key and miss the later
+ordinary duplicate before Foundation coerces the plist dictionary.
+
+The detector now appends UTF-8 CDATA text only while its current element is a
+key. An undecodable CDATA key fails closed by marking the raw plist invalid and
+aborting parsing. Binary plists retain the existing fallback behavior, and the
+recursive exact/type-safe comparison is unchanged.
+
+### TDD and verification evidence
+
+- RED: current-service CDATA-before-normal `ProgramArguments` regression failed
+  with `status accepted CDATA-encoded duplicate plist key` after registering
+  the independent CDATA delegate path with no accumulated content.
+- GREEN: the focused ServiceManager command passed after the minimal CDATA
+  append/fail-closed implementation. It includes current status rejection and
+  legacy migration rejection that preserves exact legacy bytes, writes no
+  background plist, and makes no launchctl mutation.
+- `tests.test_legacy_cleanup_policy`: 12 tests, OK.
+- Whole-app Swift typecheck: exit 0; only the pre-existing macOS 14
+  `OnboardingView.onChange` deprecation warning remains.
+
+### Full Python-suite environment note
+
+The requested system-Python invocation could not load the full suite:
+`python3 -m unittest discover -s tests -p 'test_*.py' -v` stops while importing
+`tests.test_agent_control` because `face_verifier.py` raises
+`ModuleNotFoundError: No module named 'numpy'`. The project `.venv` contains
+NumPy 1.26.4, but its attempted full-suite invocation did not emit a complete
+unittest footer in this command runner. No unrelated Python dependency or test
+code was changed, and this is not recorded as a full-suite pass.
