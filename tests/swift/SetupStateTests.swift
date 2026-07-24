@@ -79,7 +79,7 @@ struct SetupStateTests {
             )
         }
 
-        let booleanGates: [(SetupCheck, SetupReadiness)] = [
+        let requiredBooleanGates: [(SetupCheck, SetupReadiness)] = [
             (
                 .ownerProfile,
                 SetupReadiness.evaluate(
@@ -87,26 +87,6 @@ struct SetupStateTests {
                     ownerProfileValid: false,
                     diagnosisPassed: true,
                     ownerTestPassed: true,
-                    serviceHealthy: true
-                )
-            ),
-            (
-                .diagnosis,
-                SetupReadiness.evaluate(
-                    permissions: grantedPermissions,
-                    ownerProfileValid: true,
-                    diagnosisPassed: false,
-                    ownerTestPassed: true,
-                    serviceHealthy: true
-                )
-            ),
-            (
-                .ownerTest,
-                SetupReadiness.evaluate(
-                    permissions: grantedPermissions,
-                    ownerProfileValid: true,
-                    diagnosisPassed: true,
-                    ownerTestPassed: false,
                     serviceHealthy: true
                 )
             ),
@@ -121,7 +101,7 @@ struct SetupStateTests {
                 )
             ),
         ]
-        for (check, readiness) in booleanGates {
+        for (check, readiness) in requiredBooleanGates {
             try require(
                 !readiness.canEnableProtection,
                 "failed \(check.rawValue) must block protection"
@@ -131,6 +111,33 @@ struct SetupStateTests {
                 "failed \(check.rawValue) was not exposed in readiness checks"
             )
         }
+
+        let diagnosticFailures = SetupReadiness.evaluate(
+            permissions: grantedPermissions,
+            ownerProfileValid: true,
+            diagnosisPassed: false,
+            ownerTestPassed: false,
+            serviceHealthy: true
+        )
+        try require(
+            diagnosticFailures.canEnableProtection,
+            "diagnosis and owner test must remain observable without blocking permission readiness"
+        )
+        try require(
+            diagnosticFailures.checks[.diagnosis] == false
+                && diagnosticFailures.checks[.ownerTest] == false,
+            "diagnostic failures were not retained as observable checks"
+        )
+        try require(
+            diagnosticFailures.requiredChecks == [
+                .cameraPermission,
+                .inputMonitoringPermission,
+                .accessibilityPermission,
+                .ownerProfile,
+                .serviceHealth,
+            ],
+            "permission readiness contains obsolete or missing required checks"
+        )
     }
 
     private static func testScreenRecordingTracksScreenshotEvidencePolicy() throws {

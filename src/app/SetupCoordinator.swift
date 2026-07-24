@@ -1391,6 +1391,54 @@ final class SetupCoordinator: ObservableObject {
         }
     }
 
+    @discardableResult
+    func completePermissionStatusStep() async -> Bool {
+        guard !rejectMutationDuringApplicationQuit() else {
+            return false
+        }
+        do {
+            _ = try localStore.writeControl(enabled: false)
+        } catch {
+            currentError = "无法保持保护关闭，请检查应用支持目录权限后重试。"
+            return false
+        }
+        await ensureLegacyInspectionCompleted()
+        guard !rejectMutationDuringApplicationQuit(),
+              guardLegacyCleanupGate() else {
+            return false
+        }
+
+        refreshStaticOwnerProfileEvidence()
+        await refreshPermissions()
+        await refreshServiceHealthForEnable()
+        updateReadiness()
+
+        let missingChecks = readiness.requiredChecks
+            .filter { readiness.checks[$0] != true }
+            .sorted { $0.rawValue < $1.rawValue }
+        guard ownerProfileValid, missingChecks.isEmpty else {
+            currentError = SetupCoordinatorError
+                .notReady(missingChecks)
+                .localizedDescription
+            return false
+        }
+
+        do {
+            runtimeValidationRequired = false
+            recoveryStep = nil
+            if hasCompletedOnboarding {
+                try persistCompletedEvidencePreservingHistory()
+            } else {
+                try persistStep(.completion, completing: .safetyTest)
+            }
+            currentError = nil
+            return true
+        } catch {
+            currentError = "无法保存权限确认结果，请检查应用支持目录权限后重试。"
+            return false
+        }
+    }
+
     func verifyOwnerWithoutLocking() async {
         guard !rejectMutationDuringApplicationQuit() else {
             return

@@ -154,8 +154,6 @@ struct SetupReadiness: Equatable {
             .inputMonitoringPermission,
             .accessibilityPermission,
             .ownerProfile,
-            .diagnosis,
-            .ownerTest,
             .serviceHealth,
         ]
         if screenshotEvidenceEnabled {

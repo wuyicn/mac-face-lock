@@ -1114,6 +1114,8 @@ struct SetupCoordinatorTests {
         try await testSuccessfulEnrollmentClearsActiveEnrollmentRefusal()
         try await testVerificationCannotPassAfterEnrollmentReplacesProfile()
         try await testReleaseDiagnosisInstallsAndUsesAgentOwnedServiceHealth()
+        try await testPermissionStatusCompletionSkipsRuntimeAndLeavesProtectionDisabled()
+        try await testPermissionStatusCompletionRejectsMissingOwnerProfile()
         try await testPermissionBlockedSafetyTestStillBootstrapsReleaseAgent()
         try await testVisibleAppGrantsCannotOverrideUnhealthyAgentPermissions()
         try await testSourceModePreservesExistingServiceHealthBoundary()
@@ -5095,6 +5097,119 @@ struct SetupCoordinatorTests {
                 && coordinator.checks[.serviceHealth] == false
                 && !coordinator.readiness.canEnableProtection,
             "permission-blocked bootstrap relaxed a protection-readiness gate"
+        )
+    }
+
+    private static func testPermissionStatusCompletionSkipsRuntimeAndLeavesProtectionDisabled()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        try fixture.setupStore.save(
+            OnboardingRecord(
+                currentStep: .safetyTest,
+                completedSteps: [.preparation, .permissions, .enrollment],
+                completedAt: nil,
+                appVersion: "0.1.0-beta",
+                ownerProfileFingerprint: "stable-owner",
+                requiresOwnerReverification: true
+            )
+        )
+        let runner = FakeRuntimeRunner()
+        let serviceManager = FakeServiceManager(state: .healthy)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            ownerProfileInspector: FakeOwnerProfileInspector()
+        )
+        await coordinator.inspectLegacyInstall()
+        _ = try fixture.localStore.writeControl(enabled: true)
+
+        let completed = await coordinator.completePermissionStatusStep()
+
+        try require(completed, "ready permission status did not complete the setup step")
+        try require(
+            runner.commands.isEmpty,
+            "permission status completion launched a diagnosis or owner-test runtime"
+        )
+        try require(
+            serviceManager.statusChecks == 1,
+            "permission status completion did not refresh current service state"
+        )
+        try require(
+            coordinator.checks[.diagnosis] == false
+                && coordinator.checks[.ownerTest] == false
+                && coordinator.readiness.canEnableProtection,
+            "non-blocking diagnostic state prevented permission status completion"
+        )
+        try require(
+            coordinator.currentStep == .completion
+                && fixture.setupStore.record.currentStep == .completion
+                && fixture.setupStore.record.completedSteps.contains(.safetyTest),
+            "permission status completion did not preserve the existing onboarding record shape"
+        )
+        try require(
+            !fixture.setupStore.record.isComplete
+                && fixture.setupStore.record.completedAt == nil,
+            "permission status completion prematurely finalized onboarding"
+        )
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "permission status completion enabled protection before explicit confirmation"
+        )
+    }
+
+    private static func testPermissionStatusCompletionRejectsMissingOwnerProfile()
+        async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.remove() }
+        let originalRecord = OnboardingRecord(
+            currentStep: .safetyTest,
+            completedSteps: [.preparation, .permissions, .enrollment],
+            completedAt: nil,
+            appVersion: "0.1.0-beta",
+            ownerProfileFingerprint: nil,
+            requiresOwnerReverification: true
+        )
+        try fixture.setupStore.save(originalRecord)
+        let runner = FakeRuntimeRunner()
+        let serviceManager = FakeServiceManager(state: .healthy)
+        let coordinator = SetupCoordinator(
+            environment: fixture.environment,
+            permissionCenter: PermissionCenter(provider: CoordinatorPermissionProvider()),
+            setupStore: fixture.setupStore,
+            localStore: fixture.localStore,
+            runtimeRunner: runner,
+            serviceManager: serviceManager,
+            legacyInstallCleaner: FakeLegacyInstallCleaner(inspection: .notFound),
+            ownerProfileInspector: FakeOwnerProfileInspector(valid: false)
+        )
+        await coordinator.inspectLegacyInstall()
+        let recordBeforeCompletion = fixture.setupStore.record
+        _ = try fixture.localStore.writeControl(enabled: true)
+
+        let completed = await coordinator.completePermissionStatusStep()
+
+        try require(!completed, "missing owner profile completed the permission status step")
+        try require(
+            fixture.setupStore.record == recordBeforeCompletion,
+            "failed permission status completion changed onboarding history"
+        )
+        try require(
+            serviceManager.statusChecks == 1 && runner.commands.isEmpty,
+            "failed permission status completion skipped refresh or launched runtime work"
+        )
+        try require(
+            coordinator.currentError != nil,
+            "failed permission status completion did not publish a recovery message"
+        )
+        try require(
+            !fixture.localStore.readControl().protectionEnabled,
+            "failed permission status completion left protection enabled"
         )
     }
 
