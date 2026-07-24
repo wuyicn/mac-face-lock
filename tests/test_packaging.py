@@ -503,7 +503,7 @@ class UnifiedPackagingTests(unittest.TestCase):
             "准备检查",
             "权限中心",
             "录入本人",
-            "安全测试",
+            "权限确认",
             "完成并开启",
         ):
             with self.subTest(onboarding_step=label):
@@ -608,40 +608,53 @@ class UnifiedPackagingTests(unittest.TestCase):
         local_store_source = (PROJECT_DIR / "src/app/LocalJSONStore.swift").read_text()
         self.assertIn("init(resourcesURL: URL, dataURL: URL)", local_store_source)
 
-    def test_safety_test_click_diagnostic_markers_are_wired(self) -> None:
-        delegate = (PROJECT_DIR / "src/app/AppDelegate.swift").read_text()
-        window_controller = (
-            PROJECT_DIR / "src/app/DesktopWindowController.swift"
-        ).read_text()
+    def test_permission_confirmation_uses_live_status_without_security_test_action(
+        self,
+    ) -> None:
         onboarding = (PROJECT_DIR / "src/app/OnboardingView.swift").read_text()
+        settings = (PROJECT_DIR / "src/app/SettingsView.swift").read_text()
 
-        self.assertIn("LocalMouseEventMonitor(", delegate)
-        self.assertIn("localMouseMonitor?.start()", delegate)
-        self.assertIn("localMouseMonitor?.stop()", delegate)
-        self.assertIn(".appActivation", delegate)
-        self.assertIn(".desktopWindowShow(", window_controller)
+        step_start = onboarding.index("    private var permissionStatusStep")
+        step_end = onboarding.index(
+            "    private var completionStep",
+            step_start,
+        )
+        permission_step = onboarding[step_start:step_end]
 
-        ordered_markers = (
-            ".securityTestActionEntered",
-            '.working("正在执行不锁屏安全测试…")',
-            ".securityTestWorkingStateAssigned",
-            ".securityTestCoordinatorBefore",
-            "await setupCoordinator.runSafetyTest()",
-            ".securityTestCoordinatorAfter(",
-        )
-        button_start = onboarding.index('Button("运行安全测试")')
-        button_end = onboarding.index(".buttonStyle(.borderedProminent)", button_start)
-        safety_test_button = onboarding[button_start:button_end]
-        offsets = [safety_test_button.find(marker) for marker in ordered_markers]
-        self.assertTrue(
-            all(offset >= 0 for offset in offsets),
-            f"missing safety-test diagnostic marker: {dict(zip(ordered_markers, offsets))}",
-        )
-        self.assertEqual(
-            offsets,
-            sorted(offsets),
-            "safety-test diagnostic markers are not ordered around the action boundary",
-        )
+        for token in (
+            'title: "权限确认"',
+            'readinessRow(.ownerProfile, title: "本人人脸资料")',
+            'readinessRow(.serviceHealth, title: "后台服务")',
+            'agentPermissionRow(.camera, title: "Mac Face Lock 摄像头")',
+            'agentPermissionRow(.inputMonitoring, title: "Mac Face Lock 输入监控")',
+            'agentPermissionRow(.accessibility, title: "Mac Face Lock 辅助功能")',
+            'Button("确认权限并继续")',
+            "await setupCoordinator.completePermissionStatusStep()",
+        ):
+            with self.subTest(permission_status_token=token):
+                self.assertIn(token, permission_step)
+
+        self.assertEqual(permission_step.count("agentPermissionRow("), 3)
+        for retired_token in (
+            ".diagnosis",
+            ".ownerTest",
+            "runSafetyTest",
+            "安全测试",
+        ):
+            with self.subTest(retired_permission_status_token=retired_token):
+                self.assertNotIn(retired_token, permission_step)
+
+        for retired_copy in (
+            'Button("运行安全测试")',
+            'Button("重新运行安全测试")',
+            "请重新完成安全测试",
+            "请重新运行安全测试",
+        ):
+            with self.subTest(retired_security_test_action=retired_copy):
+                self.assertNotIn(retired_copy, onboarding + settings)
+
+        self.assertIn('Button("刷新权限与运行状态")', settings)
+        self.assertIn("await setupCoordinator.refreshLiveReadiness()", settings)
 
     def test_onboarding_action_feedback_resets_only_on_real_step_changes(
         self,

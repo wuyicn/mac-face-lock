@@ -26,15 +26,16 @@ struct SettingsView: View {
                         .foregroundStyle(Color(nsColor: .systemOrange))
 
                         if setupCoordinator.recoveryStep == .safetyTest {
-                            Button("重新运行安全测试") {
-                                protectionAction = .working("正在重新确认当前安全状态…")
+                            Button("刷新权限与运行状态") {
+                                protectionAction = .working("正在刷新权限与运行状态…")
                                 Task {
-                                    if await setupCoordinator.runSafetyTest() {
-                                        protectionAction = .success("当前安全状态已重新确认")
+                                    await setupCoordinator.refreshLiveReadiness()
+                                    if setupCoordinator.isLiveReady {
+                                        protectionAction = .success("权限与运行状态已刷新")
                                     } else {
                                         protectionAction = .failure(
                                             setupCoordinator.currentError
-                                                ?? "安全测试未全部通过"
+                                                ?? "必要权限或后台服务尚未就绪"
                                         )
                                     }
                                 }
@@ -151,7 +152,7 @@ struct SettingsView: View {
                     Task {
                         await setupCoordinator.startEnrollment()
                         if setupCoordinator.currentStep == .safetyTest {
-                            enrollmentAction = .success("新资料已保存，请重新完成安全测试")
+                            enrollmentAction = .success("新资料已保存，请确认权限状态")
                         } else {
                             enrollmentAction = .failure(
                                 setupCoordinator.currentError ?? "重新录入未完成"
@@ -409,7 +410,7 @@ struct SettingsView: View {
         case .enrollment:
             return "首次设置记录仍然保留，但当前本人模板无效，请重新录入本人。"
         case .safetyTest:
-            return "首次设置记录仍然保留。请重新运行安全测试确认本人和当前环境。"
+            return "首次设置记录仍然保留。请确认三项必要权限和后台服务状态。"
         case .completion:
             return "首次设置记录仍然保留。后台服务需要诊断或修复。"
         case .preparation, .none:

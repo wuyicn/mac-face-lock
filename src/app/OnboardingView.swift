@@ -38,7 +38,7 @@ struct OnboardingView: View {
         (.preparation, "准备检查", "checklist"),
         (.permissions, "权限中心", "hand.raised"),
         (.enrollment, "录入本人", "faceid"),
-        (.safetyTest, "安全测试", "shield.checkered"),
+        (.safetyTest, "权限确认", "checkmark.shield"),
         (.completion, "完成并开启", "checkmark.shield"),
     ]
 
@@ -110,6 +110,11 @@ struct OnboardingView: View {
             if setupCoordinator.currentStep == .permissions {
                 while !Task.isCancelled {
                     await setupCoordinator.refreshPermissions()
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                }
+            } else if setupCoordinator.currentStep == .safetyTest {
+                while !Task.isCancelled {
+                    await setupCoordinator.refreshCurrentAuthorizationStatus()
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                 }
             } else if setupCoordinator.currentStep == .completion {
@@ -189,7 +194,7 @@ struct OnboardingView: View {
         case .enrollment:
             enrollmentStep
         case .safetyTest:
-            safetyTestStep
+            permissionStatusStep
         case .completion:
             completionStep
         }
@@ -305,7 +310,7 @@ struct OnboardingView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("清理完成后，需要重新授权、录入本人并完成安全测试。")
+            Text("清理完成后，需要重新授权、录入本人并确认权限状态。")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             if let message = setupCoordinator.currentError {
@@ -332,7 +337,7 @@ struct OnboardingView: View {
     private var permissionsStep: some View {
         OnboardingCard(
             title: "权限中心",
-            subtitle: "检查 Mac Face Lock 的三项必要权限；后台状态会在安全测试中确认。",
+            subtitle: "检查 Mac Face Lock 的三项必要权限；完成录入后会再次确认权限与后台状态。",
             symbol: "hand.raised"
         ) {
             Text("Mac Face Lock 权限")
@@ -459,17 +464,15 @@ struct OnboardingView: View {
         }
     }
 
-    private var safetyTestStep: some View {
+    private var permissionStatusStep: some View {
         OnboardingCard(
-            title: "安全测试",
-            subtitle: "验证后台服务、摄像头、本人资料与实际权限；测试不会触发锁屏。",
-            symbol: "shield.checkered"
+            title: "权限确认",
+            subtitle: "确认本人资料、后台服务和三项必要权限均已就绪。",
+            symbol: "checkmark.shield"
         ) {
             VStack(alignment: .leading, spacing: 12) {
-                readinessRow(.diagnosis, title: "运行组件与数据目录")
                 readinessRow(.ownerProfile, title: "本人人脸资料")
-                readinessRow(.ownerTest, title: "本人验证（不锁屏）")
-                readinessRow(.serviceHealth, title: "后台服务与实际权限")
+                readinessRow(.serviceHealth, title: "后台服务")
             }
 
             VStack(alignment: .leading, spacing: 10) {
@@ -485,25 +488,15 @@ struct OnboardingView: View {
             HStack {
                 backButton
                 Spacer()
-                Button("运行安全测试") {
-                    UIEventTraceRecorder.shared.record(.securityTestActionEntered)
-                    actionState = .working("正在执行不锁屏安全测试…")
-                    UIEventTraceRecorder.shared.record(
-                        .securityTestWorkingStateAssigned
-                    )
+                Button("确认权限并继续") {
+                    actionState = .working("正在刷新权限与运行状态…")
                     Task {
-                        UIEventTraceRecorder.shared.record(
-                            .securityTestCoordinatorBefore
-                        )
-                        let passed = await setupCoordinator.runSafetyTest()
-                        UIEventTraceRecorder.shared.record(
-                            .securityTestCoordinatorAfter(passed: passed)
-                        )
-                        if passed {
-                            actionState = .success("所有安全测试已通过")
+                        if await setupCoordinator.completePermissionStatusStep() {
+                            actionState = .success("权限状态已确认")
                         } else {
                             actionState = .failure(
-                                setupCoordinator.currentError ?? "安全测试未全部通过"
+                                setupCoordinator.currentError
+                                    ?? "必要权限或运行状态尚未就绪"
                             )
                         }
                     }
@@ -525,7 +518,6 @@ struct OnboardingView: View {
                 readinessRow(.inputMonitoringPermission, title: "Mac Face Lock 输入监控")
                 readinessRow(.accessibilityPermission, title: "Mac Face Lock 辅助功能")
                 readinessRow(.ownerProfile, title: "本人资料")
-                readinessRow(.ownerTest, title: "本人安全测试")
                 readinessRow(.serviceHealth, title: "后台服务")
             }
 
@@ -708,8 +700,9 @@ struct OnboardingView: View {
     }
 
     private func updatePermissionPolling(for step: SetupStep) {
-        setupCoordinator.setPermissionStepVisible(step == .permissions)
-        if step == .permissions {
+        let permissionStatusVisible = step == .permissions || step == .safetyTest
+        setupCoordinator.setPermissionStepVisible(permissionStatusVisible)
+        if permissionStatusVisible {
             Task {
                 await setupCoordinator.refreshPermissions()
             }
