@@ -621,7 +621,7 @@ Require:
 - default config
 - `LICENSE` and `THIRD_PARTY_NOTICES.md`
 - build manifest with SHA-256 per shipped resource
-- no `/Users/`, source path, `.venv`, or system-Python executable reference
+- no macOS user-home paths, source path, `.venv`, or system-Python executable reference
 - arm64 Mach-O and macOS 12 minimum for product executables
 
 - [ ] **Step 2: Run and verify RED**
