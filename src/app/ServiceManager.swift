@@ -590,11 +590,7 @@ final class ServiceManager: ServiceManaging {
         arguments: [String]
     )? {
         guard let data = try? fileSystem.readData(at: plistURL),
-              let dictionary = try? PropertyListSerialization.propertyList(
-                from: data,
-                options: [],
-                format: nil
-              ) as? [String: Any],
+              let dictionary = Self.plistDictionary(from: data),
               let arguments = Self.plistArguments(in: dictionary) else {
             return nil
         }
@@ -882,6 +878,9 @@ final class ServiceManager: ServiceManaging {
         appURL: URL,
         supportURL: URL
     ) throws -> Data {
+        guard !xmlPlistHasDuplicateDictionaryKeys(data) else {
+            throw ServiceManagerError.invalidTemplate
+        }
         let object: Any
         do {
             object = try PropertyListSerialization.propertyList(
@@ -968,11 +967,27 @@ final class ServiceManager: ServiceManaging {
     private static func plistDictionary(
         from data: Data
     ) -> [String: Any]? {
-        try? PropertyListSerialization.propertyList(
+        guard !xmlPlistHasDuplicateDictionaryKeys(data) else {
+            return nil
+        }
+        return try? PropertyListSerialization.propertyList(
             from: data,
             options: [],
             format: nil
         ) as? [String: Any]
+    }
+
+    private static func xmlPlistHasDuplicateDictionaryKeys(_ data: Data) -> Bool {
+        let detector = XMLPlistDuplicateKeyDetector()
+        let parser = XMLParser(data: data)
+        parser.delegate = detector
+        parser.shouldResolveExternalEntities = false
+        if !parser.parse(), !detector.hasDuplicateDictionaryKey {
+            // Binary plists and malformed input have no XML structure to inspect.
+            // PropertyListSerialization remains responsible for rejecting malformed data.
+            return false
+        }
+        return detector.hasDuplicateDictionaryKey
     }
 
     private static func propertyListValuesExactlyEqual(
@@ -1045,5 +1060,61 @@ final class ServiceManager: ServiceManaging {
             return nil
         }
         return Int32(output[range])
+    }
+}
+
+private final class XMLPlistDuplicateKeyDetector: NSObject, XMLParserDelegate {
+    private struct Element {
+        let name: String
+        var dictionaryKeys: Set<String> = []
+        var keyText: String?
+    }
+
+    private var elements: [Element] = []
+    private(set) var hasDuplicateDictionaryKey = false
+
+    func parser(
+        _ parser: XMLParser,
+        didStartElement elementName: String,
+        namespaceURI: String?,
+        qualifiedName qName: String?,
+        attributes attributeDict: [String: String] = [:]
+    ) {
+        elements.append(
+            Element(
+                name: elementName,
+                keyText: elementName == "key" ? "" : nil
+            )
+        )
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        guard elements.last?.name == "key" else {
+            return
+        }
+        elements[elements.count - 1].keyText?.append(string)
+    }
+
+    func parser(
+        _ parser: XMLParser,
+        didEndElement elementName: String,
+        namespaceURI: String?,
+        qualifiedName qName: String?
+    ) {
+        guard let completed = elements.popLast(),
+              completed.name == elementName else {
+            return
+        }
+        guard completed.name == "key",
+              elements.last?.name == "dict",
+              let key = completed.keyText else {
+            return
+        }
+        let dictionaryIndex = elements.count - 1
+        guard elements[dictionaryIndex].dictionaryKeys.insert(key).inserted else {
+            hasDuplicateDictionaryKey = true
+            parser.abortParsing()
+            return
+        }
     }
 }
