@@ -402,6 +402,8 @@ class OpenSourcePolicyTests(unittest.TestCase):
             "scripts/build-release.sh",
             "docs/design-references/mac-face-lock-onboarding-permissions.png",
             "docs/design-references/mac-face-lock-onboarding-enrollment.png",
+            "权限确认",
+            "不需要单独安装、打开或授权另一个 Agent 应用",
         ):
             self.assertIn(token, readme)
         for token in (
@@ -410,7 +412,7 @@ class OpenSourcePolicyTests(unittest.TestCase):
             "校验",
             "权限中心",
             "录入本人",
-            "安全测试",
+            "权限确认",
             "修复",
             "保留数据",
             "彻底删除",

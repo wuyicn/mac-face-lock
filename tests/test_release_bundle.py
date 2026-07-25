@@ -83,7 +83,7 @@ class ReleaseBundlePolicyTests(unittest.TestCase):
             "右键",
             "摄像头",
             "录入本人",
-            "安全测试",
+            "权限确认",
             "重新登录",
             "撤销并恢复",
             "卸载后台服务并保留数据",
