@@ -27,6 +27,8 @@ fi
 export PYTHONHASHSEED=0
 export MACOSX_DEPLOYMENT_TARGET=12.0
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$BUILD_DIR/uv-cache}"
+TCC_BUNDLE_IDENTIFIER="com.wuyi.mac-face-lock.app"
+TCC_SIGNING_REQUIREMENT='designated => identifier "com.wuyi.mac-face-lock.app"'
 
 "$UV_BIN" python install 3.11
 "$UV_BIN" venv --clear --python 3.11 "$VENV_DIR"
@@ -64,7 +66,10 @@ xcrun vtool \
   "$RUNTIME_EXECUTABLE"
 chmod +x "$PATCHED_EXECUTABLE"
 mv "$PATCHED_EXECUTABLE" "$RUNTIME_EXECUTABLE"
-codesign --sign - --force "$RUNTIME_EXECUTABLE" >/dev/null
+codesign --sign - --force \
+  -i "$TCC_BUNDLE_IDENTIFIER" \
+  -r="$TCC_SIGNING_REQUIREMENT" \
+  "$RUNTIME_EXECUTABLE" >/dev/null
 xcrun vtool -show-build "$RUNTIME_EXECUTABLE" |
   awk '$1 == "minos" { found = 1; if ($2 != "12.0") exit 1 } END { exit !found }'
 echo "$DIST_DIR/MacFaceLockRuntime"

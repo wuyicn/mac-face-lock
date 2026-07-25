@@ -103,6 +103,20 @@ def png_rgba_pixel_digest(path: Path) -> tuple[tuple[int, int], str]:
 
 
 class UnifiedPackagingTests(unittest.TestCase):
+    def test_release_signing_keeps_runtime_on_the_unified_tcc_identity(self) -> None:
+        runtime_builder = (PROJECT_DIR / "scripts" / "build-runtime.sh").read_text()
+        ui_builder = UI_BUILD_SCRIPT.read_text()
+        release_builder = (PROJECT_DIR / "scripts" / "build-release.sh").read_text()
+
+        for script in (runtime_builder, ui_builder, release_builder):
+            with self.subTest(script=script[:40]):
+                self.assertIn(
+                    'TCC_SIGNING_REQUIREMENT=\'designated => identifier "com.wuyi.mac-face-lock.app"\'',
+                    script,
+                )
+                self.assertIn('-i "$TCC_BUNDLE_IDENTIFIER"', script)
+                self.assertIn('-r="$TCC_SIGNING_REQUIREMENT"', script)
+
     def test_release_launchagent_targets_the_unified_runtime_dispatcher(self) -> None:
         plist_path = (
             PROJECT_DIR / "launchd" / "com.wuyi.mac-face-lock-release.plist"

@@ -15,6 +15,8 @@ APP="$STAGING_DIR/Mac Face Lock.app"
 RESOURCES="$APP/Contents/Resources"
 ZIP="$RELEASE_DIR/Mac-Face-Lock-$VERSION-arm64.zip"
 CHECKSUM="$ZIP.sha256"
+TCC_BUNDLE_IDENTIFIER="com.wuyi.mac-face-lock.app"
+TCC_SIGNING_REQUIREMENT='designated => identifier "com.wuyi.mac-face-lock.app"'
 
 rm -rf "$RELEASE_DIR"
 mkdir -p "$STAGING_DIR" "$RELEASE_DIR"
@@ -47,6 +49,11 @@ done < <(
     sort -r
 )
 
+codesign --sign - --force \
+  -i "$TCC_BUNDLE_IDENTIFIER" \
+  -r="$TCC_SIGNING_REQUIREMENT" \
+  "$RESOURCES/runtime/MacFaceLockRuntime/MacFaceLockRuntime" >/dev/null
+
 if [[ -e "$APP/Contents/Library/LoginItems/Mac Face Lock Agent.app" ]]; then
   echo "release app must not embed Mac Face Lock Agent.app" >&2
   exit 1
@@ -63,10 +70,16 @@ test -x "$RESOURCES/runtime/MacFaceLockRuntime/MacFaceLockRuntime"
 
 MANIFEST="$RESOURCES/BuildManifest.json"
 # Establish every signature path before recording the exact exclusion set.
-codesign --sign - --force --deep "$APP" >/dev/null
+codesign --sign - --force --deep \
+  -i "$TCC_BUNDLE_IDENTIFIER" \
+  -r="$TCC_SIGNING_REQUIREMENT" \
+  "$APP" >/dev/null
 "$ROOT_DIR/.build/runtime-python311/bin/python" \
   "$ROOT_DIR/scripts/release-manifest.py" generate "$APP" "$MANIFEST"
-codesign --sign - --force --deep "$APP" >/dev/null
+codesign --sign - --force --deep \
+  -i "$TCC_BUNDLE_IDENTIFIER" \
+  -r="$TCC_SIGNING_REQUIREMENT" \
+  "$APP" >/dev/null
 codesign --verify --deep --strict "$APP"
 "$ROOT_DIR/.build/runtime-python311/bin/python" \
   "$ROOT_DIR/scripts/release-manifest.py" verify "$APP" "$MANIFEST"

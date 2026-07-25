@@ -383,8 +383,31 @@ enum SetupCoordinatorError: Error, Equatable, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notReady:
-            return "必要设置尚未完成，请先修复未通过的检查。"
+        case .notReady(let checks):
+            let labels = checks.map { check in
+                switch check {
+                case .cameraPermission:
+                    return "摄像头权限"
+                case .inputMonitoringPermission:
+                    return "输入监控权限"
+                case .accessibilityPermission:
+                    return "辅助功能权限"
+                case .screenRecordingPermission:
+                    return "屏幕录制权限"
+                case .ownerProfile:
+                    return "本人资料"
+                case .diagnosis:
+                    return "运行诊断"
+                case .ownerTest:
+                    return "本人验证"
+                case .serviceHealth:
+                    return "后台服务"
+                }
+            }
+            if labels.isEmpty {
+                return "必要设置尚未完成，请先修复未通过的检查。"
+            }
+            return "必要设置尚未完成：\(labels.joined(separator: "、"))。请先修复后重试。"
         case .persistenceFailed:
             return "无法保存保护设置，请检查应用支持目录权限后重试。"
         }

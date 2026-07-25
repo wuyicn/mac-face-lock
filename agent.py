@@ -1020,15 +1020,11 @@ class FaceLockAgent:
         except ImportError as exc:
             raise RuntimeError("Missing input dependency. Run scripts/bootstrap.sh first.") from exc
 
-        self.permission_readiness = probe_agent_permissions(
-            request=True,
-            camera_request_timeout_seconds=float(
-                self.config.get(
-                    "camera_permission_request_timeout_seconds",
-                    CAMERA_PERMISSION_REQUEST_TIMEOUT_SECONDS,
-                )
-            ),
-        )
+        # Permission prompts belong to the foreground Mac Face Lock app. The
+        # launchd-owned runtime only reads its current TCC state; requesting
+        # from this process can invoke PyObjC callbacks without a registered
+        # block signature and leaves the service falsely unhealthy.
+        self.permission_readiness = probe_agent_permissions(request=False)
         initial_state = {
             "status": "running",
             "mode": self.mode,

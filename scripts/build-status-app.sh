@@ -15,6 +15,8 @@ RUNTIME_SOURCE="$ROOT_DIR/dist/runtime/MacFaceLockRuntime"
 RUNTIME_EXECUTABLE="$RUNTIME_SOURCE/MacFaceLockRuntime"
 BUNDLED_RUNTIME_EXECUTABLE="Contents/Resources/runtime/MacFaceLockRuntime/MacFaceLockRuntime"
 RELEASE_LAUNCHD_DIR="$RESOURCES_DIR/launchd"
+TCC_BUNDLE_IDENTIFIER="com.wuyi.mac-face-lock.app"
+TCC_SIGNING_REQUIREMENT='designated => identifier "com.wuyi.mac-face-lock.app"'
 
 bundle_is_valid() {
   local bundle="$1"
@@ -116,7 +118,10 @@ xcrun swiftc "${SOURCE_FILES[@]}" \
   -framework CoreGraphics \
   -o "$EXECUTABLE"
 chmod +x "$EXECUTABLE"
-codesign --sign - --force --deep "$BUILD_DIR" >/dev/null
+codesign --sign - --force --deep \
+  -i "$TCC_BUNDLE_IDENTIFIER" \
+  -r="$TCC_SIGNING_REQUIREMENT" \
+  "$BUILD_DIR" >/dev/null
 plutil -lint "$CONTENTS_DIR/Info.plist" >/dev/null
 plutil -lint \
   "$RELEASE_LAUNCHD_DIR/com.wuyi.mac-face-lock-release.plist" >/dev/null

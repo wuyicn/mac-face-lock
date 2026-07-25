@@ -1114,6 +1114,7 @@ struct SetupCoordinatorTests {
         try await testSuccessfulEnrollmentClearsActiveEnrollmentRefusal()
         try await testVerificationCannotPassAfterEnrollmentReplacesProfile()
         try await testReleaseDiagnosisInstallsAndUsesAgentOwnedServiceHealth()
+        try testNotReadyErrorListsFailedChecks()
         try await testPermissionStatusCompletionSkipsRuntimeAndLeavesProtectionDisabled()
         try await testPermissionStatusCompletionRejectsMissingOwnerProfile()
         try await testCompatibilitySafetyTestRejectsFailedOwnerVerification()
@@ -5155,6 +5156,19 @@ struct SetupCoordinatorTests {
                 && coordinator.checks[.serviceHealth] == false
                 && !coordinator.readiness.canEnableProtection,
             "permission-blocked bootstrap relaxed a protection-readiness gate"
+        )
+    }
+
+    private static func testNotReadyErrorListsFailedChecks() throws {
+        let message = SetupCoordinatorError.notReady(
+            [.cameraPermission, .inputMonitoringPermission, .serviceHealth]
+        ).localizedDescription
+
+        try require(
+            message.contains("摄像头")
+                && message.contains("输入监控")
+                && message.contains("后台服务"),
+            "not-ready error did not identify the failed checks: \(message)"
         )
     }
 

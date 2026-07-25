@@ -603,7 +603,7 @@ class AgentControlTests(unittest.TestCase):
         ):
             agent.run()
 
-        probe.assert_called()
+        probe.assert_called_once_with(request=False)
         verify_current_user.assert_not_called()
         initial_state = replace_state.call_args.args[0]
         self.assertEqual(initial_state["agent_pid"], os.getpid())
