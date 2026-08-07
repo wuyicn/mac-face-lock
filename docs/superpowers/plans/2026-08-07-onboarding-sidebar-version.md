@@ -255,7 +255,7 @@ git commit -m "feat: show version in onboarding sidebar"
 **Files:**
 - Verify only: `dist/release/Mac-Face-Lock-0.2.0-beta-arm64.zip`
 - Replace recoverably: `/Applications/OPC/Mac Face Lock.app`
-- Preserve: `/Users/wuyi-macs/Library/Application Support/Mac Face Lock`
+- Preserve: `$HOME/Library/Application Support/Mac Face Lock`
 
 **Interfaces:**
 - Consumes: committed formatter and sidebar integration from Tasks 1-2.
@@ -380,4 +380,3 @@ Open the installed app and inspect the onboarding sidebar with Computer Use. Ver
 5. Light and dark appearances both retain readable contrast.
 
 Expected: all five checks pass in the actual `/Applications/OPC/Mac Face Lock.app` UI.
-
