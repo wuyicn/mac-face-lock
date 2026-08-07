@@ -226,6 +226,21 @@ class UnifiedPackagingTests(unittest.TestCase):
             settings,
         )
 
+    def test_onboarding_sidebar_uses_dynamic_bundle_version_label(self) -> None:
+        onboarding = (PROJECT_DIR / "src/app/OnboardingView.swift").read_text()
+        version_display = (
+            PROJECT_DIR / "src/app/AppVersionDisplay.swift"
+        ).read_text()
+
+        self.assertIn(
+            "if let versionText = AppVersionDisplay.current",
+            onboarding,
+        )
+        self.assertIn("Text(versionText)", onboarding)
+        self.assertIn(".font(.caption2)", onboarding)
+        self.assertIn("CFBundleShortVersionString", version_display)
+        self.assertNotIn('Text("v0.2.0")', onboarding)
+
     @unittest.skipUnless(
         MACOS_ICON_TOOLCHAIN_AVAILABLE,
         "requires macOS xcrun and iconutil",

@@ -170,11 +170,19 @@ struct OnboardingView: View {
 
             Spacer()
 
-            Text("所有人脸资料和运行记录只保存在本机。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(28)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("所有人脸资料和运行记录只保存在本机。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let versionText = AppVersionDisplay.current {
+                    Text(versionText)
+                        .font(.caption2)
+                        .foregroundStyle(Color.secondary.opacity(0.72))
+                }
+            }
+            .padding(28)
         }
         .background(.ultraThinMaterial)
         .overlay(alignment: .trailing) {
