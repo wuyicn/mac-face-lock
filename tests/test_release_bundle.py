@@ -130,6 +130,15 @@ class ReleaseBundlePolicyTests(unittest.TestCase):
             self.assertIn("mktemp -d", script)
             self.assertIn("trap ", script)
 
+    def test_release_runtime_smoke_test_never_launches_gui_control_center(self) -> None:
+        source = inspect.getsource(
+            ExtractedReleaseBundleTests
+            .test_extracted_release_environment_launches_without_developer_tools
+        )
+        self.assertIn('"--internal-runtime"', source)
+        self.assertIn('"diagnose"', source)
+        self.assertNotIn("subprocess.Popen", source)
+
     def test_path_scan_has_no_file_size_bypass(self) -> None:
         source = inspect.getsource(
             ExtractedReleaseBundleTests
@@ -427,28 +436,39 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
         )
 
     def test_extracted_release_environment_launches_without_developer_tools(self) -> None:
+        resources = self.app / "Contents/Resources"
         executable = self.app / "Contents/MacOS/MacFaceLock"
-        process = subprocess.Popen(
-            [str(executable)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        try:
-            time.sleep(2)
-            self.assertIsNone(
-                process.poll(),
-                process.stderr.read() if process.poll() is not None else "",
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            support = temporary / "Library/Application Support/Mac Face Lock"
+            (support / "config").mkdir(parents=True)
+            (support / "data").mkdir()
+            (support / "logs").mkdir()
+            (support / "config/config.json").write_bytes(
+                (resources / "defaults/config.json").read_bytes()
             )
-        finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-            if process.stderr is not None:
-                process.stderr.close()
+            result = subprocess.run(
+                [
+                    str(executable),
+                    "--internal-runtime",
+                    "--resources-dir",
+                    str(resources),
+                    "--support-dir",
+                    str(support),
+                    "diagnose",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env={
+                    **os.environ,
+                    "CFFIXED_USER_HOME": directory,
+                    "HOME": directory,
+                },
+            )
+
+            self.assertIn(result.returncode, {0, 10, 11, 20}, result.stderr)
+            self.assertIn('"event": "diagnosis_complete"', result.stdout)
 
     def test_packaged_main_executable_accepts_exact_release_arguments(self) -> None:
         resources = self.app / "Contents/Resources"
