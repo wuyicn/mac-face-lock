@@ -4,6 +4,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -356,6 +357,30 @@ def dangerous_ci_command(command):
 
 
 class OpenSourcePolicyTests(unittest.TestCase):
+    def test_macos_icon_tests_are_skipped_when_imported_as_linux(self):
+        probe = """
+import sys
+sys.platform = "linux"
+from tests.test_packaging import UnifiedPackagingTests
+
+names = (
+    "test_control_center_packages_the_project_owned_icon",
+    "test_app_icon_regeneration_uses_fixed_pixels_and_matches_asset",
+)
+raise SystemExit(0 if all(
+    getattr(getattr(UnifiedPackagingTests, name), "__unittest_skip__", False)
+    for name in names
+) else 1)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_manual_release_artifact_workflow_is_safe_and_reviewable(self):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         for token in (

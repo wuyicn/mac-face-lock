@@ -35,6 +35,11 @@ APP_ICON_SLOTS = {
     "icon_512x512.png": (512, 512),
     "icon_512x512@2x.png": (1024, 1024),
 }
+MACOS_ICON_TOOLCHAIN_AVAILABLE = (
+    sys.platform == "darwin"
+    and shutil.which("xcrun") is not None
+    and shutil.which("iconutil") is not None
+)
 
 
 def png_rgba_pixel_digest(path: Path) -> tuple[tuple[int, int], str]:
@@ -220,6 +225,10 @@ class UnifiedPackagingTests(unittest.TestCase):
             settings,
         )
 
+    @unittest.skipUnless(
+        MACOS_ICON_TOOLCHAIN_AVAILABLE,
+        "requires macOS xcrun and iconutil",
+    )
     def test_control_center_packages_the_project_owned_icon(self) -> None:
         info_path = PROJECT_DIR / "src" / "app" / "Info.plist"
         icon_path = PROJECT_DIR / "src" / "app" / "AppIcon.icns"
@@ -250,6 +259,10 @@ class UnifiedPackagingTests(unittest.TestCase):
                 text=True,
             )
 
+    @unittest.skipUnless(
+        MACOS_ICON_TOOLCHAIN_AVAILABLE,
+        "requires macOS xcrun and iconutil",
+    )
     def test_app_icon_regeneration_uses_fixed_pixels_and_matches_asset(self) -> None:
         renderer = PROJECT_DIR / "scripts" / "generate-app-icon.swift"
         generator = PROJECT_DIR / "scripts" / "generate-app-icon.sh"
