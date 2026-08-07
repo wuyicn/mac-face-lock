@@ -429,6 +429,8 @@ raise SystemExit(0 if all(
             "docs/design-references/mac-face-lock-onboarding-enrollment.png",
             "权限确认",
             "不需要单独安装、打开或授权另一个 Agent 应用",
+            "如果 Releases 页面没有发行版",
+            "尚未公开客户构建",
         ):
             self.assertIn(token, readme)
         for token in (
@@ -515,15 +517,18 @@ scripts/install-launchagent.sh"""
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, security)
 
-    def test_security_policy_does_not_claim_an_unverified_private_channel(self):
+    def test_security_policy_publishes_the_verified_private_channel(self):
         security = self._read_required_document("SECURITY.md")
-        for phrase in ["尚未启用", "Report a vulnerability", "发布门禁", "实测"]:
+        for phrase in [
+            "仓库已经公开",
+            "private vulnerability reporting 已启用",
+            "GitHub Security Advisories",
+            "Report a vulnerability",
+        ]:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, security)
-        self.assertNotIn(
-            "请通过仓库的 **GitHub Security Advisories** 发起私密报告",
-            security,
-        )
+        self.assertNotIn("尚未创建公开 GitHub 仓库", security)
+        self.assertNotIn("尚未启用", security)
 
     def test_contributing_policy_protects_private_runtime_data(self):
         contributing = self._read_required_document("CONTRIBUTING.md")

@@ -1,12 +1,12 @@
 # Mac Face Lock
 
-Mac Face Lock 是一款默认在本机处理、运行时默认离线的 macOS 人脸锁屏辅助工具。普通客户可直接使用自包含的桌面发行包；源码开发者也可自行构建。项目源码采用 [MIT License](LICENSE)。
+Mac Face Lock 是一款默认在本机处理、运行时默认离线的 macOS 人脸锁屏辅助工具。项目提供自包含桌面发行包的构建能力，也支持从源码自行构建。项目源码采用 [MIT License](LICENSE)。
 
 > 安全提醒：当前人脸比对没有活体检测，照片、视频或其他重放方式可能绕过识别。Mac Face Lock 不能替代 macOS 登录密码、Touch ID、FileVault、系统锁屏策略、MDM 或物理访问控制，不应用于高安全场景。
 
 ## 普通客户：下载安装
 
-从项目的 **GitHub Releases** 下载 `Mac-Face-Lock-0.2.0-beta-arm64.zip` 和同名 `.sha256` 文件。发行包自带运行组件，**无需 Codex、Python、Xcode、终端或源码仓库**。
+正式面向普通客户的构建只会发布在项目的 **GitHub Releases**，文件名为 `Mac-Face-Lock-0.2.0-beta-arm64.zip` 和同名 `.sha256`。如果 Releases 页面没有发行版，表示项目**尚未公开客户构建**，请不要把 Actions 构件、本地构建或第三方转载当作正式下载。发行包自带运行组件，**无需 Codex、Python、Xcode、终端或源码仓库**。
 
 1. 在 Finder 中解压 ZIP，把 `Mac Face Lock.app` 拖入“应用程序”。
 2. 可按 [普通客户安装指南](docs/customer-installation.md) 校验 SHA-256。
