@@ -38,6 +38,7 @@ REQUIRED_LICENSES = (
     "six/LICENSE",
     "PyObjC/LICENSE.txt",
 )
+FIXTURE_SOURCE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 
 def find_forbidden_token(path: Path, tokens: tuple[bytes, ...]) -> bytes | None:
@@ -76,6 +77,7 @@ class ReleaseBundlePolicyTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("source_commit", source)
         for token in (
             "新建的普通测试账户",
             "Codex、Python、Xcode",
@@ -190,6 +192,9 @@ class ReleaseBundlePolicyTests(unittest.TestCase):
             self.assertIn(required_absence_check, release)
         self.assertIn("release-manifest.py", release)
         self.assertIn('"$RESOURCES/licenses"', release)
+        self.assertIn("git status --porcelain=v1 --untracked-files=all", release)
+        self.assertIn("git rev-parse HEAD", release)
+        self.assertIn('"$SOURCE_COMMIT"', release)
 
     def test_third_party_notices_enumerate_bundled_license_files(self) -> None:
         notices = (PROJECT_DIR / "THIRD_PARTY_NOTICES.md").read_text(
@@ -230,13 +235,19 @@ class ReleaseManifestToolTests(unittest.TestCase):
             executable.write_bytes(bytes.fromhex("cffaedfe") + b"\0" * 64)
             manifest = app / "Contents/Resources/BuildManifest.json"
 
-            generated = self.run_tool("generate", str(app), str(manifest))
+            generated = self.run_tool(
+                "generate",
+                str(app),
+                str(manifest),
+                FIXTURE_SOURCE_COMMIT,
+            )
             self.assertEqual(generated.returncode, 0, generated.stderr)
             verified = self.run_tool("verify", str(app), str(manifest))
             self.assertEqual(verified.returncode, 0, verified.stderr)
 
             document = json.loads(manifest.read_text(encoding="utf-8"))
-            self.assertEqual(document["schema_version"], 2)
+            self.assertEqual(document["schema_version"], 3)
+            self.assertEqual(document["source_commit"], FIXTURE_SOURCE_COMMIT)
             self.assertEqual(document["scope"], "final_non_code_payload")
             self.assertEqual(
                 {item["reason"] for item in document["excluded_files"]},
@@ -248,6 +259,48 @@ class ReleaseManifestToolTests(unittest.TestCase):
             mutated = self.run_tool("verify", str(app), str(manifest))
             self.assertNotEqual(mutated.returncode, 0)
             self.assertIn("digest mismatch", mutated.stderr)
+
+    def test_manifest_rejects_invalid_source_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory) / "Fixture.app"
+            app.mkdir()
+            manifest = app / "Contents/Resources/BuildManifest.json"
+            invalid_commits = (
+                FIXTURE_SOURCE_COMMIT.upper(),
+                FIXTURE_SOURCE_COMMIT[:-1],
+                "z" * 40,
+            )
+            for source_commit in invalid_commits:
+                with self.subTest(source_commit=source_commit):
+                    generated = self.run_tool(
+                        "generate",
+                        str(app),
+                        str(manifest),
+                        source_commit,
+                    )
+                    self.assertNotEqual(generated.returncode, 0)
+                    self.assertIn("source commit", generated.stderr)
+
+    def test_manifest_verify_rejects_invalid_recorded_source_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory) / "Fixture.app"
+            app.mkdir()
+            manifest = app / "Contents/Resources/BuildManifest.json"
+            generated = self.run_tool(
+                "generate",
+                str(app),
+                str(manifest),
+                FIXTURE_SOURCE_COMMIT,
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            document["source_commit"] = "not-a-commit"
+            manifest.write_text(json.dumps(document), encoding="utf-8")
+
+            verified = self.run_tool("verify", str(app), str(manifest))
+
+            self.assertNotEqual(verified.returncode, 0)
+            self.assertIn("source commit", verified.stderr)
 
 
 class ExtractedReleaseBundleTests(unittest.TestCase):
@@ -303,7 +356,14 @@ class ExtractedReleaseBundleTests(unittest.TestCase):
         manifest = json.loads(
             (contents / "Resources/BuildManifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["schema_version"], 3)
+        self.assertRegex(manifest["source_commit"], r"^[0-9a-f]{40}$")
+        source_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_DIR,
+            text=True,
+        ).strip()
+        self.assertEqual(manifest["source_commit"], source_commit)
         self.assertEqual(manifest["scope"], "final_non_code_payload")
         self.assertTrue(manifest["files"])
         outer_plist = plistlib.loads((contents / "Info.plist").read_bytes())

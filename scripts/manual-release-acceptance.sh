@@ -66,8 +66,11 @@ PYTHON="$ROOT_DIR/.build/runtime-python311/bin/python"
 if [[ ! -x "$PYTHON" ]]; then
   PYTHON="$(command -v python3)"
 fi
-"$PYTHON" "$ROOT_DIR/scripts/release-manifest.py" verify \
-  "$APP" "$APP/Contents/Resources/BuildManifest.json"
+MANIFEST="$APP/Contents/Resources/BuildManifest.json"
+"$PYTHON" "$ROOT_DIR/scripts/release-manifest.py" verify "$APP" "$MANIFEST"
+SOURCE_COMMIT="$("$PYTHON" -c \
+  'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["source_commit"])' \
+  "$MANIFEST")"
 
 echo
 echo "自动预检：PASS"
@@ -75,5 +78,6 @@ echo "发行包：$(basename "$ZIP")"
 echo "SHA-256：$(shasum -a 256 "$ZIP" | awk '{print $1}')"
 echo "版本：$(plutil -extract CFBundleShortVersionString raw \
   "$APP/Contents/Info.plist")"
+echo "源提交：$SOURCE_COMMIT"
 echo
 print_checklist

@@ -4,6 +4,21 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="0.2.0-beta"
 RELEASE_DIR="$ROOT_DIR/dist/release"
+if [[ "$(git -C "$ROOT_DIR" rev-parse --is-inside-work-tree 2>/dev/null || true)" != "true" ]]; then
+  echo "release build must run from a Git worktree" >&2
+  exit 1
+fi
+DIRTY_STATE="$(cd "$ROOT_DIR" && git status --porcelain=v1 --untracked-files=all)"
+if [[ -n "$DIRTY_STATE" ]]; then
+  echo "release build requires a clean Git worktree" >&2
+  printf '%s\n' "$DIRTY_STATE" >&2
+  exit 1
+fi
+SOURCE_COMMIT="$(cd "$ROOT_DIR" && git rev-parse HEAD)"
+if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "release source commit must be a lowercase 40-character SHA" >&2
+  exit 1
+fi
 mkdir -p "$ROOT_DIR/.build"
 BUILD_WORK_DIR="$(mktemp -d "$ROOT_DIR/.build/release.XXXXXX")"
 cleanup() {
@@ -75,7 +90,8 @@ codesign --sign - --force --deep \
   -r="$TCC_SIGNING_REQUIREMENT" \
   "$APP" >/dev/null
 "$ROOT_DIR/.build/runtime-python311/bin/python" \
-  "$ROOT_DIR/scripts/release-manifest.py" generate "$APP" "$MANIFEST"
+  "$ROOT_DIR/scripts/release-manifest.py" generate \
+  "$APP" "$MANIFEST" "$SOURCE_COMMIT"
 codesign --sign - --force --deep \
   -i "$TCC_BUNDLE_IDENTIFIER" \
   -r="$TCC_SIGNING_REQUIREMENT" \

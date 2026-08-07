@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ MACH_O_MAGICS = {
     bytes.fromhex("bfbafeca"),
 }
 MANIFEST_RELATIVE_PATH = "Contents/Resources/BuildManifest.json"
+SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 MANIFEST_KEYS = {
     "architecture",
     "excluded_files",
@@ -25,6 +27,7 @@ MANIFEST_KEYS = {
     "minimum_macos",
     "schema_version",
     "scope",
+    "source_commit",
     "version",
 }
 
@@ -81,14 +84,24 @@ def expected_scope(app: Path) -> tuple[list[dict[str, str]], list[dict[str, str]
     return files, excluded
 
 
-def generate(app: Path, manifest: Path) -> None:
+def validate_source_commit(source_commit: object) -> str:
+    if not isinstance(source_commit, str) or not SOURCE_COMMIT_PATTERN.fullmatch(
+        source_commit
+    ):
+        raise ManifestError("source commit must be a lowercase 40-character SHA")
+    return source_commit
+
+
+def generate(app: Path, manifest: Path, source_commit: str) -> None:
+    validate_source_commit(source_commit)
     files, excluded = expected_scope(app)
     document = {
-        "schema_version": 2,
+        "schema_version": 3,
         "version": "0.2.0-beta",
         "architecture": "arm64",
         "minimum_macos": "12.0",
         "scope": "final_non_code_payload",
+        "source_commit": source_commit,
         "files": files,
         "excluded_files": excluded,
     }
@@ -112,10 +125,11 @@ def verify(app: Path, manifest: Path) -> None:
         raise ManifestError(f"manifest unreadable: {error}") from error
     if not isinstance(document, dict) or set(document) != MANIFEST_KEYS:
         raise ManifestError("manifest schema keys mismatch")
-    if document["schema_version"] != 2:
+    if document["schema_version"] != 3:
         raise ManifestError("manifest schema version mismatch")
     if document["scope"] != "final_non_code_payload":
         raise ManifestError("manifest scope mismatch")
+    validate_source_commit(document["source_commit"])
     recorded_files = document["files"]
     recorded_excluded = document["excluded_files"]
     if not isinstance(recorded_files, list) or not isinstance(recorded_excluded, list):
@@ -142,18 +156,28 @@ def verify(app: Path, manifest: Path) -> None:
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) != 4 or arguments[1] not in {"generate", "verify"}:
+    if len(arguments) < 2 or arguments[1] not in {"generate", "verify"}:
         print(
-            "usage: release-manifest.py generate|verify APP MANIFEST",
+            "usage: release-manifest.py generate APP MANIFEST SOURCE_COMMIT | "
+            "verify APP MANIFEST",
             file=sys.stderr,
         )
         return 64
-    command, app_text, manifest_text = arguments[1:]
+    command = arguments[1]
+    expected_length = 5 if command == "generate" else 4
+    if len(arguments) != expected_length:
+        print(
+            "usage: release-manifest.py generate APP MANIFEST SOURCE_COMMIT | "
+            "verify APP MANIFEST",
+            file=sys.stderr,
+        )
+        return 64
+    app_text, manifest_text = arguments[2:4]
     app = Path(app_text)
     manifest = Path(manifest_text)
     try:
         if command == "generate":
-            generate(app, manifest)
+            generate(app, manifest, arguments[4])
         else:
             verify(app, manifest)
     except ManifestError as error:
