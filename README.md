@@ -172,6 +172,12 @@ scripts/uninstall-launchagent.sh
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v
 
 xcrun swiftc -parse-as-library \
+  src/app/AppVersionDisplay.swift \
+  tests/swift/AppVersionDisplayTests.swift \
+  -o /tmp/mac-face-lock-version-display-tests
+/tmp/mac-face-lock-version-display-tests
+
+xcrun swiftc -parse-as-library \
   src/app/Models.swift src/app/SetupModels.swift \
   src/app/LocalJSONStore.swift \
   tests/swift/LocalStoreSmokeTests.swift \

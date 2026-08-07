@@ -58,6 +58,13 @@ jobs:
         run: scripts/build-runtime.sh
       - name: Run full Python suite
         run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Run Swift app-version display tests
+        run: |
+          xcrun swiftc -parse-as-library \
+            src/app/AppVersionDisplay.swift \
+            tests/swift/AppVersionDisplayTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-version-display-tests"
+          "$RUNNER_TEMP/mac-face-lock-version-display-tests"
       - name: Run Swift local-store smoke test
         run: |
           xcrun swiftc -parse-as-library \
