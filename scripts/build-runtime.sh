@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SIGN_CODE="$ROOT_DIR/scripts/sign-code.sh"
 UV_REQUIRED_VERSION="0.11.13"
 UV_BIN="${UV_BIN:-$(command -v uv || true)}"
 BUILD_DIR="$ROOT_DIR/.build"
@@ -28,7 +29,6 @@ export PYTHONHASHSEED=0
 export MACOSX_DEPLOYMENT_TARGET=12.0
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$BUILD_DIR/uv-cache}"
 TCC_BUNDLE_IDENTIFIER="com.wuyi.mac-face-lock.app"
-TCC_SIGNING_REQUIREMENT='designated => identifier "com.wuyi.mac-face-lock.app"'
 
 "$UV_BIN" python install 3.11
 "$UV_BIN" venv --clear --python 3.11 "$VENV_DIR"
@@ -66,9 +66,8 @@ xcrun vtool \
   "$RUNTIME_EXECUTABLE"
 chmod +x "$PATCHED_EXECUTABLE"
 mv "$PATCHED_EXECUTABLE" "$RUNTIME_EXECUTABLE"
-codesign --sign - --force \
-  -i "$TCC_BUNDLE_IDENTIFIER" \
-  -r="$TCC_SIGNING_REQUIREMENT" \
+"$SIGN_CODE" \
+  --identifier "$TCC_BUNDLE_IDENTIFIER" \
   "$RUNTIME_EXECUTABLE" >/dev/null
 xcrun vtool -show-build "$RUNTIME_EXECUTABLE" |
   awk '$1 == "minos" { found = 1; if ($2 != "12.0") exit 1 } END { exit !found }'

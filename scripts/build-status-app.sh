@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SIGN_CODE="$ROOT_DIR/scripts/sign-code.sh"
 APP_DIR="$ROOT_DIR/dist/Mac Face Lock.app"
 BUILD_DIR="$ROOT_DIR/dist/.Mac Face Lock.app.building"
 PREVIOUS_DIR="$ROOT_DIR/dist/.Mac Face Lock.app.previous"
@@ -16,7 +17,6 @@ RUNTIME_EXECUTABLE="$RUNTIME_SOURCE/MacFaceLockRuntime"
 BUNDLED_RUNTIME_EXECUTABLE="Contents/Resources/runtime/MacFaceLockRuntime/MacFaceLockRuntime"
 RELEASE_LAUNCHD_DIR="$RESOURCES_DIR/launchd"
 TCC_BUNDLE_IDENTIFIER="com.wuyi.mac-face-lock.app"
-TCC_SIGNING_REQUIREMENT='designated => identifier "com.wuyi.mac-face-lock.app"'
 
 bundle_is_valid() {
   local bundle="$1"
@@ -118,9 +118,8 @@ xcrun swiftc "${SOURCE_FILES[@]}" \
   -framework CoreGraphics \
   -o "$EXECUTABLE"
 chmod +x "$EXECUTABLE"
-codesign --sign - --force --deep \
-  -i "$TCC_BUNDLE_IDENTIFIER" \
-  -r="$TCC_SIGNING_REQUIREMENT" \
+"$SIGN_CODE" --deep \
+  --identifier "$TCC_BUNDLE_IDENTIFIER" \
   "$BUILD_DIR" >/dev/null
 plutil -lint "$CONTENTS_DIR/Info.plist" >/dev/null
 plutil -lint \

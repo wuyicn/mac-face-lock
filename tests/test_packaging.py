@@ -116,11 +116,12 @@ class UnifiedPackagingTests(unittest.TestCase):
         for script in (runtime_builder, ui_builder, release_builder):
             with self.subTest(script=script[:40]):
                 self.assertIn(
-                    'TCC_SIGNING_REQUIREMENT=\'designated => identifier "com.wuyi.mac-face-lock.app"\'',
+                    'SIGN_CODE="$ROOT_DIR/scripts/sign-code.sh"',
                     script,
                 )
-                self.assertIn('-i "$TCC_BUNDLE_IDENTIFIER"', script)
-                self.assertIn('-r="$TCC_SIGNING_REQUIREMENT"', script)
+                self.assertIn('"$SIGN_CODE"', script)
+                self.assertIn('--identifier "$TCC_BUNDLE_IDENTIFIER"', script)
+                self.assertNotIn("TCC_SIGNING_REQUIREMENT", script)
 
     def test_release_launchagent_targets_the_unified_runtime_dispatcher(self) -> None:
         plist_path = (

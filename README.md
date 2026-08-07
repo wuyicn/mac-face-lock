@@ -124,6 +124,15 @@ scripts/build-status-app.sh
 scripts/build-release.sh
 ```
 
+需要在本机开发和升级时保留摄像头、输入监控、辅助功能等 TCC 权限，应使用钥匙串中的稳定 Apple Development 或 Developer ID 签名身份：
+
+```bash
+MAC_FACE_LOCK_SIGNING_IDENTITY="Apple Development: <name> (<team-id>)" \
+  scripts/build-release.sh
+```
+
+未设置该变量时构建会回退到 ad-hoc 签名，适合无证书的 CI 构件检查，但 macOS 无法可靠地把不同 ad-hoc 构建识别为同一应用；替换应用后可能必须重新授权。公开客户构建必须使用适合分发的稳定签名和公证，不能把 ad-hoc CI 构件当作正式发行版。
+
 输出为 `dist/release/Mac-Face-Lock-0.2.0-beta-arm64.zip` 及其 SHA-256 文件。GitHub 的手动工作流只生成可检查的构件，不自动创建 Release。
 
 ## 源码运行与卸载

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SIGN_CODE="$ROOT_DIR/scripts/sign-code.sh"
 VERSION="0.2.0-beta"
 RELEASE_DIR="$ROOT_DIR/dist/release"
 if [[ "$(git -C "$ROOT_DIR" rev-parse --is-inside-work-tree 2>/dev/null || true)" != "true" ]]; then
@@ -31,7 +32,6 @@ RESOURCES="$APP/Contents/Resources"
 ZIP="$RELEASE_DIR/Mac-Face-Lock-$VERSION-arm64.zip"
 CHECKSUM="$ZIP.sha256"
 TCC_BUNDLE_IDENTIFIER="com.wuyi.mac-face-lock.app"
-TCC_SIGNING_REQUIREMENT='designated => identifier "com.wuyi.mac-face-lock.app"'
 
 rm -rf "$RELEASE_DIR"
 mkdir -p "$STAGING_DIR" "$RELEASE_DIR"
@@ -56,7 +56,7 @@ cp "$ROOT_DIR/docs/legacy-install-resolution.md" \
   "$RESOURCES/licenses"
 
 while IFS= read -r code_path; do
-  codesign --sign - --force "$code_path" >/dev/null 2>&1
+  "$SIGN_CODE" "$code_path" >/dev/null 2>&1
 done < <(
   find "$RESOURCES/runtime/MacFaceLockRuntime" -type f -print0 |
     xargs -0 file |
@@ -64,9 +64,8 @@ done < <(
     sort -r
 )
 
-codesign --sign - --force \
-  -i "$TCC_BUNDLE_IDENTIFIER" \
-  -r="$TCC_SIGNING_REQUIREMENT" \
+"$SIGN_CODE" \
+  --identifier "$TCC_BUNDLE_IDENTIFIER" \
   "$RESOURCES/runtime/MacFaceLockRuntime/MacFaceLockRuntime" >/dev/null
 
 if [[ -e "$APP/Contents/Library/LoginItems/Mac Face Lock Agent.app" ]]; then
@@ -85,16 +84,14 @@ test -x "$RESOURCES/runtime/MacFaceLockRuntime/MacFaceLockRuntime"
 
 MANIFEST="$RESOURCES/BuildManifest.json"
 # Establish every signature path before recording the exact exclusion set.
-codesign --sign - --force --deep \
-  -i "$TCC_BUNDLE_IDENTIFIER" \
-  -r="$TCC_SIGNING_REQUIREMENT" \
+"$SIGN_CODE" --deep \
+  --identifier "$TCC_BUNDLE_IDENTIFIER" \
   "$APP" >/dev/null
 "$ROOT_DIR/.build/runtime-python311/bin/python" \
   "$ROOT_DIR/scripts/release-manifest.py" generate \
   "$APP" "$MANIFEST" "$SOURCE_COMMIT"
-codesign --sign - --force --deep \
-  -i "$TCC_BUNDLE_IDENTIFIER" \
-  -r="$TCC_SIGNING_REQUIREMENT" \
+"$SIGN_CODE" --deep \
+  --identifier "$TCC_BUNDLE_IDENTIFIER" \
   "$APP" >/dev/null
 codesign --verify --deep --strict "$APP"
 "$ROOT_DIR/.build/runtime-python311/bin/python" \

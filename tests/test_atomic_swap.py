@@ -110,6 +110,10 @@ class BuildRecoveryTests(unittest.TestCase):
             PROJECT_DIR / "scripts" / "build-app.sh",
             self.root / "scripts" / "build-app.sh",
         )
+        shutil.copy2(
+            PROJECT_DIR / "scripts" / "sign-code.sh",
+            self.root / "scripts" / "sign-code.sh",
+        )
         shutil.copy2(SWAP_HELPER, self.root / "scripts" / SWAP_HELPER.name)
         shutil.copy2(
             PROJECT_DIR / "src" / "app" / "Info.plist",
