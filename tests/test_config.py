@@ -39,6 +39,7 @@ class ConfigurationTests(unittest.TestCase):
             config["final_evidence_owner_threshold"], config["face_match_threshold"]
         )
         self.assertGreaterEqual(config["enroll_samples"], 8)
+        self.assertGreaterEqual(config["enroll_timeout_seconds"], 120)
 
     def test_launchd_plists_load(self) -> None:
         labels = (

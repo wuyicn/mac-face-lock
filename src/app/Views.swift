@@ -23,6 +23,7 @@ enum AppSection: String, CaseIterable, Identifiable {
 
 struct RootView: View {
     @ObservedObject var faceLockStore: FaceLockStore
+    @ObservedObject var setupCoordinator: SetupCoordinator
     @ObservedObject var themeStore: ThemeStore
     let projectURL: URL
     let dataURL: URL
@@ -33,28 +34,75 @@ struct RootView: View {
     }
 
     var body: some View {
+        Group {
+            if RootDestination.resolve(
+                hasCompletedOnboarding: setupCoordinator.hasCompletedOnboarding,
+                isLiveReady: setupCoordinator.isLiveReady,
+                requiresLegacyCleanupAttention:
+                    setupCoordinator.requiresLegacyCleanupAttention
+            ) != .onboarding {
+                mainInterface
+            } else {
+                OnboardingView(
+                    setupCoordinator: setupCoordinator,
+                    themeStore: themeStore
+                )
+            }
+        }
+    }
+
+    private var mainInterface: some View {
         GeometryReader { geometry in
             ZStack {
                 windowBackdrop
 
-                HStack(spacing: 0) {
-                    SidebarView(
-                        selection: $selection,
-                        accentColor: themeStore.accentColor
-                    )
-                    .frame(width: 210)
+                VStack(spacing: 0) {
+                    if !setupCoordinator.isLiveReady {
+                        HStack(spacing: 12) {
+                            Image(systemName: "exclamationmark.shield.fill")
+                                .foregroundStyle(Color(nsColor: .systemOrange))
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("首次设置已完成，当前安全状态尚未全部确认")
+                                    .font(.system(size: 14, weight: .semibold))
+                                Text("保护恢复前会重新检查当前权限、本人资料和后台保护状态。")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("前往设置") {
+                                selection = .settings
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        .padding(.horizontal, 18)
+                        .frame(minHeight: 58)
+                        .background(.regularMaterial)
+                        .overlay(alignment: .bottom) {
+                            Rectangle()
+                                .fill(Color(nsColor: .systemOrange).opacity(0.45))
+                                .frame(height: 1)
+                        }
+                    }
 
-                    sectionContent
-                        .frame(minWidth: 520, maxWidth: .infinity, maxHeight: .infinity)
+                    HStack(spacing: 0) {
+                        SidebarView(
+                            selection: $selection,
+                            accentColor: themeStore.accentColor
+                        )
+                        .frame(width: 210)
 
-                    if selection == .overview, geometry.size.width >= 1050 {
-                        Rectangle()
-                            .fill(Color.primary.opacity(0.10))
-                            .frame(width: 1)
-                            .overlay(Color.white.opacity(0.06))
+                        sectionContent
+                            .frame(minWidth: 520, maxWidth: .infinity, maxHeight: .infinity)
 
-                        PolicyInspector()
-                            .frame(width: 300)
+                        if selection == .overview, geometry.size.width >= 1050 {
+                            Rectangle()
+                                .fill(Color.primary.opacity(0.10))
+                                .frame(width: 1)
+                                .overlay(Color.white.opacity(0.06))
+
+                            PolicyInspector()
+                                .frame(width: 300)
+                        }
                     }
                 }
             }
@@ -85,6 +133,7 @@ struct RootView: View {
         case .overview:
             OverviewView(
                 faceLockStore: faceLockStore,
+                setupCoordinator: setupCoordinator,
                 accentColor: themeStore.accentColor,
                 selection: $selection
             )
@@ -96,7 +145,11 @@ struct RootView: View {
                 dataURL: dataURL
             )
         case .settings:
-            SettingsView(themeStore: themeStore)
+            SettingsView(
+                setupCoordinator: setupCoordinator,
+                faceLockStore: faceLockStore,
+                themeStore: themeStore
+            )
         }
     }
 }
@@ -176,6 +229,7 @@ private struct SidebarView: View {
 
 private struct OverviewView: View {
     @ObservedObject var faceLockStore: FaceLockStore
+    @ObservedObject var setupCoordinator: SetupCoordinator
     let accentColor: Color
     @Binding var selection: AppSection
 
@@ -260,10 +314,18 @@ private struct OverviewView: View {
 
             VStack(alignment: .trailing, spacing: 8) {
                 Button(faceLockStore.protectionEnabled ? "暂停保护" : "恢复保护") {
-                    faceLockStore.setProtectionEnabled(!faceLockStore.protectionEnabled)
+                    if faceLockStore.protectionEnabled {
+                        faceLockStore.setProtectionEnabled(false)
+                    } else {
+                        Task {
+                            try? await setupCoordinator.enableProtection()
+                            faceLockStore.refresh()
+                        }
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
+                .disabled(setupCoordinator.isQuitting)
 
                 if let error = faceLockStore.lastError {
                     Text(error)
@@ -600,196 +662,6 @@ private struct ActivityRecordRow: View {
     }
 }
 
-private struct SettingsView: View {
-    @ObservedObject var themeStore: ThemeStore
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
-                Text("外观")
-                    .font(.system(size: 30, weight: .bold))
-
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("显示模式")
-                        .font(.system(size: 18, weight: .semibold))
-
-                    Picker("显示模式", selection: appearanceBinding) {
-                        Text("跟随系统").tag(AppearanceMode.system)
-                        Text("浅色").tag(AppearanceMode.light)
-                        Text("深色").tag(AppearanceMode.dark)
-                    }
-                    .pickerStyle(.segmented)
-
-                    Text(appearanceDescription)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("主题颜色")
-                        .font(.system(size: 18, weight: .semibold))
-
-                    HStack(spacing: 14) {
-                        AccentChoiceCard(
-                            title: "深海蓝",
-                            theme: .oceanBlue,
-                            color: themeAccentColor(for: .oceanBlue),
-                            selectedTheme: themeStore.preferences.accent,
-                            onSelect: themeStore.setAccent
-                        )
-                        AccentChoiceCard(
-                            title: "守护绿",
-                            theme: .guardianGreen,
-                            color: themeAccentColor(for: .guardianGreen),
-                            selectedTheme: themeStore.preferences.accent,
-                            onSelect: themeStore.setAccent
-                        )
-                        AccentChoiceCard(
-                            title: "紫晶",
-                            theme: .amethyst,
-                            color: themeAccentColor(for: .amethyst),
-                            selectedTheme: themeStore.preferences.accent,
-                            onSelect: themeStore.setAccent
-                        )
-                    }
-
-                    Text("仅改变强调色与玻璃染色，不影响安全状态颜色")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("实时预览")
-                        .font(.system(size: 18, weight: .semibold))
-
-                    HStack(spacing: 20) {
-                        Image(systemName: "checkmark.shield.fill")
-                            .font(.system(size: 40, weight: .semibold))
-                            .foregroundStyle(StatusSeverity.safe.color)
-
-                        Text("已开启 · 正常使用中")
-                            .font(.system(size: 23, weight: .bold, design: .rounded))
-                            .foregroundStyle(StatusSeverity.safe.color)
-
-                        Spacer()
-
-                        Button("暂停保护") {}
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.large)
-                            .allowsHitTesting(false)
-                            .accessibilityHidden(true)
-                    }
-                    .padding(28)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .stroke(themeStore.accentColor.opacity(0.22), lineWidth: 1)
-                    }
-                }
-            }
-            .padding(.horizontal, 42)
-            .padding(.top, 56)
-            .padding(.bottom, 42)
-            .frame(maxWidth: 980, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    private var appearanceBinding: Binding<AppearanceMode> {
-        Binding(
-            get: { themeStore.preferences.appearance },
-            set: { themeStore.setAppearance($0) }
-        )
-    }
-
-    private var appearanceDescription: String {
-        switch themeStore.preferences.appearance {
-        case .system:
-            return "自动跟随 macOS 外观设置"
-        case .light:
-            return "始终使用清晰明亮的浅色玻璃外观"
-        case .dark:
-            return "始终使用低眩光的深色玻璃外观"
-        }
-    }
-}
-
-private struct AccentChoiceCard: View {
-    let title: String
-    let theme: AccentTheme
-    let color: Color
-    let selectedTheme: AccentTheme
-    let onSelect: (AccentTheme) -> Void
-
-    private var isSelected: Bool {
-        theme == selectedTheme
-    }
-
-    var body: some View {
-        Button {
-            onSelect(theme)
-        } label: {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    Circle()
-                        .fill(
-                            LinearGradient(
-                                colors: [color.opacity(0.65), color],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .overlay(Circle().stroke(Color.white.opacity(0.36), lineWidth: 1))
-                        .frame(width: 58, height: 58)
-                        .accessibilityHidden(true)
-
-                    Spacer()
-
-                    if isSelected {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 21, weight: .semibold))
-                            .foregroundStyle(color)
-                            .accessibilityHidden(true)
-                    }
-                }
-
-                Text(title)
-                    .font(.system(size: 16, weight: .semibold))
-
-                VStack(spacing: 7) {
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(color.opacity(0.80))
-                        .frame(height: 16)
-                    HStack(spacing: 6) {
-                        Circle().fill(color).frame(width: 8, height: 8)
-                        Capsule().fill(Color.secondary.opacity(0.32)).frame(height: 6)
-                    }
-                    HStack(spacing: 6) {
-                        Circle().fill(Color.secondary.opacity(0.35)).frame(width: 8, height: 8)
-                        Capsule().fill(Color.secondary.opacity(0.25)).frame(height: 6)
-                    }
-                }
-                .accessibilityHidden(true)
-            }
-            .padding(16)
-            .frame(maxWidth: .infinity, minHeight: 172, alignment: .leading)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .stroke(isSelected ? color : Color.primary.opacity(0.10), lineWidth: isSelected ? 2 : 1)
-            }
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(title)
-        .accessibilityValue(isSelected ? "已选择" : "未选择")
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
-    }
-}
-
 private struct EventVisual {
     let symbol: String
     let color: Color
@@ -840,17 +712,6 @@ private enum WorkspaceLinks {
 
     static func openLog(projectURL: URL) {
         NSWorkspace.shared.open(projectURL.appendingPathComponent("logs/agent.log"))
-    }
-}
-
-private func themeAccentColor(for theme: AccentTheme) -> Color {
-    switch theme {
-    case .oceanBlue:
-        return Color(red: 0.20, green: 0.48, blue: 0.96)
-    case .guardianGreen:
-        return Color(red: 0.28, green: 0.67, blue: 0.32)
-    case .amethyst:
-        return Color(red: 0.56, green: 0.32, blue: 0.86)
     }
 }
 

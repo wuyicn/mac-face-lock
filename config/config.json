@@ -28,6 +28,6 @@
   "allow_owner_from_final_evidence": true,
   "final_evidence_owner_threshold": 0.82,
   "enroll_samples": 16,
-  "enroll_timeout_seconds": 40,
+  "enroll_timeout_seconds": 120,
   "log_level": "info"
 }

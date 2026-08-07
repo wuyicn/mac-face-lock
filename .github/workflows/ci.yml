@@ -25,6 +25,13 @@ jobs:
         run: python -m pip install -r requirements-lock.txt
       - name: Run full Python suite
         run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Validate frozen-runtime build lock
+        run: |
+          grep -Fx "PyInstaller==6.21.0" requirements-build.txt
+          python -m pip install -r requirements-build-lock.txt
+          python -m PyInstaller --version | grep -Fx "6.21.0"
+          python -m unittest \
+            tests.test_release_bundle.ReleaseBundlePolicyTests -v
       - name: Compile Python sources
         run: python -m compileall -q -x '/\.git/|/\.venv/|/dist/' .
       - name: Parse all shell entry points
@@ -41,53 +48,171 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: requirements-lock.txt
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.13"
       - name: Install locked Python dependencies
         run: python -m pip install -r requirements-lock.txt
+      - name: Build the bundled runtime
+        run: scripts/build-runtime.sh
       - name: Run full Python suite
         run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Run Swift app-version display tests
+        run: |
+          xcrun swiftc -parse-as-library \
+            src/app/AppVersionDisplay.swift \
+            tests/swift/AppVersionDisplayTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-version-display-tests"
+          "$RUNNER_TEMP/mac-face-lock-version-display-tests"
       - name: Run Swift local-store smoke test
         run: |
           xcrun swiftc -parse-as-library \
-            src/app/Models.swift src/app/LocalJSONStore.swift \
+            src/app/Models.swift src/app/SetupModels.swift \
+            src/app/LocalJSONStore.swift \
             tests/swift/LocalStoreSmokeTests.swift \
             -o "$RUNNER_TEMP/mac-face-lock-store-tests"
           "$RUNNER_TEMP/mac-face-lock-store-tests"
+      - name: Run Swift setup-state tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ProjectLocator.swift src/app/AppEnvironment.swift \
+            src/app/Models.swift src/app/SetupModels.swift \
+            src/app/LocalJSONStore.swift src/app/SetupStore.swift \
+            tests/swift/SetupStateTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-setup-state-tests"
+          "$RUNNER_TEMP/mac-face-lock-setup-state-tests"
+      - name: Run Swift permission-state tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/SetupModels.swift src/app/PermissionCenter.swift \
+            tests/swift/PermissionStateTests.swift \
+            -framework AppKit -framework AVFoundation \
+            -framework ApplicationServices -framework CoreGraphics \
+            -o "$RUNNER_TEMP/mac-face-lock-permission-tests"
+          "$RUNNER_TEMP/mac-face-lock-permission-tests"
+      - name: Run Swift runtime-command-runner tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ProjectLocator.swift src/app/AppEnvironment.swift \
+            src/app/RuntimeCommandRunner.swift \
+            tests/swift/RuntimeCommandRunnerTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-runtime-command-tests"
+          "$RUNNER_TEMP/mac-face-lock-runtime-command-tests"
+      - name: Run Swift service-manager tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/Models.swift src/app/ServiceManager.swift \
+            tests/swift/ServiceManagerTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-service-manager-tests"
+          "$RUNNER_TEMP/mac-face-lock-service-manager-tests"
+      - name: Run Swift setup-coordinator tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ProjectLocator.swift src/app/AppEnvironment.swift \
+            src/app/Models.swift src/app/SetupModels.swift \
+            src/app/LocalJSONStore.swift src/app/SetupStore.swift \
+            src/app/PermissionCenter.swift src/app/RuntimeCommandRunner.swift \
+            src/app/ServiceManager.swift src/app/SecureFileTree.swift \
+            src/app/LegacyInstallCleaner.swift src/app/SetupCoordinator.swift \
+            tests/swift/SetupCoordinatorTests.swift \
+            -framework AppKit -framework AVFoundation \
+            -framework ApplicationServices -framework CoreGraphics \
+            -o "$RUNNER_TEMP/mac-face-lock-setup-coordinator-tests"
+          "$RUNNER_TEMP/mac-face-lock-setup-coordinator-tests"
       - name: Run Swift project-locator tests
         run: |
           xcrun swiftc -parse-as-library -DTESTING \
             src/app/ProjectLocator.swift tests/swift/ProjectLocatorTests.swift \
             -o "$RUNNER_TEMP/mac-face-lock-project-locator-tests"
           "$RUNNER_TEMP/mac-face-lock-project-locator-tests"
+      - name: Run Swift app-environment tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ProjectLocator.swift src/app/AppEnvironment.swift \
+            tests/swift/AppEnvironmentTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-environment-tests"
+          "$RUNNER_TEMP/mac-face-lock-environment-tests"
+      - name: Run Swift application launch mode tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ApplicationLaunchMode.swift \
+            tests/swift/ApplicationLaunchModeTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-application-mode-tests"
+          "$RUNNER_TEMP/mac-face-lock-application-mode-tests"
+      - name: Run Swift application quit coordinator tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/ApplicationQuitCoordinator.swift \
+            tests/swift/ApplicationQuitCoordinatorTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-quit-tests"
+          "$RUNNER_TEMP/mac-face-lock-quit-tests"
       - name: Run Swift agent-launcher tests
         run: |
           xcrun swiftc -parse-as-library -DTESTING \
             src/agent-launcher/main.swift tests/swift/AgentLauncherPathTests.swift \
             -o "$RUNNER_TEMP/mac-face-lock-agent-launcher-tests"
           "$RUNNER_TEMP/mac-face-lock-agent-launcher-tests"
+      - name: Run Swift UI-event trace recorder tests
+        run: |
+          xcrun swiftc -parse-as-library \
+            -target arm64-apple-macosx12.0 \
+            -strict-concurrency=complete -warn-concurrency -warnings-as-errors \
+            src/app/UIEventTraceRecorder.swift \
+            tests/swift/UIEventTraceRecorderTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-ui-event-trace-tests"
+          "$RUNNER_TEMP/mac-face-lock-ui-event-trace-tests"
+      - name: Run Swift local-mouse monitor tests
+        run: |
+          xcrun swiftc -parse-as-library \
+            -target arm64-apple-macosx12.0 \
+            -strict-concurrency=complete -warn-concurrency -warnings-as-errors \
+            src/app/UIEventTraceRecorder.swift \
+            src/app/LocalMouseEventMonitor.swift \
+            tests/swift/LocalMouseEventMonitorTests.swift \
+            -framework AppKit \
+            -o "$RUNNER_TEMP/mac-face-lock-mouse-monitor-tests"
+          "$RUNNER_TEMP/mac-face-lock-mouse-monitor-tests"
+      - name: Run Swift secure-file-tree tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/SecureFileTree.swift tests/swift/SecureFileTreeTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-secure-tree-tests"
+          "$RUNNER_TEMP/mac-face-lock-secure-tree-tests"
+      - name: Run Swift legacy-install-cleaner tests
+        run: |
+          xcrun swiftc -parse-as-library -DTESTING \
+            src/app/Models.swift src/app/ServiceManager.swift \
+            src/app/SecureFileTree.swift src/app/LegacyInstallCleaner.swift \
+            tests/swift/LegacyInstallCleanerTests.swift \
+            -o "$RUNNER_TEMP/mac-face-lock-legacy-cleaner-tests"
+          "$RUNNER_TEMP/mac-face-lock-legacy-cleaner-tests"
       - name: Typecheck the unified Swift application
         run: |
           xcrun swiftc -parse-as-library -typecheck \
-            src/app/*.swift -framework AppKit -framework SwiftUI
-      - name: Build both ad-hoc signed applications
+            src/app/*.swift -framework AppKit -framework SwiftUI \
+            -framework AVFoundation -framework ApplicationServices \
+            -framework CoreGraphics
+      - name: Build the unified ad-hoc signed application
         run: |
-          scripts/build-app.sh
           scripts/build-status-app.sh
       - name: Lint source, LaunchAgent, and bundle plists
         run: |
           plutil -lint src/app/Info.plist \
             launchd/com.wuyi.mac-face-lock-agent.plist \
+            launchd/com.wuyi.mac-face-lock-release.plist \
             launchd/com.wuyi.mac-face-lock-status.plist \
-            "dist/Mac Face Lock Agent.app/Contents/Info.plist" \
             "dist/Mac Face Lock.app/Contents/Info.plist"
       - name: Verify ad-hoc signatures
         run: |
-          codesign --verify --deep --strict "dist/Mac Face Lock Agent.app"
           codesign --verify --deep --strict "dist/Mac Face Lock.app"
+          codesign --verify --strict \
+            "dist/runtime/MacFaceLockRuntime/MacFaceLockRuntime"
       - name: Verify Mach-O minos 12.0
         run: |
           for executable in \
-            "dist/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent" \
-            "dist/Mac Face Lock.app/Contents/MacOS/MacFaceLock"
+            "dist/Mac Face Lock.app/Contents/MacOS/MacFaceLock" \
+            "dist/runtime/MacFaceLockRuntime/MacFaceLockRuntime"
           do
             build_info="$(xcrun vtool -show-build "$executable")"
             printf '%s\n' "$build_info"

@@ -4,7 +4,7 @@
 
 **Goal:** Deliver an Apple Silicon open-source Beta that a customer can download and configure without Codex, Python, Xcode Command Line Tools, or Terminal.
 
-**Architecture:** Keep the tested Python/OpenCV protection core, add explicit runtime paths and a structured command-line boundary, freeze it into an arm64 self-contained runtime with PyInstaller 6.21.0, and embed that runtime plus the hidden Agent inside the SwiftUI application. The visible application owns onboarding, permission status, service installation, migration, and settings; protection remains disabled until every required gate passes.
+**Architecture:** Keep the tested Python/OpenCV protection core, add explicit runtime paths and a structured command-line boundary, freeze it into an arm64 self-contained runtime with PyInstaller 6.21.0, and embed that runtime plus the hidden Agent inside the SwiftUI application. The visible application owns onboarding, permission status, service installation, service diagnostics, and settings; protection remains disabled until every required gate passes.
 
 **Tech Stack:** Swift 5 / SwiftUI / AppKit / AVFoundation / ApplicationServices / CoreGraphics, Python 3.11, PyInstaller 6.21.0, OpenCV 4.10.0.84, NumPy 1.26.4, unittest, LaunchAgent, ad-hoc codesigning.
 
@@ -32,7 +32,7 @@ New focused units:
 - `template_store.py`: validation and atomic owner-template replacement.
 - `src/app/AppEnvironment.swift`: source/release environment resolution.
 - `src/app/SetupModels.swift`: onboarding state, permission state, and readiness gates.
-- `src/app/SetupStore.swift`: persistent onboarding and migration state.
+- `src/app/SetupStore.swift`: persistent onboarding state.
 - `src/app/PermissionCenter.swift`: macOS permission probes, requests, and settings links.
 - `src/app/RuntimeCommandRunner.swift`: JSON-lines process runner for the frozen runtime.
 - `src/app/ServiceManager.swift`: user LaunchAgent install, verification, restart, and rollback.
@@ -83,7 +83,7 @@ class RuntimePathsTests(unittest.TestCase):
 
 - [ ] **Step 2: Run the tests and verify RED**
 
-Run: `python -m unittest tests.test_runtime_paths -v`  
+Run: `python -m unittest tests.test_runtime_paths -v`
 Expected: `ModuleNotFoundError: No module named 'runtime_paths'`.
 
 - [ ] **Step 3: Implement the immutable path contract**
@@ -112,7 +112,7 @@ Add computed path properties and `ensure_writable_directories()`. Refactor modul
 
 - [ ] **Step 4: Run focused and regression tests**
 
-Run: `python -m unittest tests.test_runtime_paths tests.test_control_store tests.test_activity_store tests.test_agent_control -v`  
+Run: `python -m unittest tests.test_runtime_paths tests.test_control_store tests.test_activity_store tests.test_agent_control -v`
 Expected: all tests pass.
 
 - [ ] **Step 5: Commit**
@@ -161,7 +161,7 @@ def test_diagnose_emits_versioned_json(self):
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `python -m unittest tests.test_template_store tests.test_runtime_cli -v`  
+Run: `python -m unittest tests.test_template_store tests.test_runtime_cli -v`
 Expected: imports fail because the new modules do not exist.
 
 - [ ] **Step 3: Implement JSON event output and template transaction**
@@ -188,7 +188,7 @@ Make enrollment emit `enrollment_started`, repeated `enrollment_progress`, and `
 
 Add a test that patches `lock_controller.lock_screen` to raise if called, invokes `verify-owner`, and asserts success without the patch being called.
 
-Run: `python -m unittest tests.test_runtime_cli tests.test_template_store tests.test_agent_control -v`  
+Run: `python -m unittest tests.test_runtime_cli tests.test_template_store tests.test_agent_control -v`
 Expected: all tests pass.
 
 - [ ] **Step 5: Commit**
@@ -315,7 +315,7 @@ For release mode, also prove that a missing onboarding record creates `control.j
 
 - [ ] **Step 2: Compile and verify RED**
 
-Run the new Swift test target.  
+Run the new Swift test target.
 Expected: compile failure for missing setup types.
 
 - [ ] **Step 3: Implement models and atomic persistence**
@@ -472,7 +472,7 @@ Use `launchctl bootout`, `bootstrap`, `enable`, and `kickstart` through bounded 
 
 The coordinator must install and verify the service before making the final “开启保护” action available. A moved app path must produce `.needsRepair`.
 
-- [ ] **Step 5: Run service, packaging, and existing migration tests**
+- [ ] **Step 5: Run service, packaging, and existing onboarding tests**
 
 Expected: all pass.
 
@@ -504,7 +504,7 @@ git commit -m "feat: manage the bundled background service"
 
 Extend `tests/test_packaging.py` to require the five onboarding step labels, operational settings section labels, and no shell-command copy in user-facing Swift sources.
 
-Run: `python -m unittest tests.test_packaging.UnifiedPackagingTests.test_onboarding_sources_define_complete_customer_flow -v`  
+Run: `python -m unittest tests.test_packaging.UnifiedPackagingTests.test_onboarding_sources_define_complete_customer_flow -v`
 Expected: failure because the new views do not exist.
 
 - [ ] **Step 2: Implement the five onboarding screens**
@@ -533,7 +533,7 @@ Add “重新录入本人”, “刷新权限”, “打开系统设置”, “�
 
 - [ ] **Step 4: Typecheck, build, and run packaging tests**
 
-Run the Swift typecheck, `scripts/build-status-app.sh`, and `python -m unittest tests.test_packaging -v`.  
+Run the Swift typecheck, `scripts/build-status-app.sh`, and `python -m unittest tests.test_packaging -v`.
 Expected: all pass.
 
 - [ ] **Step 5: Commit**
@@ -546,6 +546,8 @@ git commit -m "feat: add guided first-run setup"
 ---
 
 ### Task 9: Import Existing Source-Beta Data Safely
+
+> **Superseded on 2026-07-18:** The first open-source Beta does not ship automatic source-beta migration. The replacement implementation is `docs/superpowers/plans/2026-07-18-defer-source-beta-migration.md`. Existing source-beta data remains untouched and the release requires fresh enrollment.
 
 **Files:**
 - Create: `src/app/SourceDataMigrator.swift`
@@ -626,7 +628,7 @@ Require:
 
 - [ ] **Step 2: Run and verify RED**
 
-Run: `python -m unittest tests.test_release_bundle -v`  
+Run: `python -m unittest tests.test_release_bundle -v`
 Expected: failure because release build scripts and artifact do not exist.
 
 - [ ] **Step 3: Add the reproducible PyInstaller build**
@@ -679,7 +681,7 @@ Require pinned Python 3.11, `PyInstaller==6.21.0`, macOS runner, build-release i
 
 - [ ] **Step 2: Run and verify RED**
 
-Run the focused open-source policy tests.  
+Run the focused open-source policy tests.
 Expected: missing workflow assertions fail.
 
 - [ ] **Step 3: Implement workflows and gates**
@@ -734,7 +736,7 @@ Build the actual application, open the permission and enrollment screens with sy
 
 - [ ] **Step 5: Run documentation and privacy gates**
 
-Run `python -m unittest tests.test_open_source_policy -v` and inspect the tracked-file private-path scan.  
+Run `python -m unittest tests.test_open_source_policy -v` and inspect the tracked-file private-path scan.
 Expected: all pass.
 
 - [ ] **Step 6: Commit**

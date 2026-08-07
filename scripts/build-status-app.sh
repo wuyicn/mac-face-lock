@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SIGN_CODE="$ROOT_DIR/scripts/sign-code.sh"
 APP_DIR="$ROOT_DIR/dist/Mac Face Lock.app"
 BUILD_DIR="$ROOT_DIR/dist/.Mac Face Lock.app.building"
 PREVIOUS_DIR="$ROOT_DIR/dist/.Mac Face Lock.app.previous"
@@ -11,12 +12,22 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 EXECUTABLE="$MACOS_DIR/MacFaceLock"
 GENERATION_FILE="Contents/Resources/BuildGeneration"
+RUNTIME_SOURCE="$ROOT_DIR/dist/runtime/MacFaceLockRuntime"
+RUNTIME_EXECUTABLE="$RUNTIME_SOURCE/MacFaceLockRuntime"
+BUNDLED_RUNTIME_EXECUTABLE="Contents/Resources/runtime/MacFaceLockRuntime/MacFaceLockRuntime"
+RELEASE_LAUNCHD_DIR="$RESOURCES_DIR/launchd"
+TCC_BUNDLE_IDENTIFIER="com.wuyi.mac-face-lock.app"
 
 bundle_is_valid() {
   local bundle="$1"
   [[ -d "$bundle" ]] || return 1
   [[ -x "$bundle/Contents/MacOS/MacFaceLock" ]] || return 1
+  [[ -x "$bundle/$BUNDLED_RUNTIME_EXECUTABLE" ]] || return 1
+  [[ -f "$bundle/Contents/Resources/launchd/com.wuyi.mac-face-lock-release.plist" ]] || return 1
   plutil -lint "$bundle/Contents/Info.plist" >/dev/null 2>&1 || return 1
+  plutil -lint \
+    "$bundle/Contents/Resources/launchd/com.wuyi.mac-face-lock-release.plist" \
+    >/dev/null 2>&1 || return 1
   codesign --verify --deep --strict "$bundle" >/dev/null 2>&1 || return 1
 }
 
@@ -82,8 +93,17 @@ mkdir -p "$ROOT_DIR/dist"
 recover_pair "$PREVIOUS_DIR"
 recover_pair "$BUILD_DIR" 1
 
-mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
+if [[ ! -x "$RUNTIME_EXECUTABLE" ]]; then
+  echo "缺少已构建的运行时: $RUNTIME_EXECUTABLE" >&2
+  exit 1
+fi
+
+mkdir -p "$MACOS_DIR" "$RESOURCES_DIR/runtime" "$RELEASE_LAUNCHD_DIR"
 cp "$ROOT_DIR/src/app/Info.plist" "$CONTENTS_DIR/Info.plist"
+cp "$ROOT_DIR/src/app/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+cp -R "$RUNTIME_SOURCE" "$RESOURCES_DIR/runtime/MacFaceLockRuntime"
+cp "$ROOT_DIR/launchd/com.wuyi.mac-face-lock-release.plist" \
+  "$RELEASE_LAUNCHD_DIR/com.wuyi.mac-face-lock-release.plist"
 CURRENT_GENERATION="$(bundle_generation "$APP_DIR")"
 printf '%s\n' "$((CURRENT_GENERATION + 1))" > "$BUILD_DIR/$GENERATION_FILE"
 SOURCE_FILES=("$ROOT_DIR"/src/app/*.swift)
@@ -93,10 +113,17 @@ xcrun swiftc "${SOURCE_FILES[@]}" \
   -target arm64-apple-macosx12.0 \
   -framework AppKit \
   -framework SwiftUI \
+  -framework AVFoundation \
+  -framework ApplicationServices \
+  -framework CoreGraphics \
   -o "$EXECUTABLE"
 chmod +x "$EXECUTABLE"
-codesign --sign - --force --deep "$BUILD_DIR" >/dev/null
+"$SIGN_CODE" --deep \
+  --identifier "$TCC_BUNDLE_IDENTIFIER" \
+  "$BUILD_DIR" >/dev/null
 plutil -lint "$CONTENTS_DIR/Info.plist" >/dev/null
+plutil -lint \
+  "$RELEASE_LAUNCHD_DIR/com.wuyi.mac-face-lock-release.plist" >/dev/null
 codesign --verify --deep --strict "$BUILD_DIR"
 
 "$SWAP_HELPER" "$BUILD_DIR" "$APP_DIR"

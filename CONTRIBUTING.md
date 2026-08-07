@@ -9,7 +9,7 @@
 3. 更新与用户行为相关的 README、CHANGELOG 或安全说明。
 4. 在 Pull Request 中说明动机、风险、验证结果和任何未解决的限制。
 
-依赖变更必须同时更新 `requirements.txt`、`requirements-lock.txt` 和 `THIRD_PARTY_NOTICES.md`。不要降低 Python 3.9、Apple Silicon 或 macOS 12 的公开兼容基线，除非变更经过明确讨论。
+运行依赖变更必须同时更新 `requirements.txt`、`requirements-lock.txt` 和 `THIRD_PARTY_NOTICES.md`；发行构建依赖还要更新 `requirements-build.txt`、`requirements-build-lock.txt`。不要降低 Python 3.9、Apple Silicon 或 macOS 12 的公开兼容基线，除非变更经过明确讨论。
 
 ## 隐私和安全要求
 
@@ -47,6 +47,23 @@ xcrun swiftc -parse-as-library -DTESTING \
   -o /tmp/mac-face-lock-agent-launcher-tests
 /tmp/mac-face-lock-agent-launcher-tests
 
+xcrun swiftc -parse-as-library \
+  -target arm64-apple-macosx12.0 \
+  -strict-concurrency=complete -warn-concurrency -warnings-as-errors \
+  src/app/UIEventTraceRecorder.swift \
+  tests/swift/UIEventTraceRecorderTests.swift \
+  -o /tmp/mac-face-lock-ui-event-trace-tests
+/tmp/mac-face-lock-ui-event-trace-tests
+
+xcrun swiftc -parse-as-library \
+  -target arm64-apple-macosx12.0 \
+  -strict-concurrency=complete -warn-concurrency -warnings-as-errors \
+  src/app/UIEventTraceRecorder.swift src/app/LocalMouseEventMonitor.swift \
+  tests/swift/LocalMouseEventMonitorTests.swift \
+  -framework AppKit \
+  -o /tmp/mac-face-lock-mouse-monitor-tests
+/tmp/mac-face-lock-mouse-monitor-tests
+
 xcrun swiftc -parse-as-library -typecheck \
   src/app/*.swift -framework AppKit -framework SwiftUI
 
@@ -62,3 +79,5 @@ codesign --verify --deep --strict "dist/Mac Face Lock.app"
 ```
 
 Pull Request 必须附上完整验证结果。若某项无法运行，请清楚说明原因和未验证风险，不能用部分测试结果代替完整验证。
+
+涉及发行包的 Pull Request 还必须运行 `scripts/build-release.sh`，验证 ZIP 的 SHA-256、临时签名、arm64 架构、macOS 12 最低版本、内置运行组件与解压后的策略测试。发布工作流只产生供人工验收的构件；不得在未完成真实新账号验收、Developer ID 签名和 Apple 公证前自动创建 GitHub Release。

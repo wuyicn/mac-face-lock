@@ -9,17 +9,21 @@
   <string>Mac Face Lock</string>
   <key>CFBundleIdentifier</key>
   <string>com.wuyi.mac-face-lock.app</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>0.2.0</string>
   <key>CFBundleExecutable</key>
   <string>MacFaceLock</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Mac Face Lock 使用摄像头在本机验证当前使用者是否为本人。</string>
   <key>LSUIElement</key>
-  <true/>
+  <false/>
 </dict>
 </plist>

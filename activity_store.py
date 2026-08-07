@@ -7,10 +7,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from runtime_paths import RuntimePaths
 from state_store import now_iso
 
 
-ACTIVITY_PATH = Path(__file__).resolve().parent / "data" / "activity.jsonl"
+ACTIVITY_PATH = RuntimePaths.for_source(
+    Path(__file__).resolve().parent
+).activity_path
 _WRITE_LOCK = threading.Lock()
 
 

@@ -16,6 +16,12 @@ struct FaceLockState: Codable, Equatable {
     var framesChecked: Int?
     var lockReason: String?
     var lockSucceeded: Bool?
+    var agentPid: Int32?
+    var cameraReady: Bool?
+    var inputMonitoringReady: Bool?
+    var accessibilityReady: Bool?
+    var heartbeatTimestamp: String?
+    var heartbeatSequence: UInt64?
 
     init(
         status: String,
@@ -32,7 +38,13 @@ struct FaceLockState: Codable, Equatable {
         noFaceHits: Int? = nil,
         framesChecked: Int? = nil,
         lockReason: String? = nil,
-        lockSucceeded: Bool? = nil
+        lockSucceeded: Bool? = nil,
+        agentPid: Int32? = nil,
+        cameraReady: Bool? = nil,
+        inputMonitoringReady: Bool? = nil,
+        accessibilityReady: Bool? = nil,
+        heartbeatTimestamp: String? = nil,
+        heartbeatSequence: UInt64? = nil
     ) {
         self.status = status
         self.mode = mode
@@ -49,6 +61,12 @@ struct FaceLockState: Codable, Equatable {
         self.framesChecked = framesChecked
         self.lockReason = lockReason
         self.lockSucceeded = lockSucceeded
+        self.agentPid = agentPid
+        self.cameraReady = cameraReady
+        self.inputMonitoringReady = inputMonitoringReady
+        self.accessibilityReady = accessibilityReady
+        self.heartbeatTimestamp = heartbeatTimestamp
+        self.heartbeatSequence = heartbeatSequence
     }
 
     static let missing = FaceLockState(status: "missing", armed: false)
@@ -91,6 +109,11 @@ struct ControlFile: Codable, Equatable {
     var schemaVersion: Int = 1
     var protectionEnabled: Bool
     var updatedAt: String
+
+    static let enabledFallback = ControlFile(
+        protectionEnabled: true,
+        updatedAt: ""
+    )
 }
 
 enum AppearanceMode: String, Codable, CaseIterable {

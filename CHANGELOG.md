@@ -2,9 +2,28 @@
 
 本项目的所有重要变更都记录在此文件中。
 
-格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)。Beta 标签使用 Git tag `v0.1.0-beta`，应用内营销版本为 `0.1.0`、build 为 `1`。
+格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，版本号遵循 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)。当前 Beta 标签为 `v0.2.0-beta`，应用内营销版本为 `0.2.0`、build 为 `1`。
 
 ## [Unreleased]
+
+## [0.2.0-beta] - 2026-07-18
+
+### Added
+
+- 面向普通客户的 Apple Silicon 自包含离线发行包，无需 Codex、Python、Xcode、终端或源码仓库。
+- 原生首次设置流程：准备检查、权限中心、五姿态本人录入、安全测试与服务启用。
+- 手动 GitHub Actions 构件工作流，生成 ZIP 与 SHA-256 供维护者检查，不自动发布。
+- 旧版结构不明确时的隐私安全诊断摘要与非技术处理指南。
+
+### Changed
+
+- 本人录入只有在正脸、左转、右转、轻微低头和轻微抬头全部达标后才原子替换旧模板。
+- 已确认的旧源码 Beta 采用单向清理；删除阶段使用描述符相对的隔离名与恢复日志，缩小替换竞态。
+
+### Security
+
+- 保持摄像头失败时 fail-open、通知默认关闭、屏幕截图默认关闭及没有活体检测的公开边界。
+- 发行包使用临时签名且尚未 Apple 公证；首次启动需要 Finder 右键打开。
 
 ## [0.1.0-beta] - 2026-07-15
 

@@ -1,58 +1,63 @@
 # Mac Face Lock
 
-Mac Face Lock 是一套默认在本机处理、运行时默认离线的 macOS 人脸锁屏辅助工具。当前发布是 **源码 Beta**：仓库提供源码和本地构建脚本，不提供 Developer ID 签名或 Apple 公证的二进制安装包；用户显式启用的外部通知脚本是离线默认的例外。
-
-公开版本为 `0.1.0-beta`，对应 Git tag `v0.1.0-beta`；两个应用的营销版本统一为 `0.1.0`、build 为 `1`。项目源码采用 [MIT License](LICENSE)。
+Mac Face Lock 是一款默认在本机处理、运行时默认离线的 macOS 人脸锁屏辅助工具。项目提供自包含桌面发行包的构建能力，也支持从源码自行构建。项目源码采用 [MIT License](LICENSE)。
 
 > 安全提醒：当前人脸比对没有活体检测，照片、视频或其他重放方式可能绕过识别。Mac Face Lock 不能替代 macOS 登录密码、Touch ID、FileVault、系统锁屏策略、MDM 或物理访问控制，不应用于高安全场景。
 
-## 桌面端界面预览
+## 普通客户：下载安装
 
-### 保护概览
+正式面向普通客户的构建只会发布在项目的 **GitHub Releases**，文件名为 `Mac-Face-Lock-0.2.0-beta-arm64.zip` 和同名 `.sha256`。如果 Releases 页面没有发行版，表示项目**尚未公开客户构建**，请不要把 Actions 构件、本地构建或第三方转载当作正式下载。发行包自带运行组件，**无需 Codex、Python、Xcode、终端或源码仓库**。
 
-![Mac Face Lock 桌面端保护概览](docs/design-references/mac-face-lock-overview-liquid-glass.png)
+1. 在 Finder 中解压 ZIP，把 `Mac Face Lock.app` 拖入“应用程序”。
+2. 可按 [普通客户安装指南](docs/customer-installation.md) 校验 SHA-256。
+3. 因当前公开 Beta 使用临时签名且没有 Apple 公证，首次启动请在 Finder 中对应用**右键**，选择“打开”，再确认一次。
+4. 按首次设置依次完成“准备检查”“权限中心”“录入本人”和“权限确认”，最后在“完成并开启”中主动开启保护。
 
-### 外观设置
+发行包中的控制中心与内嵌后台运行时使用同一个 `Mac Face Lock` 代码签名身份。升级
+自本次修复之前的 Beta 后，macOS 可能仍保留旧版本的隐私授权记录；请在三个系统
+设置页面中对当前的 **Mac Face Lock** 各重新确认一次，之后同一发行身份的升级不
+会再生成第二个 Agent 权限项。
 
-![Mac Face Lock 桌面端外观设置](docs/design-references/mac-face-lock-appearance-settings.png)
+当前发行版支持 Apple Silicon Mac 与 macOS 12 或更高版本。首次设置会引导开启：
 
-## 系统要求
+- 控制中心的摄像头权限；
+- Mac Face Lock 应用的摄像头、输入监控和辅助功能权限；
+- 仅在用户启用锁屏前截图时才需要的屏幕录制权限。
 
-- Apple Silicon Mac
-- macOS 12 或更高版本
-- Python 3.9 或更高版本
-- Xcode Command Line Tools（用于本地编译两个 Swift 启动应用）
-- 摄像头、输入监控和辅助功能权限
-- 仅当启用锁屏前屏幕截图时需要屏幕录制权限
+系统更新、移动应用或重置隐私权限后，macOS 可能要求再次授权。应用会显示修复入口；重新授权后回到权限中心或权限确认页刷新状态即可。升级自早期源码 Beta 时，不导入旧模板，必须**重新录入本人**并确认权限状态。
 
-所有系统权限都必须由用户在“系统设置 → 隐私与安全性”中确认；脚本不会绕过系统授权。
+### 首次设置界面
 
-## 安装
+权限中心会逐项显示真实授权状态：
 
-在终端运行：
+![Mac Face Lock 权限中心](docs/design-references/mac-face-lock-onboarding-permissions.png)
 
-```bash
-git clone <repository-url>
-cd mac-face-lock-agent
-scripts/bootstrap.sh
-scripts/enroll-owner.sh
-scripts/install-launchagent.sh
-```
+录入本人完成后，权限确认页会重新读取统一 Mac Face Lock 应用身份的摄像头、输入监控、辅助功能和后台服务状态。它只显示实时状态并提供系统设置入口，不执行额外的诊断或本人验证。
 
-`scripts/bootstrap.sh` 会拒绝低于 Python 3.9 的解释器，创建 `.venv`，并从 `requirements-lock.txt` 安装固定版本依赖。该锁文件目前不包含 hashes：它固定解析后的版本，但不提供下载包文件的哈希完整性校验。首次安装依赖需要访问 pip 包源。
+录入本人要求完成正脸、左转、右转、轻微低头和轻微抬头，任一动作缺失都不会提前完成：
 
-录入本人时，请在摄像头前缓慢覆盖正脸、左右约 30 度、轻微低头和抬头。模板保存在 `data/owner_face.npy`，不要提交到 Git。
+![Mac Face Lock 录入本人](docs/design-references/mac-face-lock-onboarding-enrollment.png)
 
-安装脚本必须从主仓库目录运行，不能从 linked worktree 直接迁移正在运行的服务。脚本会构建并临时签名两个应用、验证签名，再事务式更新两个用户 LaunchAgent。
+更多 Finder 安装、校验、权限修复和卸载说明见 [普通客户安装指南](docs/customer-installation.md)。
+
+## 安全与隐私边界
+
+- 人脸模板、验证、状态、活动记录、设置和可选证据默认在本机处理；正常运行默认离线。
+- 摄像头不可用或读取失败时使用 **fail-open**：保持 Mac 解锁并显示警告，避免设备故障造成误锁。这不是高安全策略。
+- 当前版本**没有活体检测**，可能被照片或视频重放绕过。
+- 通知默认关闭；只有用户显式配置自定义脚本后，事件才可能离开本机。
+- 屏幕截图默认关闭；摄像头证据默认只保存在本机。
+- “暂停保护”会停止布防、验证和锁屏，但界面、活动记录及已配置的通知链路仍可运行。
+
+完整威胁边界和私密漏洞报告状态见 [SECURITY.md](SECURITY.md)。
 
 ## 工作方式
 
-系统由两个常驻进程组成：
+发行版只安装一个 `Mac Face Lock.app`。后台运行组件和控制中心都内置在这个应用包中，权限只需要授予统一的 Mac Face Lock 应用身份，不需要单独安装、打开或授权另一个 Agent 应用。
 
-- `Mac Face Lock Agent.app`：唯一的 Python 安全执行器，负责输入监听、人脸验证、状态记录与锁屏。
-- `Mac Face Lock.app`：统一的原生菜单栏与桌面控制中心，只展示状态并发送暂停/恢复指令，不执行人脸识别或锁屏。
+后台运行组件负责输入监听、人脸验证、状态记录与锁屏；同一个 Mac Face Lock 应用还负责首次设置、状态展示和暂停/恢复。
 
-默认 `presence_guard` 流程：
+默认保护流程：
 
 ```text
 正常使用，不检查摄像头
@@ -70,72 +75,75 @@ scripts/install-launchagent.sh
 摄像头不可用：保持解锁并显示警告
 ```
 
-锁屏不会让系统睡眠，也不会停止网络或后台服务。关键默认值位于 `config/config.json`：空闲 60 秒后布防；本人命中至少 2 次放行；陌生人命中至少 3 次锁屏；锁屏后与摄像头错误冷却时间均不少于 300 秒。
+锁屏不会让系统睡眠，也不会停止网络或后台服务。默认空闲 60 秒后布防；本人命中至少 2 次放行；陌生人命中至少 3 次锁屏；锁屏后与摄像头错误冷却时间均不少于 300 秒。
 
-## 隐私、安全与通知
+## 本地数据与卸载
 
-- 正常运行默认离线：人脸模板、验证、状态、活动记录和设置都在本机处理，不调用云端识别服务。
-- 摄像头不可用时保持 Mac 解锁。`lock_on_camera_error` 默认且必须保持为 `false`；摄像头故障不会被当成陌生人。
-- 通知默认关闭：`event_notify_on_lock` 为 `false`，`event_notify_script` 为空。项目只提供可选的本地通知脚本接口，不内置外部发送服务。
-- 显式启用通知接口后，自定义脚本可能把事件或证据发送到外部系统；该脚本的目的地、存储和重试策略由使用者负责审查。
-- 摄像头证据默认保存在本机，屏幕截图默认关闭。
-- “暂停保护”会停止布防、验证和锁屏，但 Agent、界面、活动记录和已配置的通知链路仍可运行。
+发行版数据保存在用户的 Application Support 目录；源码开发模式的数据位于仓库的 `data/` 与 `logs/`。主要内容包括本人模板、状态、活动记录、界面偏好、日志及可选证据。
 
-更完整的威胁边界和私密漏洞报告方式见 [SECURITY.md](SECURITY.md)。
+普通**卸载**应先打开“设置 → 服务诊断与修复”，点击“卸载后台服务并保留数据”并确认成功，再退出应用并把它移到废纸篓。该操作停止服务并默认**保留数据**，以后重装可继续使用。只把应用移到废纸篓不能可靠停止已注册的后台服务。若要**彻底删除**，请先确认不再需要本人模板、活动记录和证据，再按 [普通客户安装指南](docs/customer-installation.md#卸载与删除数据) 删除应用支持数据。此操作不可恢复。
 
-## 统一菜单栏与控制中心
+## 从源码测试版转到发行版
 
-安装后，菜单栏会出现 `脸锁:…` 状态入口。可以直接查看状态、暂停或恢复保护、刷新状态、打开证据目录、查看 Agent 日志，以及打开控制中心。
+如果发行版检测到本项目已知的源码测试版，会在首次设置中要求确认一次不可恢复的清理：
+停止并移除旧 Agent 与旧状态服务，删除源码目录中的 config/config.json、data/、logs/
+和已构建的 Mac Face Lock 应用。源码、Git 历史、文档、脚本与 .venv 保留。
+旧人脸模板和设置不会导入；清理完成后必须重新授权、录入本人并确认权限状态。
+卸载发行版不会恢复旧服务或旧数据。
 
-控制中心包含“保护”“记录”“设置”三个页面。重复打开只会唤起同一个窗口；暂停后，菜单栏、保护页和 `data/state.json` 都会显示明确的暂停状态。
+如旧版结构不完整，应用不会猜测或继续删除，而会提供仅含结构布尔值的诊断摘要与处理指南。
 
-界面支持跟随系统、浅色或深色外观，以及深海蓝、守护绿、紫晶三种强调色。偏好保存在 `data/ui-preferences.json`；主题色不会覆盖安全、警告和错误的语义颜色。
+## 源码开发
 
-## 本地数据
+源码发布线仍是 **源码 Beta**，适用于开发、审计和贡献。需要 Apple Silicon Mac、macOS 12 或更高版本、Python 3.9 或更高版本，以及 Xcode Command Line Tools。
 
-| 路径 | 用途 |
-| --- | --- |
-| `data/owner_face.npy` | 本人人脸模板 |
-| `data/state.json` | Agent 当前状态 |
-| `data/control.json` | 暂停/恢复控制状态 |
-| `data/activity.jsonl` | 控制中心活动时间线 |
-| `data/ui-preferences.json` | 外观和主题偏好 |
-| `data/evidence/` | 可选的锁屏前本地证据 |
-| `logs/agent.log` | Agent 运行日志 |
+源码开发模式的构建脚本会额外生成 `Mac Face Lock Agent.app` 供开发和审计使用；它不属于普通客户下载的发行包。普通客户发行包仍只有一个 `Mac Face Lock.app` 应用身份。
 
-`data/activity.jsonl` 是本机 JSON Lines 文件，仅供统一界面读取。卸载服务不会删除 `data/`、`logs/`、本人模板、活动记录、界面偏好或证据；重新安装后可继续使用这些数据。需要彻底删除时，请在确认备份需求后手动移除。
+```bash
+git clone <repository-url>
+cd mac-face-lock-agent
+scripts/bootstrap.sh
+scripts/enroll-owner.sh
+scripts/install-launchagent.sh
+```
 
-## 构建、状态与卸载
+`scripts/bootstrap.sh` 会拒绝低于 Python 3.9 的解释器，创建 `.venv`，并从 `requirements-lock.txt` 安装固定版本依赖。该锁文件目前不包含 hashes：它固定解析后的版本，但不提供下载包文件的哈希完整性校验。首次安装依赖需要访问 pip 包源。
 
-单独构建两个应用：
+本人人脸模板保存在 `data/owner_face.npy`，不得提交到 Git。安装脚本必须从主仓库目录运行，不能从 linked worktree 迁移正在运行的服务。
+
+构建源码应用：
 
 ```bash
 scripts/build-app.sh
 scripts/build-status-app.sh
 ```
 
-产物为：
+使用锁定的 Python 3.11 与 PyInstaller 6.21.0 构建可分发 ZIP：
 
-```text
-dist/Mac Face Lock Agent.app
-dist/Mac Face Lock.app
+```bash
+scripts/build-release.sh
 ```
 
-查看两个服务、当前状态和最近日志：
+需要在本机开发和升级时保留摄像头、输入监控、辅助功能等 TCC 权限，应使用钥匙串中的稳定 Apple Development 或 Developer ID 签名身份：
+
+```bash
+MAC_FACE_LOCK_SIGNING_IDENTITY="Apple Development: <name> (<team-id>)" \
+  scripts/build-release.sh
+```
+
+未设置该变量时构建会回退到 ad-hoc 签名，适合无证书的 CI 构件检查，但 macOS 无法可靠地把不同 ad-hoc 构建识别为同一应用；替换应用后可能必须重新授权。公开客户构建必须使用适合分发的稳定签名和公证，不能把 ad-hoc CI 构件当作正式发行版。
+
+输出为 `dist/release/Mac-Face-Lock-0.2.0-beta-arm64.zip` 及其 SHA-256 文件。GitHub 的手动工作流只生成可检查的构件，不自动创建 Release。
+
+## 源码运行与卸载
+
+查看服务、状态和最近日志：
 
 ```bash
 scripts/status.sh
 ```
 
-卸载两个 LaunchAgent：
-
-```bash
-scripts/uninstall-launchagent.sh
-```
-
-卸载只停止服务并移除 `~/Library/LaunchAgents/com.wuyi.mac-face-lock-agent.plist` 和 `~/Library/LaunchAgents/com.wuyi.mac-face-lock-status.plist`，不会删除上述本地数据。
-
-## 诊断
+运行诊断：
 
 ```bash
 scripts/run-agent.sh
@@ -148,6 +156,14 @@ scripts/camera-diagnostic.sh
 scripts/lock-now.sh
 ```
 
+卸载源码模式的两个 LaunchAgent：
+
+```bash
+scripts/uninstall-launchagent.sh
+```
+
+源码模式卸载不会删除 `data/`、`logs/`、本人模板、活动记录、界面偏好或证据。
+
 ## 完整测试
 
 先通过 `scripts/bootstrap.sh` 创建 `.venv`，再从项目根目录运行：
@@ -156,7 +172,14 @@ scripts/lock-now.sh
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v
 
 xcrun swiftc -parse-as-library \
-  src/app/Models.swift src/app/LocalJSONStore.swift \
+  src/app/AppVersionDisplay.swift \
+  tests/swift/AppVersionDisplayTests.swift \
+  -o /tmp/mac-face-lock-version-display-tests
+/tmp/mac-face-lock-version-display-tests
+
+xcrun swiftc -parse-as-library \
+  src/app/Models.swift src/app/SetupModels.swift \
+  src/app/LocalJSONStore.swift \
   tests/swift/LocalStoreSmokeTests.swift \
   -o /tmp/mac-face-lock-store-tests
 /tmp/mac-face-lock-store-tests
@@ -171,12 +194,32 @@ xcrun swiftc -parse-as-library -DTESTING \
   -o /tmp/mac-face-lock-agent-launcher-tests
 /tmp/mac-face-lock-agent-launcher-tests
 
+xcrun swiftc -parse-as-library \
+  -target arm64-apple-macosx12.0 \
+  -strict-concurrency=complete -warn-concurrency -warnings-as-errors \
+  src/app/UIEventTraceRecorder.swift \
+  tests/swift/UIEventTraceRecorderTests.swift \
+  -o /tmp/mac-face-lock-ui-event-trace-tests
+/tmp/mac-face-lock-ui-event-trace-tests
+
+xcrun swiftc -parse-as-library \
+  -target arm64-apple-macosx12.0 \
+  -strict-concurrency=complete -warn-concurrency -warnings-as-errors \
+  src/app/UIEventTraceRecorder.swift src/app/LocalMouseEventMonitor.swift \
+  tests/swift/LocalMouseEventMonitorTests.swift \
+  -framework AppKit \
+  -o /tmp/mac-face-lock-mouse-monitor-tests
+/tmp/mac-face-lock-mouse-monitor-tests
+
 xcrun swiftc -parse-as-library -typecheck \
-  src/app/*.swift -framework AppKit -framework SwiftUI
+  src/app/*.swift -framework AppKit -framework SwiftUI \
+  -framework AVFoundation -framework ApplicationServices \
+  -framework CoreGraphics
 
 plutil -lint src/app/Info.plist
 plutil -lint \
   launchd/com.wuyi.mac-face-lock-agent.plist \
+  launchd/com.wuyi.mac-face-lock-release.plist \
   launchd/com.wuyi.mac-face-lock-status.plist
 
 scripts/build-app.sh
@@ -185,4 +228,4 @@ codesign --verify --deep --strict "dist/Mac Face Lock Agent.app"
 codesign --verify --deep --strict "dist/Mac Face Lock.app"
 ```
 
-贡献说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，版本变化见 [CHANGELOG.md](CHANGELOG.md)，直接依赖许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+贡献说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，版本变化见 [CHANGELOG.md](CHANGELOG.md)，直接和发行包依赖许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

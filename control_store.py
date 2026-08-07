@@ -6,10 +6,13 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from runtime_paths import RuntimePaths
 from state_store import now_iso
 
 
-CONTROL_PATH = Path(__file__).resolve().parent / "data" / "control.json"
+CONTROL_PATH = RuntimePaths.for_source(
+    Path(__file__).resolve().parent
+).control_path
 
 
 @dataclass(frozen=True)

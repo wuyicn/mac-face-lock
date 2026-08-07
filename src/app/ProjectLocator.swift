@@ -32,7 +32,10 @@ struct ProjectLocation {
 }
 
 enum ProjectLocator {
-    static func locate(arguments: [String]) throws -> ProjectLocation {
+    static func locate(
+        arguments: [String],
+        fileManager: FileManager = .default
+    ) throws -> ProjectLocation {
         guard arguments.count >= 2 else {
             throw ProjectLocatorError.missingProjectArgument
         }
@@ -45,7 +48,6 @@ enum ProjectLocator {
             throw ProjectLocatorError.relativeProjectPath(path)
         }
 
-        let fileManager = FileManager.default
         let projectURL = URL(fileURLWithPath: path, isDirectory: true)
             .resolvingSymlinksInPath()
             .standardizedFileURL

@@ -19,14 +19,124 @@ from control_store import CONTROL_PATH, ControlState, read_control
 from evidence_store import capture_camera_evidence, capture_screen_evidence
 from face_verifier import VerifyResult, evidence_matches_owner, load_owner_encoding, verify_current_user
 from lock_controller import lock_screen
+from runtime_paths import RuntimePaths
 from state_store import now_iso, replace_state, write_state
 from event_notifier import notify_lock_event
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = PROJECT_DIR / "config" / "config.json"
-LOG_PATH = PROJECT_DIR / "logs" / "agent.log"
-PID_PATH = PROJECT_DIR / "logs" / "agent.pid"
+RUNTIME_PATHS = RuntimePaths.for_source(PROJECT_DIR)
+CONFIG_PATH = RUNTIME_PATHS.config_path
+LOG_PATH = RUNTIME_PATHS.logs_dir / "agent.log"
+PID_PATH = RUNTIME_PATHS.logs_dir / "agent.pid"
+CAMERA_PERMISSION_REQUEST_TIMEOUT_SECONDS = 5.0
+LISTENER_READY_TIMEOUT_SECONDS = 5.0
+HEARTBEAT_INTERVAL_SECONDS = 1.0
+
+
+def probe_agent_permissions(
+    *,
+    request: bool = False,
+    camera_request_timeout_seconds: float = (
+        CAMERA_PERMISSION_REQUEST_TIMEOUT_SECONDS
+    ),
+) -> dict[str, bool]:
+    """Read or request this Agent process's TCC readiness without camera capture."""
+
+    camera_ready = False
+    input_monitoring_ready = False
+    accessibility_ready = False
+    try:
+        try:
+            import AVFoundation
+
+            camera_status = (
+                AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(
+                    AVFoundation.AVMediaTypeVideo
+                )
+            )
+            if (
+                request
+                and camera_status == AVFoundation.AVAuthorizationStatusNotDetermined
+            ):
+                completion_event = threading.Event()
+
+                def camera_completion(_granted: bool) -> None:
+                    completion_event.set()
+
+                AVFoundation.AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+                    AVFoundation.AVMediaTypeVideo,
+                    camera_completion,
+                )
+                if completion_event.wait(max(0.0, camera_request_timeout_seconds)):
+                    camera_status = (
+                        AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(
+                            AVFoundation.AVMediaTypeVideo
+                        )
+                    )
+            camera_ready = (
+                camera_status == AVFoundation.AVAuthorizationStatusAuthorized
+            )
+        except ImportError:
+            import objc
+            from Foundation import NSBundle
+
+            bundle = NSBundle.bundleWithPath_(
+                "/System/Library/Frameworks/AVFoundation.framework"
+            )
+            if bundle is None or not bundle.load():
+                raise RuntimeError("AVFoundation framework is unavailable")
+            capture_device = objc.lookUpClass("AVCaptureDevice")
+            camera_status = int(
+                capture_device.authorizationStatusForMediaType_("vide")
+            )
+            if request and camera_status == 0:
+                completion_event = threading.Event()
+
+                def camera_completion(_granted: bool) -> None:
+                    completion_event.set()
+
+                capture_device.requestAccessForMediaType_completionHandler_(
+                    "vide",
+                    camera_completion,
+                )
+                if completion_event.wait(max(0.0, camera_request_timeout_seconds)):
+                    camera_status = int(
+                        capture_device.authorizationStatusForMediaType_("vide")
+                    )
+            camera_ready = camera_status == 3
+    except Exception as exc:
+        logging.warning("camera permission readiness probe failed error=%s", exc)
+
+    try:
+        import Quartz
+
+        input_monitoring_ready = bool(Quartz.CGPreflightListenEventAccess())
+        if request and not input_monitoring_ready:
+            input_monitoring_ready = bool(Quartz.CGRequestListenEventAccess())
+    except Exception as exc:
+        logging.warning("input monitoring readiness probe failed error=%s", exc)
+
+    try:
+        import ApplicationServices
+
+        accessibility_ready = bool(ApplicationServices.AXIsProcessTrusted())
+        if request and not accessibility_ready:
+            accessibility_ready = bool(
+                ApplicationServices.AXIsProcessTrustedWithOptions(
+                    {
+                        ApplicationServices.kAXTrustedCheckOptionPrompt: True,
+                    }
+                )
+            )
+    except Exception as exc:
+        logging.warning("accessibility readiness probe failed error=%s", exc)
+
+    return {
+        "camera_ready": camera_ready,
+        "input_monitoring_ready": input_monitoring_ready,
+        "accessibility_ready": accessibility_ready,
+    }
 
 
 def normalize_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -135,11 +245,16 @@ class FaceLockAgent:
         self,
         config: dict[str, Any],
         *,
-        control_path: Path = CONTROL_PATH,
-        activity_path: Path = ACTIVITY_PATH,
+        runtime_paths: RuntimePaths | None = None,
+        control_path: Path | None = None,
+        activity_path: Path | None = None,
         activity_writer: Any | None = None,
         activity_thread_factory: Callable[..., threading.Thread] = threading.Thread,
     ) -> None:
+        self.runtime_paths = runtime_paths or RUNTIME_PATHS
+        self.explicit_runtime_paths = runtime_paths is not None
+        control_path = control_path or self.runtime_paths.control_path
+        activity_path = activity_path or self.runtime_paths.activity_path
         self.config = normalize_runtime_config(config)
         self.mode = str(self.config.get("mode", "observe"))
         self.control_path = control_path
@@ -155,8 +270,18 @@ class FaceLockAgent:
                 thread_factory=activity_thread_factory,
             )
         )
-        self.protection_enabled = read_control(control_path).protection_enabled
-        self.owner_encoding = load_owner_encoding()
+        control_fallback = ControlState(
+            self.runtime_paths.control_fallback_enabled,
+            None,
+        )
+        self.protection_enabled = read_control(
+            control_path,
+            control_fallback,
+        ).protection_enabled
+        if self.explicit_runtime_paths:
+            self.owner_encoding = load_owner_encoding(self.runtime_paths.owner_face_path)
+        else:
+            self.owner_encoding = load_owner_encoding()
         self.stop_event = threading.Event()
         self.verify_lock = threading.Lock()
         self.verify_workers_lock = threading.Lock()
@@ -171,6 +296,94 @@ class FaceLockAgent:
         self.mouse_listener: Any | None = None
         self.keyboard_listener: Any | None = None
         self.system_idle_supported: bool | None = None
+        self.state_lock = threading.Lock()
+        self.live_state_started = False
+        self.heartbeat_sequence = 0
+        self.last_heartbeat_at = -float("inf")
+        self.last_permission_probe_at = -float("inf")
+        self.permission_readiness = {
+            "camera_ready": False,
+            "input_monitoring_ready": False,
+            "accessibility_ready": False,
+        }
+
+    def persist_state(self, state: dict[str, Any]) -> None:
+        with self.state_lock:
+            payload = self.decorate_live_state(state)
+            if self.explicit_runtime_paths:
+                write_state(payload, path=self.runtime_paths.state_path)
+            else:
+                write_state(payload)
+
+    def persist_replacement_state(self, state: dict[str, Any]) -> None:
+        with self.state_lock:
+            payload = self.decorate_live_state(state)
+            if self.explicit_runtime_paths:
+                replace_state(payload, path=self.runtime_paths.state_path)
+            else:
+                replace_state(payload)
+
+    def decorate_live_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(state)
+        if not self.live_state_started:
+            return payload
+        self.heartbeat_sequence += 1
+        self.last_heartbeat_at = time.monotonic()
+        payload.update(self.permission_readiness)
+        payload["agent_pid"] = __import__("os").getpid()
+        payload["heartbeat_timestamp"] = now_iso()
+        payload["heartbeat_sequence"] = self.heartbeat_sequence
+        return payload
+
+    def publish_live_heartbeat_if_due(self) -> None:
+        if not self.live_state_started:
+            return
+        now = time.monotonic()
+        permission_interval = max(
+            0.0,
+            float(self.config.get("permission_probe_interval_seconds", 5)),
+        )
+        if now - self.last_permission_probe_at >= permission_interval:
+            self.last_permission_probe_at = now
+            self.permission_readiness = probe_agent_permissions()
+            self.persist_state(self.current_live_state())
+            return
+        heartbeat_interval = max(
+            0.1,
+            float(
+                self.config.get(
+                    "heartbeat_interval_seconds",
+                    HEARTBEAT_INTERVAL_SECONDS,
+                )
+            ),
+        )
+        if now - self.last_heartbeat_at >= heartbeat_interval:
+            self.persist_state(self.current_live_state())
+
+    def current_live_state(self) -> dict[str, Any]:
+        if not self.protection_enabled:
+            return {
+                "status": "paused",
+                "mode": self.mode,
+                "armed": False,
+                "action": "allow_paused",
+                "heartbeat": "paused",
+            }
+        if self.armed:
+            return {
+                "status": "armed",
+                "mode": self.mode,
+                "armed": True,
+                "action": "wait_for_input_verify",
+                "heartbeat": "armed",
+            }
+        return {
+            "status": "active",
+            "mode": self.mode,
+            "armed": False,
+            "action": "wait_until_idle",
+            "heartbeat": "active",
+        }
 
     def refresh_control_state(self) -> None:
         current = ControlState(self.protection_enabled, None)
@@ -184,7 +397,7 @@ class FaceLockAgent:
             self.last_activity_at = time.monotonic()
             self.last_active_state_at = self.last_activity_at
             if self.protection_enabled:
-                write_state(
+                self.persist_state(
                     {
                         "status": "active",
                         "mode": self.mode,
@@ -200,7 +413,7 @@ class FaceLockAgent:
                     "info",
                 )
             else:
-                write_state(
+                self.persist_state(
                     {
                         "status": "paused",
                         "mode": self.mode,
@@ -221,7 +434,7 @@ class FaceLockAgent:
             generation = self.control_generation
             if not self.protection_enabled or generation != self.control_generation:
                 return False
-            write_state(state)
+            self.persist_state(state)
             return bool(self.protection_enabled) and generation == self.control_generation
 
     def run_active_action(self, action: Callable[[], Any]) -> tuple[bool, Any]:
@@ -419,7 +632,7 @@ class FaceLockAgent:
                     def allow_cooldown() -> None:
                         self.last_activity_at = now
                         self.armed = False
-                        write_state(
+                        self.persist_state(
                             {
                                 "status": "active",
                                 "mode": self.mode,
@@ -454,7 +667,7 @@ class FaceLockAgent:
 
                 def write_active_input() -> None:
                     self.last_active_state_at = now
-                    write_state(
+                    self.persist_state(
                         {
                             "status": "active",
                             "mode": self.mode,
@@ -520,7 +733,7 @@ class FaceLockAgent:
                 self.last_pass_at = time.monotonic()
                 self.last_activity_at = time.monotonic()
                 self.armed = False
-                write_state({**state, "armed": False, "action": "allow"})
+                self.persist_state({**state, "armed": False, "action": "allow"})
 
             active, _ = self.run_active_action(accept_owner)
             if not active:
@@ -574,7 +787,7 @@ class FaceLockAgent:
             self.last_camera_error_at = time.monotonic()
             self.last_activity_at = time.monotonic()
             self.armed = False
-            write_state(
+            self.persist_state(
                 {
                     "status": "camera_unavailable",
                     "mode": self.mode,
@@ -624,10 +837,7 @@ class FaceLockAgent:
         if bool(self.config.get("capture_camera_on_lock", True)):
             try:
                 active, evidence_path = self.run_active_action(
-                    lambda: capture_camera_evidence(
-                        reason,
-                        camera_index=int(self.config.get("camera_index", 0)),
-                    )
+                    lambda: self.capture_camera_evidence(reason)
                 )
                 if not active:
                     self.last_lock_at = previous_last_lock_at
@@ -656,7 +866,7 @@ class FaceLockAgent:
                     self.last_pass_at = time.monotonic()
                     self.last_activity_at = time.monotonic()
                     self.armed = False
-                    write_state(
+                    self.persist_state(
                         {
                             **lock_state,
                             "status": "verified",
@@ -688,7 +898,7 @@ class FaceLockAgent:
         if bool(self.config.get("capture_screen_on_lock", False)):
             try:
                 active, screen_evidence_path = self.run_active_action(
-                    lambda: capture_screen_evidence(reason)
+                    lambda: self.capture_screen_evidence(reason)
                 )
                 if not active:
                     self.last_lock_at = previous_last_lock_at
@@ -730,7 +940,7 @@ class FaceLockAgent:
                     and generation == self.control_generation
                 )
                 if active and self.mode != "observe":
-                    write_state({"lock_succeeded": True})
+                    self.persist_state({"lock_succeeded": True})
             if not active:
                 return "paused"
         except Exception as exc:
@@ -810,12 +1020,18 @@ class FaceLockAgent:
         except ImportError as exc:
             raise RuntimeError("Missing input dependency. Run scripts/bootstrap.sh first.") from exc
 
+        # Permission prompts belong to the foreground Mac Face Lock app. The
+        # launchd-owned runtime only reads its current TCC state; requesting
+        # from this process can invoke PyObjC callbacks without a registered
+        # block signature and leaves the service falsely unhealthy.
+        self.permission_readiness = probe_agent_permissions(request=False)
         initial_state = {
             "status": "running",
             "mode": self.mode,
             "armed": self.armed,
+            "agent_pid": __import__("os").getpid(),
             "started_at": now_iso(),
-            "owner_profile": str(PROJECT_DIR / "data" / "owner_face.npy"),
+            "owner_profile": str(self.runtime_paths.owner_face_path),
             "lock_on_camera_error": self.config["lock_on_camera_error"],
             "cooldown_seconds_after_lock": self.config[
                 "cooldown_seconds_after_lock"
@@ -823,6 +1039,7 @@ class FaceLockAgent:
             "camera_error_cooldown_seconds": self.config[
                 "camera_error_cooldown_seconds"
             ],
+            **self.permission_readiness,
         }
         if not self.protection_enabled:
             initial_state.update(
@@ -832,9 +1049,6 @@ class FaceLockAgent:
                     "heartbeat": "paused",
                 }
             )
-        replace_state(initial_state)
-        logging.info("mac-face-lock-agent started mode=%s", self.mode)
-
         self.mouse_listener = mouse.Listener(
             on_move=lambda *_: self.on_input("mouse_move"),
             on_click=lambda *_: self.on_input("mouse_click"),
@@ -843,17 +1057,38 @@ class FaceLockAgent:
         self.keyboard_listener = keyboard.Listener(
             on_press=lambda *_: self.on_input("keyboard")
         )
-        self.mouse_listener.start()
-        self.keyboard_listener.start()
+        try:
+            self.mouse_listener.start()
+            self.keyboard_listener.start()
+            self.wait_for_input_listeners_ready()
+        except Exception as exc:
+            self.stop_input_listeners()
+            self.persist_replacement_state(
+                {
+                    "status": "input_listener_error",
+                    "mode": self.mode,
+                    "armed": False,
+                    "action": "restart_required",
+                    "agent_pid": __import__("os").getpid(),
+                    "camera_ready": False,
+                    "input_monitoring_ready": False,
+                    "accessibility_ready": False,
+                    "listener_error": str(exc),
+                }
+            )
+            raise RuntimeError(f"input listener readiness failed: {exc}") from exc
+        self.live_state_started = True
+        self.last_permission_probe_at = time.monotonic()
+        self.persist_replacement_state(initial_state)
+        logging.info("mac-face-lock-agent started mode=%s", self.mode)
 
         try:
             while not self.stop_event.wait(1):
                 self.tick()
         finally:
-            self.mouse_listener.stop()
-            self.keyboard_listener.stop()
+            self.stop_input_listeners()
             shutdown_complete = self.shutdown()
-            write_state({"status": "stopped", "stopped_at": now_iso()})
+            self.persist_state({"status": "stopped", "stopped_at": now_iso()})
             logging.info(
                 "mac-face-lock-agent stopped shutdown_complete=%s",
                 shutdown_complete,
@@ -865,7 +1100,7 @@ class FaceLockAgent:
     def tick(self) -> None:
         if not self.input_listeners_alive():
             logging.error("input listener stopped unexpectedly; exiting for launchd restart")
-            write_state(
+            self.persist_state(
                 {
                     "status": "input_listener_error",
                     "mode": self.mode,
@@ -876,6 +1111,7 @@ class FaceLockAgent:
             self.stop_event.set()
             return
 
+        self.publish_live_heartbeat_if_due()
         self.refresh_control_state()
         if not self.protection_enabled:
             now = time.monotonic()
@@ -884,7 +1120,7 @@ class FaceLockAgent:
             )
             if now - self.last_active_state_at >= update_interval:
                 self.last_active_state_at = now
-                write_state(
+                self.persist_state(
                     {
                         "status": "paused",
                         "mode": self.mode,
@@ -913,7 +1149,7 @@ class FaceLockAgent:
             update_interval = float(self.config.get("active_state_update_interval_seconds", 10))
             if now - self.last_armed_state_at >= update_interval:
                 self.last_armed_state_at = now
-                write_state(
+                self.persist_state(
                     {
                         "status": "armed",
                         "mode": self.mode,
@@ -940,7 +1176,7 @@ class FaceLockAgent:
             update_interval = float(self.config.get("active_state_update_interval_seconds", 10))
             if now - self.last_active_state_at >= update_interval:
                 self.last_active_state_at = now
-                write_state(
+                self.persist_state(
                     {
                         "status": "active",
                         "mode": self.mode,
@@ -954,7 +1190,7 @@ class FaceLockAgent:
         self.armed = True
         self.last_armed_state_at = time.monotonic()
         logging.info("presence guard armed idle_seconds=%.1f", idle_elapsed)
-        write_state(
+        self.persist_state(
             {
                 "status": "armed",
                 "mode": self.mode,
@@ -974,6 +1210,56 @@ class FaceLockAgent:
     def input_listeners_alive(self) -> bool:
         listeners = [self.mouse_listener, self.keyboard_listener]
         return all(listener is not None and listener.is_alive() for listener in listeners)
+
+    def wait_for_input_listeners_ready(self) -> None:
+        listeners = [self.mouse_listener, self.keyboard_listener]
+        if any(listener is None for listener in listeners):
+            raise RuntimeError("input listener was not created")
+        results: Queue[BaseException | None] = Queue()
+
+        def wait_for_ready(listener: Any) -> None:
+            try:
+                listener.wait()
+            except BaseException as exc:
+                results.put(exc)
+            else:
+                results.put(None)
+
+        for listener in listeners:
+            threading.Thread(
+                target=wait_for_ready,
+                args=(listener,),
+                name="face-lock-listener-readiness",
+                daemon=True,
+            ).start()
+
+        deadline = time.monotonic() + max(
+            0.0,
+            float(
+                self.config.get(
+                    "listener_ready_timeout_seconds",
+                    LISTENER_READY_TIMEOUT_SECONDS,
+                )
+            ),
+        )
+        for _listener in listeners:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("input listener readiness timed out")
+            try:
+                error = results.get(timeout=remaining)
+            except Empty as exc:
+                raise RuntimeError("input listener readiness timed out") from exc
+            if error is not None:
+                raise RuntimeError(f"input listener failed: {error}") from error
+
+    def stop_input_listeners(self) -> None:
+        for listener in (self.mouse_listener, self.keyboard_listener):
+            if listener is not None:
+                try:
+                    listener.stop()
+                except Exception:
+                    logging.exception("input listener stop failed")
 
     def system_idle_seconds(self) -> float | None:
         if not bool(self.config.get("system_idle_poll_enabled", True)):
@@ -1001,34 +1287,60 @@ class FaceLockAgent:
         trigger_seconds = float(self.config.get("system_idle_trigger_seconds", 2.0))
         return system_idle_seconds <= trigger_seconds
 
+    def capture_camera_evidence(self, reason: str) -> Path:
+        camera_index = int(self.config.get("camera_index", 0))
+        if self.explicit_runtime_paths:
+            return capture_camera_evidence(
+                reason,
+                camera_index=camera_index,
+                evidence_dir=self.runtime_paths.evidence_dir,
+            )
+        return capture_camera_evidence(reason, camera_index=camera_index)
+
+    def capture_screen_evidence(self, reason: str) -> Path:
+        if self.explicit_runtime_paths:
+            return capture_screen_evidence(
+                reason,
+                evidence_dir=self.runtime_paths.evidence_dir,
+            )
+        return capture_screen_evidence(reason)
+
 
 def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def configure_logging(config: dict[str, Any]) -> None:
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+def configure_logging(config: dict[str, Any], log_path: Path = LOG_PATH) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     level_name = str(config.get("log_level", "info")).upper()
     logging.basicConfig(
         level=getattr(logging, level_name, logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler()],
+        handlers=[logging.FileHandler(log_path), logging.StreamHandler()],
     )
 
 
-def main() -> int:
-    config = load_config()
-    configure_logging(config)
-    PID_PATH.write_text(str(__import__("os").getpid()), encoding="utf-8")
+def main(
+    paths: RuntimePaths = RUNTIME_PATHS,
+    on_started: Callable[[], None] | None = None,
+) -> int:
+    paths.ensure_writable_directories()
+    config = load_config(paths.config_path)
+    log_path = paths.logs_dir / "agent.log"
+    pid_path = paths.logs_dir / "agent.pid"
+    configure_logging(config, log_path)
+    pid_path.write_text(str(__import__("os").getpid()), encoding="utf-8")
 
-    agent = FaceLockAgent(config)
+    agent = FaceLockAgent(config, runtime_paths=paths)
     signal.signal(signal.SIGTERM, agent.stop)
     signal.signal(signal.SIGINT, agent.stop)
     try:
+        if on_started is not None:
+            on_started()
         agent.run()
     finally:
         try:
-            PID_PATH.unlink()
+            pid_path.unlink()
         except FileNotFoundError:
             pass
     return 0

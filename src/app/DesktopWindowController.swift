@@ -9,12 +9,14 @@ final class DesktopWindowController {
 
     init(
         faceLockStore: FaceLockStore,
+        setupCoordinator: SetupCoordinator,
         themeStore: ThemeStore,
         projectURL: URL,
         dataURL: URL
     ) {
         let contentView = RootView(
             faceLockStore: faceLockStore,
+            setupCoordinator: setupCoordinator,
             themeStore: themeStore,
             projectURL: projectURL,
             dataURL: dataURL
@@ -49,5 +51,11 @@ final class DesktopWindowController {
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        UIEventTraceRecorder.shared.record(
+            .desktopWindowShow(
+                windowNumber: window.windowNumber,
+                isKey: window.isKeyWindow
+            )
+        )
     }
 }

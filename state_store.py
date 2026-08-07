@@ -10,9 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from runtime_paths import RuntimePaths
+
 
 PROJECT_DIR = Path(__file__).resolve().parent
-STATE_PATH = PROJECT_DIR / "data" / "state.json"
+STATE_PATH = RuntimePaths.for_source(PROJECT_DIR).state_path
 
 
 def now_iso() -> str:

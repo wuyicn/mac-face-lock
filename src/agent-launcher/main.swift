@@ -3,7 +3,9 @@ import Foundation
 
 enum AgentLaunchError: Error, Equatable {
     case missingProjectArgument
+    case invalidReleaseInvocation
     case invalidProjectDirectory(String)
+    case invalidReleaseDirectory(String)
     case missingVirtualEnvironment(String)
     case missingAgent(String)
     case argumentAllocationFailed
@@ -14,29 +16,99 @@ struct LaunchFailureDetails: Equatable {
     let exitCode: Int32
 }
 
-func resolveAgentLaunch(arguments: [String]) throws -> (python: String, agent: String) {
-    guard arguments.count == 2 else {
-        throw AgentLaunchError.missingProjectArgument
+struct AgentLaunchResolution: Equatable {
+    let python: String
+    let agent: String
+    let execArguments: [String]
+}
+
+func resolveAgentLaunch(arguments: [String]) throws -> AgentLaunchResolution {
+    if arguments.count == 2 {
+        let projectArgument = arguments[1]
+        var isDirectory = ObjCBool(false)
+        guard projectArgument.hasPrefix("/"),
+              FileManager.default.fileExists(
+                atPath: projectArgument,
+                isDirectory: &isDirectory
+              ),
+              isDirectory.boolValue else {
+            throw AgentLaunchError.invalidProjectDirectory(projectArgument)
+        }
+
+        let root = URL(
+            fileURLWithPath: projectArgument,
+            isDirectory: true
+        ).standardizedFileURL
+        let python = root.appendingPathComponent(".venv/bin/python").path
+        let agent = root.appendingPathComponent("agent.py").path
+        guard FileManager.default.isExecutableFile(atPath: python) else {
+            throw AgentLaunchError.missingVirtualEnvironment(python)
+        }
+        guard FileManager.default.fileExists(atPath: agent) else {
+            throw AgentLaunchError.missingAgent(agent)
+        }
+        return AgentLaunchResolution(
+            python: python,
+            agent: agent,
+            execArguments: [python, "-u", agent]
+        )
     }
 
-    let projectArgument = arguments[1]
+    guard arguments.count == 6,
+          arguments[1] == "--resources-dir",
+          arguments[3] == "--support-dir",
+          arguments[5] == "agent" else {
+        if arguments.count == 1 {
+            throw AgentLaunchError.missingProjectArgument
+        }
+        throw AgentLaunchError.invalidReleaseInvocation
+    }
+
+    let resources = try canonicalReleaseDirectory(arguments[2])
+    let support = try canonicalReleaseDirectory(arguments[4])
+    guard resources.lastPathComponent == "Resources",
+          resources.deletingLastPathComponent().lastPathComponent == "Contents",
+          resources.deletingLastPathComponent()
+            .deletingLastPathComponent().pathExtension == "app" else {
+        throw AgentLaunchError.invalidReleaseDirectory(arguments[2])
+    }
+    let runtime = resources.appendingPathComponent(
+        "runtime/MacFaceLockRuntime/MacFaceLockRuntime"
+    )
+    guard runtime.standardizedFileURL.resolvingSymlinksInPath() == runtime,
+          FileManager.default.isExecutableFile(atPath: runtime.path) else {
+        throw AgentLaunchError.missingAgent(runtime.path)
+    }
+    _ = support
+    return AgentLaunchResolution(
+        python: runtime.path,
+        agent: "agent",
+        execArguments: [
+            runtime.path,
+            "--resources-dir",
+            resources.path,
+            "--support-dir",
+            support.path,
+            "agent",
+        ]
+    )
+}
+
+private func canonicalReleaseDirectory(_ path: String) throws -> URL {
+    guard path.hasPrefix("/") else {
+        throw AgentLaunchError.invalidReleaseDirectory(path)
+    }
+    let url = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+    guard url.path == path,
+          url.resolvingSymlinksInPath() == url else {
+        throw AgentLaunchError.invalidReleaseDirectory(path)
+    }
     var isDirectory = ObjCBool(false)
-    guard projectArgument.hasPrefix("/"),
-          FileManager.default.fileExists(atPath: projectArgument, isDirectory: &isDirectory),
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
           isDirectory.boolValue else {
-        throw AgentLaunchError.invalidProjectDirectory(projectArgument)
+        throw AgentLaunchError.invalidReleaseDirectory(path)
     }
-
-    let root = URL(fileURLWithPath: projectArgument, isDirectory: true).standardizedFileURL
-    let python = root.appendingPathComponent(".venv/bin/python").path
-    let agent = root.appendingPathComponent("agent.py").path
-    guard FileManager.default.isExecutableFile(atPath: python) else {
-        throw AgentLaunchError.missingVirtualEnvironment(python)
-    }
-    guard FileManager.default.fileExists(atPath: agent) else {
-        throw AgentLaunchError.missingAgent(agent)
-    }
-    return (python, agent)
+    return url
 }
 
 func makeExecArguments(
@@ -64,8 +136,18 @@ func launchFailureDetails(for error: AgentLaunchError) -> LaunchFailureDetails {
             message: "expected one absolute project directory argument",
             exitCode: 64
         )
+    case .invalidReleaseInvocation:
+        return LaunchFailureDetails(
+            message: "invalid release agent invocation",
+            exitCode: 64
+        )
     case .invalidProjectDirectory(let path):
         return LaunchFailureDetails(message: "invalid project directory: \(path)", exitCode: 64)
+    case .invalidReleaseDirectory(let path):
+        return LaunchFailureDetails(
+            message: "invalid release directory: \(path)",
+            exitCode: 64
+        )
     case .missingVirtualEnvironment(let path):
         return LaunchFailureDetails(
             message: "missing executable virtual environment Python: \(path)",
@@ -88,8 +170,7 @@ struct AgentLauncher {
     static func main() {
         do {
             let launch = try resolveAgentLaunch(arguments: CommandLine.arguments)
-            let values = [launch.python, "-u", launch.agent]
-            var pointers = try makeExecArguments(values: values)
+            var pointers = try makeExecArguments(values: launch.execArguments)
             defer {
                 for pointer in pointers where pointer != nil {
                     free(pointer)

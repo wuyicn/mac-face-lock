@@ -4,6 +4,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 REQUIREMENTS = PROJECT_DIR / "requirements.txt"
 LOCK_REQUIREMENTS = PROJECT_DIR / "requirements-lock.txt"
 CI_WORKFLOW = PROJECT_DIR / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = PROJECT_DIR / ".github" / "workflows" / "release-artifact.yml"
 BOOTSTRAP = PROJECT_DIR / "scripts" / "bootstrap.sh"
 README = PROJECT_DIR / "README.md"
 THIRD_PARTY_NOTICES = PROJECT_DIR / "THIRD_PARTY_NOTICES.md"
@@ -355,6 +357,117 @@ def dangerous_ci_command(command):
 
 
 class OpenSourcePolicyTests(unittest.TestCase):
+    def test_macos_icon_tests_are_skipped_when_imported_as_linux(self):
+        probe = """
+import sys
+sys.platform = "linux"
+from tests.test_packaging import UnifiedPackagingTests
+
+names = (
+    "test_control_center_packages_the_project_owned_icon",
+    "test_app_icon_regeneration_uses_fixed_pixels_and_matches_asset",
+)
+raise SystemExit(0 if all(
+    getattr(getattr(UnifiedPackagingTests, name), "__unittest_skip__", False)
+    for name in names
+) else 1)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_manual_release_artifact_workflow_is_safe_and_reviewable(self):
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        for token in (
+            "workflow_dispatch",
+            "macos-15",
+            'python-version: "3.11"',
+            "PyInstaller==6.21.0",
+            "scripts/build-release.sh",
+            "Mac-Face-Lock-0.2.0-beta-arm64.zip",
+            "actions/upload-artifact@v6",
+            "contents: read",
+        ):
+            self.assertIn(token, workflow)
+        for forbidden in (
+            "softprops/action-gh-release",
+            "gh release create",
+            "GITHUB_TOKEN:",
+            "contents: write",
+        ):
+            self.assertNotIn(forbidden, workflow)
+
+    def test_customer_release_documentation_is_complete(self):
+        readme = README.read_text(encoding="utf-8")
+        customer = (
+            PROJECT_DIR / "docs" / "customer-installation.md"
+        ).read_text(encoding="utf-8")
+        self.assertLess(
+            readme.index("普通客户"),
+            readme.index("源码开发"),
+        )
+        for token in (
+            "GitHub Releases",
+            "无需 Codex、Python、Xcode、终端或源码仓库",
+            "右键",
+            "SHA-256",
+            "摄像头",
+            "输入监控",
+            "辅助功能",
+            "重新录入本人",
+            "fail-open",
+            "没有活体检测",
+            "卸载",
+            "彻底删除",
+            "scripts/build-release.sh",
+            "docs/design-references/mac-face-lock-onboarding-permissions.png",
+            "docs/design-references/mac-face-lock-onboarding-enrollment.png",
+            "权限确认",
+            "不需要单独安装、打开或授权另一个 Agent 应用",
+            "如果 Releases 页面没有发行版",
+            "尚未公开客户构建",
+        ):
+            self.assertIn(token, readme)
+        for token in (
+            "Finder",
+            "右键",
+            "校验",
+            "权限中心",
+            "录入本人",
+            "权限确认",
+            "修复",
+            "保留数据",
+            "彻底删除",
+        ):
+            self.assertIn(token, customer)
+
+    def test_customer_uninstall_is_a_visible_preserve_data_action(self):
+        settings = (PROJECT_DIR / "src" / "app" / "SettingsView.swift").read_text(
+            encoding="utf-8"
+        )
+        coordinator = (
+            PROJECT_DIR / "src" / "app" / "SetupCoordinator.swift"
+        ).read_text(encoding="utf-8")
+        customer = (
+            PROJECT_DIR / "docs" / "customer-installation.md"
+        ).read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+
+        self.assertIn("卸载后台服务并保留数据", settings)
+        self.assertIn("uninstallServicePreservingData", settings)
+        self.assertIn("func uninstallServicePreservingData()", coordinator)
+        for document in (customer, readme):
+            self.assertIn("卸载后台服务并保留数据", document)
+            self.assertLess(
+                document.index("卸载后台服务并保留数据"),
+                document.index("废纸篓"),
+            )
+
     def _read_required_document(self, name):
         path = PROJECT_DIR / name
         self.assertTrue(path.is_file(), f"{name} is missing")
@@ -404,15 +517,18 @@ scripts/install-launchagent.sh"""
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, security)
 
-    def test_security_policy_does_not_claim_an_unverified_private_channel(self):
+    def test_security_policy_publishes_the_verified_private_channel(self):
         security = self._read_required_document("SECURITY.md")
-        for phrase in ["尚未启用", "Report a vulnerability", "发布门禁", "实测"]:
+        for phrase in [
+            "仓库已经公开",
+            "private vulnerability reporting 已启用",
+            "GitHub Security Advisories",
+            "Report a vulnerability",
+        ]:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, security)
-        self.assertNotIn(
-            "请通过仓库的 **GitHub Security Advisories** 发起私密报告",
-            security,
-        )
+        self.assertNotIn("尚未创建公开 GitHub 仓库", security)
+        self.assertNotIn("尚未启用", security)
 
     def test_contributing_policy_protects_private_runtime_data(self):
         contributing = self._read_required_document("CONTRIBUTING.md")
@@ -436,12 +552,33 @@ scripts/install-launchagent.sh"""
             "tests/swift/LocalStoreSmokeTests.swift",
             "tests/swift/ProjectLocatorTests.swift",
             "tests/swift/AgentLauncherPathTests.swift",
+            "tests/swift/UIEventTraceRecorderTests.swift",
+            "tests/swift/LocalMouseEventMonitorTests.swift",
         )
         for document in (README, PROJECT_DIR / "CONTRIBUTING.md"):
             text = document.read_text(encoding="utf-8")
             for suite in expected_suites:
                 with self.subTest(document=document.name, suite=suite):
                     self.assertIn(suite, text)
+
+    def test_trace_diagnostic_verification_uses_strict_swift_concurrency(self):
+        suites = (
+            "tests/swift/UIEventTraceRecorderTests.swift",
+            "tests/swift/LocalMouseEventMonitorTests.swift",
+        )
+        for document in (README, PROJECT_DIR / "CONTRIBUTING.md"):
+            text = document.read_text(encoding="utf-8")
+            for suite in suites:
+                with self.subTest(document=document.name, suite=suite):
+                    self.assertIn(suite, text)
+                    suite_offset = text.index(suite)
+                    command_start = text.rfind("xcrun swiftc", 0, suite_offset)
+                    command_end = text.find("\n", suite_offset)
+                    command = text[command_start:command_end]
+                    self.assertIn("-target arm64-apple-macosx12.0", command)
+                    self.assertIn("-strict-concurrency=complete", command)
+                    self.assertIn("-warn-concurrency", command)
+                    self.assertIn("-warnings-as-errors", command)
 
     def test_changelog_records_initial_source_beta_scope(self):
         changelog = self._read_required_document("CHANGELOG.md")
@@ -791,16 +928,61 @@ scripts/bootstrap.sh
             r"^xcrun swiftc\b.*\btests/swift/LocalStoreSmokeTests\.swift\b",
             r"^xcrun swiftc\b.*\btests/swift/ProjectLocatorTests\.swift\b",
             r"^xcrun swiftc\b.*\btests/swift/AgentLauncherPathTests\.swift\b",
+            r"^xcrun swiftc\b.*-target arm64-apple-macosx12\.0\b.*-strict-concurrency=complete\b.*-warn-concurrency\b.*-warnings-as-errors\b.*\btests/swift/UIEventTraceRecorderTests\.swift\b",
+            r"^xcrun swiftc\b.*-target arm64-apple-macosx12\.0\b.*-strict-concurrency=complete\b.*-warn-concurrency\b.*-warnings-as-errors\b.*\btests/swift/LocalMouseEventMonitorTests\.swift\b",
             r"^xcrun swiftc -parse-as-library -typecheck\b",
-            r"^scripts/build-app\.sh$",
             r"^scripts/build-status-app\.sh$",
             r"^plutil -lint\b",
-            r'^codesign --verify --deep --strict "dist/Mac Face Lock Agent\.app"$',
             r'^codesign --verify --deep --strict "dist/Mac Face Lock\.app"$',
             r'^build_info="\$\(xcrun vtool -show-build "\$executable"\)"$',
         ]:
             with self.subTest(job="macos", pattern=pattern):
                 assert_command("macos", macos_commands, pattern)
+
+        for forbidden in (
+            "scripts/build-app.sh",
+            'dist/Mac Face Lock Agent.app/Contents/Info.plist',
+            'codesign --verify --deep --strict "dist/Mac Face Lock Agent.app"',
+            'dist/Mac Face Lock Agent.app/Contents/MacOS/MacFaceLockAgent',
+        ):
+            with self.subTest(job="macos", forbidden=forbidden):
+                self.assertFalse(
+                    any(forbidden in command for command in macos_commands),
+                    f"macos release gate still depends on {forbidden!r}: {macos_commands}",
+                )
+
+    def test_ci_builds_runtime_only_on_macos_before_unified_app(self):
+        workflow = load_ci_workflow()
+        linux_commands = ci_job_run_commands(workflow["jobs"]["python-linux"])
+        macos_job = workflow["jobs"]["macos-release-gates"]
+        macos_commands = ci_job_run_commands(macos_job)
+
+        self.assertNotIn("scripts/build-runtime.sh", linux_commands)
+        uv_steps = [
+            index
+            for index, step in enumerate(macos_job["steps"])
+            if step.get("uses")
+            == "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b"
+        ]
+        self.assertEqual(uv_steps, [2], "macOS must install the pinned uv action")
+        uv_step_index = uv_steps[0]
+        self.assertEqual(
+            macos_job["steps"][uv_step_index].get("with", {}).get("version"),
+            "0.11.13",
+        )
+        runtime_step_index = next(
+            index
+            for index, step in enumerate(macos_job["steps"])
+            if step.get("run") == "scripts/build-runtime.sh"
+        )
+        self.assertLess(uv_step_index, runtime_step_index)
+        runtime_index = macos_commands.index("scripts/build-runtime.sh")
+        prerequisites_index = macos_commands.index(
+            "python -m pip install -r requirements-lock.txt"
+        )
+        unified_app_index = macos_commands.index("scripts/build-status-app.sh")
+        self.assertGreater(runtime_index, prerequisites_index)
+        self.assertLess(runtime_index, unified_app_index)
 
     def test_ci_uses_node24_action_majors(self):
         workflow = load_ci_workflow()
